@@ -1,0 +1,171 @@
+from datetime import timedelta
+
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.models.asset import Asset, MarketSnapshot
+from app.models.base import Base
+from app.models.signal import Signal, SignalEvaluation
+from app.models.simulation import SimulationAccount
+from app.schemas.trading import TradingAutomationProfileUpsert
+from app.services.trading.service import trading_workspace_service
+from app.utils.time import utcnow
+
+
+def build_session() -> Session:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(bind=engine, future=True)()
+
+
+def test_simulation_automation_can_submit_order_from_candidate_signal() -> None:
+    db = build_session()
+    asset = Asset(symbol="AUTO", name="Automation Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow() - timedelta(minutes=1),
+            open_price=100,
+            high_price=101,
+            low_price=99,
+            close_price=100,
+            volume=1000,
+            source="test",
+        )
+    )
+    account = SimulationAccount(name="Auto Sim", starting_cash=1000, cash_balance=1000, fees_bps=0, slippage_bps=0, latency_ms=0, is_active=True)
+    db.add(account)
+    db.flush()
+    db.add(
+        Signal(
+            asset_id=asset.id,
+            action="buy",
+            confidence=0.91,
+            status="candidate",
+            occurred_at=utcnow(),
+            indicators_json={},
+            related_news_ids=[],
+            related_event_ids=[],
+            ai_rationale="High conviction automation candidate.",
+            suggested_entry=100,
+            suggested_stop_loss=97,
+            suggested_take_profit=106,
+            estimated_risk_reward=2.0,
+            provider_type="openai_simulation",
+            model_name="gpt-5-mini",
+            mode="simulation",
+            source_kind="agent",
+            metadata_json={"preferred_strategy": "trend-following"},
+        )
+    )
+    db.flush()
+
+    trading_workspace_service.upsert_profile(
+        db,
+        "simulation",
+        TradingAutomationProfileUpsert(
+            automation_enabled=True,
+            approval_mode="fully_automatic",
+            confidence_threshold=0.5,
+            default_order_notional=100,
+            stop_loss_pct=0.03,
+            take_profit_pct=0.06,
+            trailing_stop_pct=0.02,
+        ),
+    )
+
+    result = trading_workspace_service.run_automation(db, "simulation", simulation_account_id=account.id)
+    db.commit()
+
+    updated_signal = db.scalar(select(Signal).where(Signal.asset_id == asset.id))
+    assert result["submitted_orders"] == 1
+    assert result["status"] == "success"
+    assert updated_signal is not None
+    assert updated_signal.status == "executed"
+
+
+def test_live_workspace_surfaces_shared_recommendations() -> None:
+    db = build_session()
+    asset = Asset(symbol="QUEUE", name="Queue Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    signal = Signal(
+        asset_id=asset.id,
+        action="buy",
+        confidence=0.82,
+        status="approved",
+        occurred_at=utcnow(),
+        indicators_json={},
+        related_news_ids=[],
+        related_event_ids=[],
+        ai_rationale="Approved shared recommendation.",
+        suggested_entry=50,
+        suggested_stop_loss=48,
+        suggested_take_profit=55,
+        estimated_risk_reward=2.5,
+        provider_type="openai_simulation",
+        model_name="gpt-5-mini",
+        mode="simulation",
+        source_kind="agent",
+        metadata_json={"preferred_strategy": "trend-following"},
+    )
+    db.add(signal)
+    db.flush()
+    db.add(
+        SignalEvaluation(
+            signal_id=signal.id,
+            approved=True,
+            evaluator="simulation-automation",
+            reason="Prepared for manual review.",
+            outcome="recommended",
+        )
+    )
+    db.commit()
+
+    workspace = trading_workspace_service.get_workspace(db, "live")
+    assert len(workspace["recommendations"]) == 1
+    assert workspace["recommendations"][0]["signal_id"] == signal.id
+    assert workspace["recommendations"][0]["reason"] == "Prepared for manual review."
+
+
+def test_reject_recommendation_marks_signal_rejected() -> None:
+    db = build_session()
+    asset = Asset(symbol="RJCT", name="Reject Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    signal = Signal(
+        asset_id=asset.id,
+        action="sell",
+        confidence=0.7,
+        status="approved",
+        occurred_at=utcnow(),
+        indicators_json={},
+        related_news_ids=[],
+        related_event_ids=[],
+        ai_rationale="Rejected by operator.",
+        suggested_entry=20,
+        suggested_stop_loss=21,
+        suggested_take_profit=18,
+        estimated_risk_reward=1.5,
+        provider_type="openai_simulation",
+        model_name="gpt-5-mini",
+        mode="simulation",
+        source_kind="agent",
+        metadata_json={"preferred_strategy": "mean-reversion"},
+    )
+    db.add(signal)
+    db.commit()
+
+    result = trading_workspace_service.reject_recommendation(db, "simulation", signal.id, "Operator declined this setup.")
+    db.commit()
+
+    updated_signal = db.get(Signal, signal.id)
+    evaluation = db.scalar(select(SignalEvaluation).where(SignalEvaluation.signal_id == signal.id).order_by(SignalEvaluation.created_at.desc()))
+
+    assert result["outcome"] == "rejected"
+    assert updated_signal is not None
+    assert updated_signal.status == "rejected"
+    assert evaluation is not None
+    assert evaluation.reason == "Operator declined this setup."

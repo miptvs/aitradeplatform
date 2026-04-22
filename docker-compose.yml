@@ -1,0 +1,172 @@
+x-frontend-base: &frontend-base
+  build:
+    context: ./apps/frontend
+  image: ai-trader-frontend:local
+  env_file:
+    - .env
+  depends_on:
+    backend:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    interval: 15s
+    timeout: 5s
+    retries: 10
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-trader-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai_trader}
+      POSTGRES_USER: ${POSTGRES_USER:-ai_trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_trader}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_trader} -d ${POSTGRES_DB:-ai_trader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-trader-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./services/backend
+    container_name: ai-trader-backend
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "alembic upgrade head &&
+      python -m app.db.seed &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/live', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: ./services/backend
+    container_name: ai-trader-worker
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "-l", "info"]
+
+  scheduler:
+    build:
+      context: ./services/backend
+    container_name: ai-trader-scheduler
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "-l", "info"]
+
+  frontend:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-openai
+    ports:
+      - "3000:3000"
+
+  frontend-anthropic:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-anthropic
+    ports:
+      - "3001:3000"
+
+  frontend-gemini:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-gemini
+    ports:
+      - "3002:3000"
+
+  frontend-deepseek:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-deepseek
+    ports:
+      - "3003:3000"
+
+  frontend-local-gpt-oss:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-local-gpt-oss
+    ports:
+      - "4000:3000"
+
+  frontend-local-qwen25:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-local-qwen25
+    ports:
+      - "4001:3000"
+
+  frontend-local-qwen3:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-local-qwen3
+    ports:
+      - "4002:3000"
+
+  frontend-local-llama3:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-local-llama3
+    ports:
+      - "4003:3000"
+
+  frontend-local-deepseek-r1:
+    <<: *frontend-base
+    container_name: ai-trader-frontend-local-deepseek-r1
+    ports:
+      - "4004:3000"
+
+  ollama:
+    build:
+      context: ./services/ollama
+    container_name: ai-trader-ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_PRELOAD_MODELS: ${OLLAMA_PRELOAD_MODELS:-true}
+      OLLAMA_MODELS: ${OLLAMA_MODELS:-gpt-oss:20b,qwen2.5:7b-instruct,qwen3:8b,llama3.1:8b,llama3.2:3b,deepseek-r1:8b}
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
