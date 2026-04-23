@@ -60,8 +60,6 @@ export default function SignalsPage() {
           <h1 className="mt-1 text-2xl font-semibold text-slate-100">Real model-backed signal candidates</h1>
           <div className="mt-2 text-sm text-slate-400">
             Active signal model: <span style={{ color: workspace.theme.primary }}>{workspace.signalProviderType}</span>
-            {" "}
-            <span className="text-slate-500">· simulation profile for this workspace</span>
           </div>
         </div>
         <button
@@ -75,7 +73,7 @@ export default function SignalsPage() {
             opacity: refreshing ? 0.65 : 1,
           }}
         >
-          {refreshing ? "Refreshing..." : "Refresh real signals"}
+          {refreshing ? "Refreshing..." : "Refresh signals"}
         </button>
       </div>
 
@@ -101,11 +99,7 @@ export default function SignalsPage() {
       ) : null}
 
       <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-300 shadow-panel">
-        This page only shows agent-generated signals for the current workspace model. Older template/demo-era signal rows are intentionally hidden, and refresh now reports whether data updated, no candidates qualified, or the provider itself is blocking generation.
-      </div>
-
-      <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-300 shadow-panel">
-        If you enabled the <span className="font-semibold text-slate-100">Actual Trading</span> tab in Settings, that does not change this page’s target profile. Signals on this route are generated with the workspace’s <span className="font-semibold text-slate-100">Simulation</span> provider.
+        This page shows the common signal pool for the current workspace model. Older template/demo-era signal rows are intentionally hidden, and refresh now reports whether data updated, no candidates qualified, or the provider itself is blocking generation.
       </div>
 
       <div className="grid gap-3 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel md:grid-cols-3">

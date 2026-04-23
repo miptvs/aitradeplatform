@@ -222,8 +222,9 @@ class NewsService:
                 feed_report["status"] = "stale"
             feed_reports.append(feed_report)
 
+        successful_feeds = len(feed_urls) - feeds_failed
         status = "ok"
-        if feeds_failed and articles_added == 0:
+        if successful_feeds <= 0:
             status = "error"
         elif feeds_failed:
             status = "warn"

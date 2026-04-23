@@ -5,10 +5,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models.asset import Asset
+from app.models.audit import Alert
 from app.models.base import Base
 from app.models.health import SystemHealthEvent
 from app.models.news import NewsArticle
 from app.services.news.service import news_service
+from app.tasks import periodic
 from app.utils.time import utcnow
 
 
@@ -151,3 +153,76 @@ def test_refresh_latest_news_force_refresh_backfills_recent_items(monkeypatch) -
     assert result["articles_added"] == 1
     assert result["force_refresh"] is True
     assert result["feed_reports"][0]["added_count"] == 1
+
+
+def test_refresh_latest_news_partial_feed_failure_is_warn_not_error(monkeypatch) -> None:
+    db = build_session()
+    db.add(Asset(symbol="SPY", name="SPDR S&P 500 ETF Trust", asset_type="etf", sector="Index", exchange="NYSEARCA", currency="USD"))
+    db.commit()
+
+    empty_feed = """
+    <rss version="2.0">
+      <channel></channel>
+    </rss>
+    """.strip()
+
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://example.com/ok", "https://example.com/fail"])
+
+    def fake_fetch(url: str) -> str:
+        if url.endswith("/fail"):
+            raise RuntimeError("temporary upstream timeout")
+        return empty_feed
+
+    monkeypatch.setattr(news_service, "_fetch_feed", fake_fetch)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+
+    latest_event = db.query(SystemHealthEvent).filter(SystemHealthEvent.component == "news.rss_refresh").order_by(SystemHealthEvent.observed_at.desc()).first()
+    assert result["articles_added"] == 0
+    assert result["feeds_failed"] == 1
+    assert latest_event is not None
+    assert latest_event.status == "warn"
+
+
+def test_alert_generation_resolves_stale_news_error_alert(monkeypatch) -> None:
+    db = build_session()
+    db.add(
+        Alert(
+            category="health",
+            severity="warning",
+            title="news.rss_refresh reported an error",
+            message="Old failure",
+            status="open",
+            mode="system",
+            source_ref="news.rss_refresh",
+            metadata_json={},
+        )
+    )
+    db.add(
+        SystemHealthEvent(
+            component="news.rss_refresh",
+            status="warn",
+            message="Feeds were stale but reachable.",
+            metadata_json={},
+            observed_at=utcnow(),
+        )
+    )
+    db.commit()
+
+    class _SessionContext:
+        def __enter__(self):
+            return db
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(periodic, "SessionLocal", lambda: _SessionContext())
+
+    result = periodic.alert_generation()
+    db.expire_all()
+
+    alert = db.query(Alert).filter(Alert.title == "news.rss_refresh reported an error").first()
+    assert result["cleaned"] >= 1
+    assert alert is not None
+    assert alert.status == "resolved"

@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.asset import Asset
-from app.models.audit import Alert
 from app.models.broker import BrokerAccount
 from app.models.portfolio import PortfolioSnapshot, Position
 from app.models.signal import Signal, SignalEvaluation
@@ -17,6 +16,7 @@ from app.models.trading import TradingAutomationProfile
 from app.schemas.portfolio import OrderCreate
 from app.schemas.trading import TradingAutomationProfileUpsert
 from app.services.audit.service import audit_service
+from app.services.alerts.service import alert_service
 from app.services.brokers.service import broker_service
 from app.services.market_data.service import market_data_service
 from app.services.portfolio.service import portfolio_service
@@ -98,16 +98,6 @@ class TradingWorkspaceService:
             orders = portfolio_service.list_orders(db, mode="simulation", simulation_account_id=simulation_account.id if simulation_account else None)
             trades = portfolio_service.list_trades(db, mode="simulation", simulation_account_id=simulation_account.id if simulation_account else None)
 
-        alerts = list(
-            db.scalars(
-                select(Alert)
-                .where(Alert.status == "open")
-                .order_by(desc(Alert.created_at))
-                .limit(30)
-            )
-        )
-        filtered_alerts = [alert for alert in alerts if alert.mode in {None, "system", mode}]
-
         return {
             "mode": mode,
             "account": account_summary,
@@ -117,7 +107,7 @@ class TradingWorkspaceService:
             "trades": trades,
             "signals": self._workspace_signals(db, mode),
             "recommendations": self._workspace_recommendations(db, mode),
-            "alerts": filtered_alerts,
+            "alerts": alert_service.list_alerts(db, mode=mode),
             "assets": market_data_service.list_asset_views(db),
             "strategies": [self._strategy_view(item) for item in strategy_service.list_strategies(db)],
             "controls": controls,
@@ -159,23 +149,23 @@ class TradingWorkspaceService:
             processed += 1
             asset = db.get(Asset, signal.asset_id)
             if asset is None:
-                decisions.append(self._reject_signal(db, signal, "Signal asset is missing from the current asset universe."))
+                decisions.append(self._reject_signal(db, signal, mode, "Signal asset is missing from the current asset universe."))
                 rejected_signals += 1
                 continue
             if signal.action not in {"buy", "sell"}:
-                decisions.append(self._reject_signal(db, signal, "Only buy and sell signals are tradable."))
+                decisions.append(self._reject_signal(db, signal, mode, "Only buy and sell signals are tradable."))
                 rejected_signals += 1
                 continue
 
             entry_price = signal.suggested_entry or market_data_service.get_latest_price(db, signal.asset_id)
             if entry_price <= 0:
-                decisions.append(self._reject_signal(db, signal, "Signal entry price is invalid."))
+                decisions.append(self._reject_signal(db, signal, mode, "Signal entry price is invalid."))
                 rejected_signals += 1
                 continue
 
             quantity = round(profile.default_order_notional / entry_price, 8)
             if quantity <= 0:
-                decisions.append(self._reject_signal(db, signal, "Configured default notional is too small for this symbol."))
+                decisions.append(self._reject_signal(db, signal, mode, "Configured default notional is too small for this symbol."))
                 rejected_signals += 1
                 continue
 
@@ -185,7 +175,6 @@ class TradingWorkspaceService:
             decision_reason = f"{profile.approval_mode.replace('_', ' ')} automation from signal {signal.id}"
 
             if profile.approval_mode in {"manual_only", "semi_automatic"}:
-                signal.status = "approved"
                 db.add(
                     SignalEvaluation(
                         signal_id=signal.id,
@@ -235,7 +224,6 @@ class TradingWorkspaceService:
                 ),
             )
             success = order.status in {"accepted", "filled"}
-            signal.status = "executed" if success else "rejected"
             db.add(
                 SignalEvaluation(
                     signal_id=signal.id,
@@ -349,13 +337,12 @@ class TradingWorkspaceService:
             "decisions": decisions,
         }
 
-    def _reject_signal(self, db: Session, signal: Signal, reason: str) -> dict[str, Any]:
-        signal.status = "rejected"
+    def _reject_signal(self, db: Session, signal: Signal, mode: str, reason: str) -> dict[str, Any]:
         db.add(
             SignalEvaluation(
                 signal_id=signal.id,
                 approved=False,
-                evaluator=f"{signal.mode}-automation",
+                evaluator=f"{mode}-automation",
                 reason=reason,
                 expected_return=signal.estimated_risk_reward,
                 outcome="rejected",
@@ -376,34 +363,33 @@ class TradingWorkspaceService:
 
     def _workspace_signals(self, db: Session, mode: str) -> list[dict]:
         signals = list(db.scalars(select(Signal).order_by(desc(Signal.occurred_at)).limit(40)))
-        filtered = [signal for signal in signals if self._signal_matches_mode(signal, mode)]
-        if mode == "live" and not filtered:
-            filtered = [signal for signal in signals if signal.mode in {"simulation", "both"}]
-        return [self._signal_view(db, signal) for signal in filtered[:12]]
+        return [self._signal_view(db, signal) for signal in signals[:12]]
 
     def _workspace_recommendations(self, db: Session, mode: str) -> list[dict]:
         signals = list(
             db.scalars(
-                select(Signal)
-                .where(Signal.status == "approved")
-                .order_by(desc(Signal.occurred_at))
-                .limit(30)
+                select(Signal).order_by(desc(Signal.occurred_at)).limit(40)
             )
         )
-        filtered = [signal for signal in signals if self._signal_matches_mode(signal, mode)]
-        if mode == "live" and not filtered:
-            filtered = [signal for signal in signals if signal.mode in {"simulation", "both"}]
-        return [self._recommendation_view(db, signal) for signal in filtered[:10]]
+        recommendations: list[dict[str, Any]] = []
+        for signal in signals:
+            evaluation = self._latest_mode_evaluation(db, signal.id, mode)
+            if evaluation is None or evaluation.outcome != "recommended":
+                continue
+            recommendations.append(self._recommendation_view(db, signal, evaluation))
+            if len(recommendations) >= 10:
+                break
+        return recommendations
 
     def reject_recommendation(self, db: Session, mode: str, signal_id: str, reason: str | None = None) -> dict[str, Any]:
         signal = db.get(Signal, signal_id)
         if signal is None:
             raise ValueError("Recommendation signal not found.")
-        if signal.status not in {"approved", "candidate"}:
+        evaluation = self._latest_mode_evaluation(db, signal.id, mode)
+        if evaluation is None or evaluation.outcome != "recommended":
             raise ValueError("This signal is no longer waiting for operator review.")
 
         final_reason = reason or "Rejected from the operator approval queue."
-        signal.status = "rejected"
         db.add(
             SignalEvaluation(
                 signal_id=signal.id,
@@ -440,17 +426,17 @@ class TradingWorkspaceService:
         signals = list(
             db.scalars(
                 select(Signal)
-                .where(Signal.status.in_(["candidate", "approved"]))
+                .where(Signal.source_kind == "agent")
                 .order_by(desc(Signal.occurred_at))
                 .limit(60)
             )
         )
-        filtered = [signal for signal in signals if self._signal_matches_mode(signal, mode)]
-        if mode == "live" and not filtered:
-            filtered = [signal for signal in signals if signal.mode == "simulation"]
 
         results: list[Signal] = []
-        for signal in filtered:
+        for signal in signals:
+            latest_mode_evaluation = self._latest_mode_evaluation(db, signal.id, mode)
+            if latest_mode_evaluation and latest_mode_evaluation.outcome in {"recommended", "executed", "manual_rejected", "rejected"}:
+                continue
             if signal.action not in profile.tradable_actions:
                 continue
             if signal.confidence < profile.confidence_threshold:
@@ -462,11 +448,6 @@ class TradingWorkspaceService:
                 continue
             results.append(signal)
         return results
-
-    def _signal_matches_mode(self, signal: Signal, mode: str) -> bool:
-        if signal.mode in {mode, "both"}:
-            return True
-        return False
 
     def _strategy_view(self, strategy: Strategy) -> dict[str, Any]:
         return {
@@ -662,24 +643,14 @@ class TradingWorkspaceService:
             "indicators_json": signal.indicators_json,
             "related_news_ids": signal.related_news_ids,
             "related_event_ids": signal.related_event_ids,
-            "mode": signal.mode,
+            "mode": self._display_signal_mode(signal.mode),
             "source_kind": signal.source_kind,
         }
 
-    def _recommendation_view(self, db: Session, signal: Signal) -> dict[str, Any]:
+    def _recommendation_view(self, db: Session, signal: Signal, evaluation: SignalEvaluation) -> dict[str, Any]:
         asset = db.get(Asset, signal.asset_id)
-        latest_evaluation = db.scalar(
-            select(SignalEvaluation)
-            .where(SignalEvaluation.signal_id == signal.id)
-            .order_by(desc(SignalEvaluation.created_at))
-            .limit(1)
-        )
-        queued_at = latest_evaluation.created_at if latest_evaluation else signal.occurred_at
-        reason = (
-            latest_evaluation.reason
-            if latest_evaluation and latest_evaluation.reason
-            else "Approved by automation and waiting for operator review."
-        )
+        queued_at = evaluation.created_at if evaluation else signal.occurred_at
+        reason = evaluation.reason if evaluation.reason else "Approved by automation and waiting for operator review."
         return {
             "signal_id": signal.id,
             "asset_id": signal.asset_id,
@@ -690,8 +661,8 @@ class TradingWorkspaceService:
             "strategy_slug": signal.metadata_json.get("preferred_strategy"),
             "provider_type": signal.provider_type,
             "model_name": signal.model_name,
-            "status": signal.status,
-            "mode": signal.mode,
+            "status": "approved",
+            "mode": self._display_signal_mode(signal.mode),
             "occurred_at": signal.occurred_at,
             "queued_at": queued_at,
             "reason": reason,
@@ -700,6 +671,22 @@ class TradingWorkspaceService:
             "suggested_take_profit": signal.suggested_take_profit,
             "estimated_risk_reward": signal.estimated_risk_reward,
         }
+
+    def _latest_mode_evaluation(self, db: Session, signal_id: str, mode: str) -> SignalEvaluation | None:
+        return db.scalar(
+            select(SignalEvaluation)
+            .where(
+                SignalEvaluation.signal_id == signal_id,
+                SignalEvaluation.evaluator.startswith(f"{mode}-"),
+            )
+            .order_by(desc(SignalEvaluation.created_at))
+            .limit(1)
+        )
+
+    def _display_signal_mode(self, stored_mode: str | None) -> str:
+        if stored_mode in {"live", "simulation", "both", "shared", None}:
+            return "shared"
+        return stored_mode
 
 
 trading_workspace_service = TradingWorkspaceService()

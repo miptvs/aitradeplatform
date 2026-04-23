@@ -160,13 +160,27 @@ def alert_generation() -> dict:
     with SessionLocal() as db:
         cleaned = 0
         supported_provider_components = {f"provider:{provider_type}" for provider_type in provider_service.catalog}
+        open_health_alerts = list(db.scalars(select(Alert).where(Alert.status == "open", Alert.category == "health")))
+        for alert in open_health_alerts:
+            if not alert.title.endswith(" reported an error"):
+                continue
+            component = alert.source_ref if alert.source_ref and ":" in alert.source_ref else alert.title.removesuffix(" reported an error")
+            latest_event = db.scalar(
+                select(SystemHealthEvent)
+                .where(SystemHealthEvent.component == component)
+                .order_by(desc(SystemHealthEvent.observed_at))
+                .limit(1)
+            )
+            if latest_event is None or latest_event.status != "error":
+                cleaned += alert_service.resolve_alerts(db, title=alert.title)
+
         recent_provider_errors = [
-            event for event in db.scalars(select(SystemHealthEvent).where(SystemHealthEvent.status == "error").order_by(desc(SystemHealthEvent.observed_at)).limit(5))
+            event for event in db.scalars(select(SystemHealthEvent).where(SystemHealthEvent.status == "error").order_by(desc(SystemHealthEvent.observed_at)).limit(10))
         ]
         created = 0
         for event in recent_provider_errors:
             if event.component.startswith("provider:") and event.component not in supported_provider_components:
-                cleaned += alert_service.resolve_alerts(db, source_ref=event.id, title=f"{event.component} reported an error")
+                cleaned += alert_service.resolve_alerts(db, title=f"{event.component} reported an error")
                 continue
 
             alert_service.create_alert(
@@ -176,7 +190,8 @@ def alert_generation() -> dict:
                 title=f"{event.component} reported an error",
                 message=event.message,
                 mode="system",
-                source_ref=event.id,
+                source_ref=event.component,
+                metadata={"latest_event_id": event.id, "observed_at": event.observed_at.isoformat()},
                 dedupe=True,
             )
             created += 1

@@ -1,6 +1,5 @@
 import type { Signal } from "@/types";
 import { formatCurrency } from "@/lib/utils";
-import { ModeBadge } from "@/components/ui/mode-badge";
 import { StatusBadge } from "@/components/ui/status-badge";
 
 export function SignalsTable({ signals }: { signals: Signal[] }) {
@@ -30,9 +29,11 @@ export function SignalsTable({ signals }: { signals: Signal[] }) {
                 </td>
                 <td className="uppercase text-slate-200">{signal.action}</td>
                 <td>{(signal.confidence * 100).toFixed(1)}%</td>
-                <td className="text-xs text-slate-300">
-                  <div>{signal.strategy_name || signal.strategy_slug || "-"}</div>
-                  <div>{signal.ai_rationale || "-"}</div>
+                <td className="min-w-[14rem] text-xs">
+                  <div className="font-semibold text-slate-100">{signal.strategy_name || signal.strategy_slug || "-"}</div>
+                  <div className="mt-1 text-[11px] leading-5 text-slate-400" title={signal.ai_rationale || undefined}>
+                    {truncateText(signal.ai_rationale || "No AI rationale recorded yet.", 140)}
+                  </div>
                 </td>
                 <td className="text-xs text-slate-300">
                   <div>Entry {signal.suggested_entry ? formatCurrency(signal.suggested_entry) : "-"}</div>
@@ -40,10 +41,7 @@ export function SignalsTable({ signals }: { signals: Signal[] }) {
                   <div>TP {signal.suggested_take_profit ? formatCurrency(signal.suggested_take_profit) : "-"}</div>
                 </td>
                 <td>
-                  <div className="flex items-center gap-2">
-                    <StatusBadge status={signal.status} />
-                    <ModeBadge mode={signal.mode} />
-                  </div>
+                  <StatusBadge status={signal.status} />
                 </td>
                 <td className="text-xs text-slate-300">
                   <div>{signal.provider_type || "-"}</div>
@@ -56,4 +54,9 @@ export function SignalsTable({ signals }: { signals: Signal[] }) {
       </div>
     </div>
   );
+}
+
+function truncateText(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1)}…`;
 }

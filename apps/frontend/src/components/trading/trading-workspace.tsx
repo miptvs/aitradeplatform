@@ -38,7 +38,7 @@ export function TradingWorkspace({
   description: string;
 }) {
   const workspace = useWorkspace();
-  const [activePanel, setActivePanel] = useState<PanelMode>("manual");
+  const [activePanel, setActivePanel] = useState<PanelMode>("automatic");
   const [selectedSimulationAccountId, setSelectedSimulationAccountId] = useState("");
   const workspaceState = useApi<TradingWorkspaceData>(
     () => (mode === "live" ? api.getLiveWorkspace() : api.getSimulationWorkspace(selectedSimulationAccountId || undefined)),
@@ -315,8 +315,8 @@ export function TradingWorkspace({
             value={activePanel}
             onChange={(value) => setActivePanel(value as PanelMode)}
             options={[
-              { value: "manual", label: "Manual Trading" },
               { value: "automatic", label: "Automatic Trading" },
+              { value: "manual", label: "Manual Trading" },
             ]}
           />
           <button
@@ -327,15 +327,6 @@ export function TradingWorkspace({
           >
             <RefreshCcw size={15} />
             Refresh
-          </button>
-          <button
-            type="button"
-            onClick={() => setManualPositionOpen(true)}
-            className="rounded-xl border px-3 py-2 text-sm"
-            style={{ borderColor: workspace.theme.accentBorder, color: workspace.theme.primary, backgroundColor: workspace.theme.accentSurface }}
-            title="Mirror an externally executed fill or seed a manual position without sending an order."
-          >
-            Mirror manual position
           </button>
         </div>
       </div>
@@ -412,6 +403,7 @@ export function TradingWorkspace({
               setSearchQuery(asset.symbol);
             }}
             onChange={setOrderForm}
+            onOpenExistingPosition={() => setManualPositionOpen(true)}
             onOpenReview={() => setReviewOpen(true)}
           />
         ) : (
@@ -453,7 +445,7 @@ export function TradingWorkspace({
           </div>
           <PositionManagementTable
             positions={workspaceData.positions}
-            emptyMessage={`No ${mode} positions yet. Use the order ticket or mirror a manual fill to get started.`}
+            emptyMessage={`No ${mode} positions yet. Use the order ticket or record an existing fill to get started.`}
             onViewDetails={setDetailPosition}
             onEditStops={(position) => {
               setStopDialogPosition(position);
@@ -480,8 +472,8 @@ export function TradingWorkspace({
           <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Signals ready for this lane</div>
-                <div className="mt-1 text-sm text-slate-400">These are the signal candidates most relevant to the current workspace and trading mode.</div>
+                <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Signals available here</div>
+                <div className="mt-1 text-sm text-slate-400">These signal candidates feed both live and simulation. The lane-specific part starts only when you review, approve, or automate against a signal.</div>
               </div>
               <StatusBadge status={workspaceData.account.status} />
             </div>
@@ -594,8 +586,8 @@ export function TradingWorkspace({
 
       <Dialog
         open={manualPositionOpen}
-        title="Mirror manual position"
-        description="Use this when you already executed a trade elsewhere, or when you want live and simulation ledgers to reflect a known starting position before automation takes over."
+        title="Add existing position"
+        description="Use this when the trade already exists in your broker or outside this ticket and you want the workspace to start tracking it. This records the position for monitoring, stops, and parity. It does not place a new order."
         actions={
           <button type="button" onClick={() => setManualPositionOpen(false)} className="rounded-xl border border-border px-3 py-2 text-sm text-slate-300 hover:bg-white/5">
             Close
@@ -629,7 +621,7 @@ export function TradingWorkspace({
                 tags: ["manual", mode],
               };
               await api.createPosition(payload);
-              setBanner({ tone: "success", message: `Manual ${mode} position added.` });
+              setBanner({ tone: "success", message: `Existing ${mode} position recorded.` });
               setManualPositionOpen(false);
               workspaceState.reload();
             } catch (error) {
@@ -686,7 +678,7 @@ export function TradingWorkspace({
           <Field label="Notes">
             <textarea rows={3} value={manualPositionForm.notes} onChange={(event) => setManualPositionForm((current) => ({ ...current, notes: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
           </Field>
-          <button className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">Save manual position</button>
+          <button className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">Record existing position</button>
         </form>
       </Dialog>
 
@@ -968,6 +960,7 @@ function OrderEntryPanel({
   onSearchQueryChange,
   onChooseAsset,
   onChange,
+  onOpenExistingPosition,
   onOpenReview,
 }: {
   mode: TradingMode;
@@ -985,6 +978,7 @@ function OrderEntryPanel({
   onSearchQueryChange: (value: string) => void;
   onChooseAsset: (asset: AssetSearchResult) => void;
   onChange: Dispatch<SetStateAction<any>>;
+  onOpenExistingPosition: () => void;
   onOpenReview: () => void;
 }) {
   return (
@@ -995,8 +989,21 @@ function OrderEntryPanel({
           <div className="mt-1 text-sm text-slate-400">
             The simulation and live tickets share the same structure so you can practise the workflow before you switch to the guarded live lane.
           </div>
+          <div className="mt-2 text-xs text-slate-500">
+            Need to track something you already bought or sold elsewhere? Use <span className="font-semibold text-slate-300">Add existing position</span>. It records the holding here without sending a new order.
+          </div>
         </div>
-        <StatusBadge status={mode === "live" ? "live" : "simulation"} />
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge status={mode === "live" ? "live" : "simulation"} />
+          <button
+            type="button"
+            onClick={onOpenExistingPosition}
+            className="rounded-xl border border-border px-3 py-2 text-xs font-medium text-slate-200 hover:bg-white/5"
+            title="Records a position that already exists in your broker or outside this order ticket so this workspace can manage stops and reporting."
+          >
+            Add existing position
+          </button>
+        </div>
       </div>
 
       <div className="mt-4 grid gap-4">
