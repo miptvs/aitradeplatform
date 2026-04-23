@@ -1,9 +1,4 @@
-<<<<<<< HEAD
-# aitradeplatform
-=======
-# AI Trader Platform
-
-Local-first AI-assisted trading and portfolio analysis platform built as a Dockerized monorepo. The MVP emphasizes strict separation between simulation and live trading, pluggable model providers, auditability, typed APIs, and a dense trading-terminal style dashboard.
+AI-assisted trading and portfolio analysis platform built as a Dockerized monorepo. The MVP emphasizes strict separation between simulation and live trading, pluggable model providers, auditability, typed APIs, and a dense trading-terminal style dashboard.
 
 ## Current iteration snapshot
 
