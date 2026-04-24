@@ -78,6 +78,7 @@ export interface Position {
   asset_id: string;
   symbol: string;
   asset_name: string;
+  signal_id?: string | null;
   mode: string;
   manual: boolean;
   manual_override: boolean;
@@ -103,6 +104,8 @@ export interface Order {
   asset_id: string;
   symbol: string;
   asset_name: string;
+  signal_id?: string | null;
+  position_id?: string | null;
   mode: string;
   side: string;
   order_type: string;
@@ -131,7 +134,11 @@ export interface Trade {
   asset_id: string;
   symbol: string;
   asset_name: string;
+  order_id?: string | null;
+  position_id?: string | null;
+  signal_id?: string | null;
   mode: string;
+  manual: boolean;
   side: string;
   quantity: number;
   price: number;
@@ -168,6 +175,55 @@ export interface Signal {
   related_event_ids: string[];
   mode: string;
   source_kind: string;
+  metadata_json: Record<string, unknown>;
+  signal_flavor: string;
+  fresh_news_used: boolean;
+  lane_statuses: Record<string, string>;
+}
+
+export interface SignalEvaluation {
+  id: string;
+  signal_id: string;
+  approved: boolean;
+  evaluator: string;
+  reason?: string | null;
+  risk_score?: number | null;
+  expected_return?: number | null;
+  realized_return?: number | null;
+  outcome?: string | null;
+  created_at: string;
+}
+
+export interface SignalDetail extends Signal {
+  strategy_id?: string | null;
+  strategy_slug?: string | null;
+  related_news: NewsArticle[];
+  related_events: ExtractedEvent[];
+}
+
+export interface AuditLog {
+  id: string;
+  actor: string;
+  action: string;
+  target_type: string;
+  target_id?: string | null;
+  status: string;
+  mode?: string | null;
+  details_json: Record<string, unknown>;
+  occurred_at: string;
+}
+
+export interface SignalTrace {
+  signal?: SignalDetail | null;
+  entrypoint: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  risk_checks: Array<Record<string, unknown>>;
+  stop_history: Array<Record<string, unknown>>;
+  evaluations: SignalEvaluation[];
+  orders: Order[];
+  positions: Position[];
+  trades: Trade[];
+  audit_logs: AuditLog[];
 }
 
 export interface NewsArticle {
@@ -343,6 +399,10 @@ export interface TradingAutomationProfile {
   name: string;
   enabled: boolean;
   automation_enabled: boolean;
+  scheduled_execution_enabled: boolean;
+  execution_interval_seconds: number;
+  inherit_from_live: boolean;
+  effective_source_mode: string;
   approval_mode: "manual_only" | "semi_automatic" | "fully_automatic" | string;
   allowed_strategy_slugs: string[];
   tradable_actions: string[];
@@ -355,6 +415,9 @@ export interface TradingAutomationProfile {
   max_orders_per_run: number;
   risk_profile: string;
   notes?: string | null;
+  last_run_at?: string | null;
+  last_scheduled_run_at?: string | null;
+  next_scheduled_run_at?: string | null;
   last_run_status?: string | null;
   last_run_message?: string | null;
   config_json: Record<string, unknown>;
@@ -417,6 +480,14 @@ export interface AutomationRunResult {
   approved_recommendations: number;
   rejected_signals: number;
   decisions: AutomationDecision[];
+}
+
+export interface PositionAction {
+  key: string;
+  label: string;
+  description: string;
+  destructive: boolean;
+  requires_confirmation: boolean;
 }
 
 export interface TradingRecommendation {
@@ -501,6 +572,8 @@ export interface SettingsOverview {
   providers: ProviderConfig[];
   task_mappings: TaskMapping[];
   risk_rules: RiskRule[];
+  live_automation: TradingAutomationProfile;
+  simulation_automation: TradingAutomationProfile;
   live_trading_enabled: boolean;
 }
 

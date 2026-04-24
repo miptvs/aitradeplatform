@@ -53,9 +53,11 @@ class Settings(BaseSettings):
     news_feed_items_limit: int = 12
     news_initial_lookback_hours: int = 72
     news_refresh_overlap_minutes: int = 720
+    news_incremental_backfill_hours: int = 48
     news_force_backfill_hours: int = 48
     news_symbol_feed_limit: int = 6
     signal_refresh_seconds: int = 300
+    automation_scan_seconds: int = 60
     provider_health_seconds: int = 900
     portfolio_snapshot_seconds: int = 300
 

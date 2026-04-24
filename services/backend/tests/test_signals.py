@@ -6,10 +6,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models.asset import Asset, MarketSnapshot
 from app.models.base import Base
 from app.models.news import NewsArticle
+from app.models.portfolio import Position
 from app.models.provider import ProviderConfig
 from app.models.signal import Signal
 from app.models.strategy import Strategy
 from app.services.providers.base import ProviderRunResult
+from app.services.signals.strategies import StrategyDecision
 from app.services.signals.service import signal_service
 from app.utils.time import utcnow
 
@@ -197,3 +199,31 @@ def test_generate_signals_surfaces_provider_error_with_symbol_context(monkeypatc
         assert str(exc).startswith("AAPL: provider timeout")
     else:
         raise AssertionError("Expected provider error to be surfaced")
+
+
+def test_position_exit_decision_creates_low_confidence_sell_watch() -> None:
+    position = Position(
+        asset_id="asset-1",
+        quantity=1,
+        avg_entry_price=205,
+        current_price=199,
+        status="open",
+        mode="simulation",
+    )
+    indicators = {
+        "close": 199,
+        "sma_30": 202,
+        "momentum_10": -0.03,
+        "macd_histogram": -0.15,
+    }
+    decisions = {
+        "breakout": StrategyDecision("sell", 0.63, "Testing support with downside pressure."),
+        "mean-reversion": StrategyDecision("buy", 0.68, "Oversold bounce possible."),
+        "blended": StrategyDecision("hold", 0.48, "Mixed thesis."),
+    }
+
+    decision = signal_service._position_exit_decision(position, "NVDA", indicators, decisions)
+
+    assert decision is not None
+    assert decision["trigger"] == "mixed_exit_watch"
+    assert decision["confidence"] < 0.58

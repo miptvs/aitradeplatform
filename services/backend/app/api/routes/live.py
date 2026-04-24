@@ -4,7 +4,17 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.broker import BrokerSyncResult
 from app.schemas.portfolio import OrderCreate, OrderRead, PositionRead, PositionUpdate
-from app.schemas.trading import AutomationDecisionRead, AutomationRunResult, RecommendationRejectRequest, TradingAccountSummary, TradingAutomationProfileRead, TradingAutomationProfileUpsert, TradingWorkspaceRead
+from app.schemas.trading import (
+    AutomationDecisionRead,
+    AutomationRunResult,
+    PositionActionRead,
+    RecommendationRejectRequest,
+    SignalApproveRequest,
+    TradingAccountSummary,
+    TradingAutomationProfileRead,
+    TradingAutomationProfileUpsert,
+    TradingWorkspaceRead,
+)
 from app.services.brokers.service import broker_service
 from app.services.portfolio.service import portfolio_service
 from app.services.trading.service import trading_workspace_service
@@ -78,7 +88,10 @@ def close_live_position(
 
 @router.get("/automation", response_model=TradingAutomationProfileRead)
 def get_automation(db: Session = Depends(get_db)) -> TradingAutomationProfileRead:
-    return TradingAutomationProfileRead.model_validate(trading_workspace_service.serialize_profile(trading_workspace_service.get_or_create_profile(db, "live")))
+    stored_profile, source_profile, inherit_from_live = trading_workspace_service.resolve_profile_pair(db, "live")
+    return TradingAutomationProfileRead.model_validate(
+        trading_workspace_service.serialize_profile(stored_profile, source_profile, inherit_from_live)
+    )
 
 
 @router.put("/automation", response_model=TradingAutomationProfileRead)
@@ -86,7 +99,10 @@ def save_automation(payload: TradingAutomationProfileUpsert, db: Session = Depen
     profile = trading_workspace_service.upsert_profile(db, "live", payload)
     db.commit()
     db.refresh(profile)
-    return TradingAutomationProfileRead.model_validate(trading_workspace_service.serialize_profile(profile))
+    stored_profile, source_profile, inherit_from_live = trading_workspace_service.resolve_profile_pair(db, "live")
+    return TradingAutomationProfileRead.model_validate(
+        trading_workspace_service.serialize_profile(stored_profile, source_profile, inherit_from_live)
+    )
 
 
 @router.post("/automation/run", response_model=AutomationRunResult)
@@ -104,6 +120,25 @@ def reject_recommendation(signal_id: str, payload: RecommendationRejectRequest |
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.commit()
     return AutomationDecisionRead.model_validate(result)
+
+
+@router.post("/signals/{signal_id}/approve", response_model=AutomationDecisionRead)
+def approve_signal(signal_id: str, payload: SignalApproveRequest | None = None, db: Session = Depends(get_db)) -> AutomationDecisionRead:
+    try:
+        result = trading_workspace_service.approve_signal(db, "live", signal_id, payload.reason if payload else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    return AutomationDecisionRead.model_validate(result)
+
+
+@router.get("/positions/{position_id}/actions", response_model=list[PositionActionRead])
+def position_actions(position_id: str, db: Session = Depends(get_db)) -> list[PositionActionRead]:
+    try:
+        actions = trading_workspace_service.position_actions(db, position_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return [PositionActionRead.model_validate(item) for item in actions]
 
 
 @router.post("/broker-sync", response_model=BrokerSyncResult)

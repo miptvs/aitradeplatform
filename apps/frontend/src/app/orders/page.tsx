@@ -2,12 +2,16 @@
 
 import { useMemo, useState } from "react";
 
+import { TraceButton } from "@/components/provenance/provenance-chips";
+import { ProvenanceDialog } from "@/components/provenance/provenance-dialog";
 import { TradesTable } from "@/components/trades/trades-table";
 import { useApi } from "@/hooks/use-api";
+import { useProvenanceTrace } from "@/hooks/use-provenance-trace";
 import { api } from "@/lib/api";
 
 export default function OrdersPage() {
   const [mode, setMode] = useState<"all" | "live" | "simulation">("all");
+  const provenance = useProvenanceTrace();
   const { data, loading, error } = useApi(async () => {
     const [orders, trades] = await Promise.all([
       api.getOrders(mode === "all" ? undefined : { mode }),
@@ -44,7 +48,10 @@ export default function OrdersPage() {
           <div className="mt-3 space-y-2">
             {rejectedOrders.map((order) => (
               <div key={order.id} className="rounded-xl border border-amber-500/15 bg-black/20 px-3 py-2">
-                <div className="font-medium">{order.symbol} · {order.side.toUpperCase()}</div>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="font-medium">{order.symbol} · {order.side.toUpperCase()}</div>
+                  <TraceButton label="Trace" onClick={() => provenance.openTrace({ type: "order", id: order.id })} />
+                </div>
                 <div className="text-xs text-amber-100/80">{order.rejection_reason || "Rejected without a detailed reason."}</div>
               </div>
             ))}
@@ -54,13 +61,22 @@ export default function OrdersPage() {
 
       <section>
         <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Orders</div>
-        <TradesTable orders={data.orders} />
+        <TradesTable orders={data.orders} onViewTrace={(type, item) => provenance.openTrace({ type, id: item.id })} />
       </section>
 
       <section>
         <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Trades</div>
-        <TradesTable trades={data.trades} />
+        <TradesTable trades={data.trades} onViewTrace={(type, item) => provenance.openTrace({ type, id: item.id })} />
       </section>
+
+      <ProvenanceDialog
+        open={Boolean(provenance.target)}
+        signal={provenance.signal}
+        trace={provenance.trace}
+        loading={provenance.loading}
+        error={provenance.error}
+        onClose={provenance.closeTrace}
+      />
     </div>
   );
 }

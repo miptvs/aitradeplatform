@@ -3,7 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.portfolio import PositionCreate, PositionRead, PositionUpdate
+from app.schemas.signal import SignalTraceRead
 from app.services.portfolio.service import portfolio_service
+from app.services.signals.service import signal_service
 
 router = APIRouter()
 
@@ -60,3 +62,11 @@ def close_position(
     db.commit()
     db.refresh(position)
     return PositionRead.model_validate(position)
+
+
+@router.get("/{position_id}/trace", response_model=SignalTraceRead)
+def position_trace(position_id: str, db: Session = Depends(get_db)) -> SignalTraceRead:
+    try:
+        return SignalTraceRead.model_validate(signal_service.get_position_trace(db, position_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

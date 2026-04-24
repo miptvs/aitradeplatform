@@ -273,6 +273,10 @@ class PortfolioService:
         if not risk_result.approved:
             order.status = "rejected"
             order.rejection_reason = "; ".join(risk_result.rejection_reasons)
+            order.audit_context = {
+                **(order.audit_context or {}),
+                "rejection_stage": "risk",
+            }
             alert_service.create_alert(
                 db,
                 category="risk",
@@ -311,6 +315,10 @@ class PortfolioService:
             if broker_account is None:
                 order.status = "rejected"
                 order.rejection_reason = "Broker account not found."
+                order.audit_context = {
+                    **(order.audit_context or {}),
+                    "rejection_stage": "execution",
+                }
             else:
                 adapter = broker_service.get_adapter(broker_account.broker_type)
                 broker_result = adapter.place_order(broker_account, payload.model_dump())
@@ -319,6 +327,10 @@ class PortfolioService:
                 else:
                     order.status = "rejected"
                     order.rejection_reason = broker_result.message
+                    order.audit_context = {
+                        **(order.audit_context or {}),
+                        "rejection_stage": "execution",
+                    }
 
         if order.status == "rejected":
             alert_service.create_alert(
@@ -405,11 +417,18 @@ class PortfolioService:
 
     def _position_view(self, db: Session, position: Position) -> dict:
         asset = db.get(Asset, position.asset_id)
+        linked_order = db.scalar(
+            select(Order)
+            .where(Order.position_id == position.id, Order.signal_id.is_not(None))
+            .order_by(desc(Order.created_at))
+            .limit(1)
+        )
         return {
             **to_plain_dict(position),
             "symbol": asset.symbol if asset else position.asset_id,
             "asset_name": asset.name if asset else position.asset_id,
             "asset_currency": asset.currency if asset else "USD",
+            "signal_id": linked_order.signal_id if linked_order else None,
         }
 
     def _order_view(self, db: Session, order: Order) -> dict:
@@ -426,10 +445,14 @@ class PortfolioService:
 
     def _trade_view(self, db: Session, trade: Trade) -> dict:
         asset = db.get(Asset, trade.asset_id)
+        order = db.get(Order, trade.order_id) if trade.order_id else None
+        position = db.get(Position, trade.position_id) if trade.position_id else None
         return {
             **to_plain_dict(trade),
             "symbol": asset.symbol if asset else trade.asset_id,
             "asset_name": asset.name if asset else trade.asset_id,
+            "signal_id": order.signal_id if order else None,
+            "manual": order.manual if order is not None else position.manual if position is not None else True,
         }
 
     def _resolve_position_asset(self, db: Session, payload: PositionCreate) -> Asset:

@@ -21,6 +21,10 @@ celery_app.conf.update(
         "market-refresh": {"task": "app.tasks.periodic.refresh_market_data", "schedule": settings.market_refresh_seconds},
         "news-refresh": {"task": "app.tasks.periodic.refresh_news", "schedule": settings.news_refresh_seconds},
         "signal-generation": {"task": "app.tasks.periodic.generate_signals", "schedule": settings.signal_refresh_seconds},
+        "simulation-automation": {
+            "task": "app.tasks.periodic.run_scheduled_simulation_automation",
+            "schedule": settings.automation_scan_seconds,
+        },
         "provider-health": {"task": "app.tasks.periodic.provider_health_checks", "schedule": settings.provider_health_seconds},
         "portfolio-snapshots": {"task": "app.tasks.periodic.portfolio_snapshots", "schedule": settings.portfolio_snapshot_seconds},
         "broker-sync": {"task": "app.tasks.periodic.broker_sync", "schedule": 900},

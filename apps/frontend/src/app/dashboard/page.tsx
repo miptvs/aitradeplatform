@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
 
 import { EquityCurveChart } from "@/components/charts/equity-curve-chart";
 import { ExposureChart } from "@/components/charts/exposure-chart";
@@ -18,6 +19,8 @@ import { useWorkspace } from "@/components/layout/workspace-provider";
 export default function DashboardPage() {
   const workspace = useWorkspace();
   const [mode, setMode] = useState<"simulation" | "live" | "combined">("simulation");
+  const [latestTradesOpen, setLatestTradesOpen] = useState(true);
+  const [latestSignalsOpen, setLatestSignalsOpen] = useState(true);
   const { data, loading, error, reload } = useApi(async () => {
     const [summary, snapshots, positions, orders, trades, signals, alerts, health] = await Promise.all([
       api.getPortfolioSummary(mode === "combined" ? undefined : mode),
@@ -177,18 +180,66 @@ export default function DashboardPage() {
       </div>
 
       <div className="space-y-4">
-        <div className="grid gap-4 xl:grid-cols-2">
-          <div>
-            <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Latest Signals</div>
-            <SignalsTable signals={filteredSignals.slice(0, 8)} />
-          </div>
-          <div>
-            <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Latest Trades</div>
-            <TradesTable trades={filteredTrades.slice(0, 10)} />
-          </div>
-        </div>
+        <DashboardDropdown
+          title="Latest Trades"
+          description="Most recent executions for the selected dashboard lane."
+          count={filteredTrades.length}
+          open={latestTradesOpen}
+          onToggle={() => setLatestTradesOpen((current) => !current)}
+        >
+          <TradesTable trades={filteredTrades.slice(0, 10)} />
+        </DashboardDropdown>
+
+        <DashboardDropdown
+          title="Latest Signals"
+          description="Newest shared signal candidates for this workspace provider."
+          count={filteredSignals.length}
+          open={latestSignalsOpen}
+          onToggle={() => setLatestSignalsOpen((current) => !current)}
+        >
+          <SignalsTable signals={filteredSignals.slice(0, 8)} />
+        </DashboardDropdown>
       </div>
     </div>
+  );
+}
+
+function DashboardDropdown({
+  title,
+  description,
+  count,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  description: string;
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full flex-col gap-3 text-left md:flex-row md:items-center md:justify-between"
+        aria-expanded={open}
+      >
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">{title}</div>
+          <div className="mt-1 text-sm text-slate-400">{description}</div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-border px-3 py-1 text-xs text-slate-300">{count} total</span>
+          <span className="rounded-full border border-border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200">
+            {open ? "Close" : "Open"}
+          </span>
+        </div>
+      </button>
+      {open ? <div className="mt-4">{children}</div> : null}
+    </section>
   );
 }
 

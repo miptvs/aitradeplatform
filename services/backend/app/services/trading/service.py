@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -14,7 +15,7 @@ from app.models.simulation import SimulationAccount
 from app.models.strategy import Strategy
 from app.models.trading import TradingAutomationProfile
 from app.schemas.portfolio import OrderCreate
-from app.schemas.trading import TradingAutomationProfileUpsert
+from app.schemas.trading import PositionActionRead, TradingAutomationProfileUpsert
 from app.services.audit.service import audit_service
 from app.services.alerts.service import alert_service
 from app.services.brokers.service import broker_service
@@ -28,6 +29,16 @@ settings = get_settings()
 
 
 class TradingWorkspaceService:
+    _terminal_lane_outcomes = {
+        "approved",
+        "sent_to_live_workflow",
+        "simulated",
+        "executed_live",
+        "manual_rejected",
+        "rejected",
+        "blocked_by_risk",
+    }
+
     def get_or_create_profile(self, db: Session, mode: str) -> TradingAutomationProfile:
         profile = db.scalar(select(TradingAutomationProfile).where(TradingAutomationProfile.mode == mode))
         if profile is not None:
@@ -42,6 +53,13 @@ class TradingWorkspaceService:
     def upsert_profile(self, db: Session, mode: str, payload: TradingAutomationProfileUpsert) -> TradingAutomationProfile:
         profile = self.get_or_create_profile(db, mode)
         updates = payload.model_dump()
+        inherit_from_live = bool(updates.pop("inherit_from_live", False))
+        config_updates = updates.pop("config_json", {})
+        profile.config_json = {
+            **(profile.config_json or {}),
+            **config_updates,
+            "inherit_from_live": inherit_from_live,
+        }
         for key, value in updates.items():
             setattr(profile, key, value)
         db.flush()
@@ -54,38 +72,77 @@ class TradingWorkspaceService:
             mode=mode,
             details={
                 "automation_enabled": profile.automation_enabled,
+                "scheduled_execution_enabled": profile.scheduled_execution_enabled,
+                "execution_interval_seconds": profile.execution_interval_seconds,
+                "inherit_from_live": inherit_from_live,
                 "approval_mode": profile.approval_mode,
                 "confidence_threshold": profile.confidence_threshold,
             },
         )
         return profile
 
-    def serialize_profile(self, profile: TradingAutomationProfile) -> dict:
+    def resolve_profile_pair(
+        self,
+        db: Session,
+        mode: str,
+    ) -> tuple[TradingAutomationProfile, TradingAutomationProfile, bool]:
+        stored_profile = self.get_or_create_profile(db, mode)
+        inherit_from_live = mode == "simulation" and bool((stored_profile.config_json or {}).get("inherit_from_live"))
+        source_profile = self.get_or_create_profile(db, "live") if inherit_from_live else stored_profile
+        return stored_profile, source_profile, inherit_from_live
+
+    def serialize_profile(
+        self,
+        stored_profile: TradingAutomationProfile,
+        source_profile: TradingAutomationProfile | None = None,
+        inherit_from_live: bool = False,
+    ) -> dict:
+        effective_profile = source_profile or stored_profile
         return {
-            "id": profile.id,
-            "mode": profile.mode,
-            "name": profile.name,
-            "enabled": profile.enabled,
-            "automation_enabled": profile.automation_enabled,
-            "approval_mode": profile.approval_mode,
-            "allowed_strategy_slugs": profile.allowed_strategy_slugs,
-            "tradable_actions": profile.tradable_actions,
-            "allowed_provider_types": profile.allowed_provider_types,
-            "confidence_threshold": profile.confidence_threshold,
-            "default_order_notional": profile.default_order_notional,
-            "stop_loss_pct": profile.stop_loss_pct,
-            "take_profit_pct": profile.take_profit_pct,
-            "trailing_stop_pct": profile.trailing_stop_pct,
-            "max_orders_per_run": profile.max_orders_per_run,
-            "risk_profile": profile.risk_profile,
-            "notes": profile.notes,
-            "last_run_status": profile.last_run_status,
-            "last_run_message": profile.last_run_message,
-            "config_json": profile.config_json,
+            "id": stored_profile.id,
+            "mode": stored_profile.mode,
+            "name": stored_profile.name,
+            "enabled": stored_profile.enabled,
+            "automation_enabled": effective_profile.automation_enabled,
+            "scheduled_execution_enabled": effective_profile.scheduled_execution_enabled,
+            "execution_interval_seconds": effective_profile.execution_interval_seconds,
+            "inherit_from_live": inherit_from_live,
+            "effective_source_mode": effective_profile.mode,
+            "approval_mode": effective_profile.approval_mode,
+            "allowed_strategy_slugs": effective_profile.allowed_strategy_slugs,
+            "tradable_actions": effective_profile.tradable_actions,
+            "allowed_provider_types": effective_profile.allowed_provider_types,
+            "confidence_threshold": effective_profile.confidence_threshold,
+            "default_order_notional": effective_profile.default_order_notional,
+            "stop_loss_pct": effective_profile.stop_loss_pct,
+            "take_profit_pct": effective_profile.take_profit_pct,
+            "trailing_stop_pct": effective_profile.trailing_stop_pct,
+            "max_orders_per_run": effective_profile.max_orders_per_run,
+            "risk_profile": effective_profile.risk_profile,
+            "notes": effective_profile.notes,
+            "last_run_at": stored_profile.last_run_at,
+            "last_scheduled_run_at": stored_profile.last_scheduled_run_at,
+            "next_scheduled_run_at": self._next_scheduled_run_at(stored_profile, effective_profile),
+            "last_run_status": stored_profile.last_run_status,
+            "last_run_message": stored_profile.last_run_message,
+            "config_json": stored_profile.config_json,
         }
 
+    def _next_scheduled_run_at(
+        self,
+        stored_profile: TradingAutomationProfile,
+        effective_profile: TradingAutomationProfile,
+    ):
+        if not effective_profile.scheduled_execution_enabled:
+            return None
+        interval = max(int(effective_profile.execution_interval_seconds or 300), 60)
+        anchor = stored_profile.last_scheduled_run_at or stored_profile.last_run_at
+        if anchor is None:
+            return utcnow()
+        return anchor + timedelta(seconds=interval)
+
     def get_workspace(self, db: Session, mode: str, *, simulation_account_id: str | None = None) -> dict:
-        profile = self.get_or_create_profile(db, mode)
+        stored_profile, effective_profile, inherit_from_live = self.resolve_profile_pair(db, mode)
         if mode == "live":
             account_summary, controls = self._live_account_summary(db)
             positions = portfolio_service.list_positions(db, mode="live")
@@ -101,7 +158,7 @@ class TradingWorkspaceService:
         return {
             "mode": mode,
             "account": account_summary,
-            "automation": self.serialize_profile(profile),
+            "automation": self.serialize_profile(stored_profile, effective_profile, inherit_from_live),
             "positions": positions,
             "orders": orders,
             "trades": trades,
@@ -121,11 +178,11 @@ class TradingWorkspaceService:
         simulation_account_id: str | None = None,
         broker_account_id: str | None = None,
     ) -> dict:
-        profile = self.get_or_create_profile(db, mode)
-        if not profile.enabled:
-            return self._finalize_profile_run(profile, "blocked", "Automation profile is disabled.", [])
+        stored_profile, profile, inherit_from_live = self.resolve_profile_pair(db, mode)
+        if not stored_profile.enabled:
+            return self._finalize_profile_run(stored_profile, "blocked", "Automation profile is disabled.", [])
         if not profile.automation_enabled:
-            return self._finalize_profile_run(profile, "blocked", "Automation toggle is off for this workspace.", [])
+            return self._finalize_profile_run(stored_profile, "blocked", "Automation toggle is off for this workspace.", [])
 
         decisions: list[dict[str, Any]] = []
         submitted_orders = 0
@@ -136,13 +193,13 @@ class TradingWorkspaceService:
         active_simulation = self._resolve_simulation_account(db, simulation_account_id) if mode == "simulation" else None
 
         if mode == "live" and active_broker is None:
-            return self._finalize_profile_run(profile, "blocked", "No enabled live broker account is configured for automation.", decisions)
+            return self._finalize_profile_run(stored_profile, "blocked", "No enabled live broker account is configured for automation.", decisions)
         if mode == "simulation" and active_simulation is None:
-            return self._finalize_profile_run(profile, "blocked", "No simulation account is available for automation.", decisions)
+            return self._finalize_profile_run(stored_profile, "blocked", "No simulation account is available for automation.", decisions)
 
         candidates = self._automation_candidates(db, mode, profile)
         if not candidates:
-            return self._finalize_profile_run(profile, "noop", "No eligible candidate signals matched the current automation policy.", decisions)
+            return self._finalize_profile_run(stored_profile, "noop", "No eligible candidate signals matched the current automation policy.", decisions)
 
         processed = 0
         for signal in candidates[: profile.max_orders_per_run]:
@@ -175,6 +232,7 @@ class TradingWorkspaceService:
             decision_reason = f"{profile.approval_mode.replace('_', ' ')} automation from signal {signal.id}"
 
             if profile.approval_mode in {"manual_only", "semi_automatic"}:
+                queued_outcome = "sent_to_live_workflow" if mode == "live" else "approved"
                 db.add(
                     SignalEvaluation(
                         signal_id=signal.id,
@@ -182,7 +240,7 @@ class TradingWorkspaceService:
                         evaluator=f"{mode}-automation",
                         reason="Eligible candidate approved for manual review.",
                         expected_return=signal.estimated_risk_reward,
-                        outcome="recommended",
+                        outcome=queued_outcome,
                     )
                 )
                 approved_recommendations += 1
@@ -194,7 +252,7 @@ class TradingWorkspaceService:
                         "confidence": signal.confidence,
                         "strategy_slug": signal.metadata_json.get("preferred_strategy"),
                         "provider_type": signal.provider_type,
-                        "outcome": "recommended",
+                        "outcome": queued_outcome,
                         "reason": "Prepared for manual approval. Review the ticket in the trading workspace before sending it.",
                         "order_id": None,
                     }
@@ -224,6 +282,10 @@ class TradingWorkspaceService:
                 ),
             )
             success = order.status in {"accepted", "filled"}
+            if success:
+                execution_outcome = "executed_live" if mode == "live" else "simulated"
+            else:
+                execution_outcome = "blocked_by_risk" if order.audit_context.get("rejection_stage") == "risk" else "rejected"
             db.add(
                 SignalEvaluation(
                     signal_id=signal.id,
@@ -231,7 +293,7 @@ class TradingWorkspaceService:
                     evaluator=f"{mode}-automation",
                     reason=order.rejection_reason or decision_reason,
                     expected_return=signal.estimated_risk_reward,
-                    outcome="executed" if success else "rejected",
+                    outcome=execution_outcome,
                 )
             )
             if success:
@@ -244,7 +306,7 @@ class TradingWorkspaceService:
                         "confidence": signal.confidence,
                         "strategy_slug": signal.metadata_json.get("preferred_strategy"),
                         "provider_type": signal.provider_type,
-                        "outcome": order.status,
+                        "outcome": execution_outcome,
                         "reason": "Order submitted through the shared trading workflow.",
                         "order_id": order.id,
                     }
@@ -259,7 +321,7 @@ class TradingWorkspaceService:
                         "confidence": signal.confidence,
                         "strategy_slug": signal.metadata_json.get("preferred_strategy"),
                         "provider_type": signal.provider_type,
-                        "outcome": "rejected",
+                        "outcome": execution_outcome,
                         "reason": order.rejection_reason or "Order rejected by the execution workflow.",
                         "order_id": order.id,
                     }
@@ -274,7 +336,7 @@ class TradingWorkspaceService:
         if rejected_signals:
             message_parts.append(f"{rejected_signals} signal{'s' if rejected_signals != 1 else ''} rejected")
         message = ", ".join(message_parts) if message_parts else "Automation reviewed candidates but no orders were sent."
-        result = self._finalize_profile_run(profile, status, message, decisions)
+        result = self._finalize_profile_run(stored_profile, status, message, decisions)
         result["processed_signals"] = processed
         result["submitted_orders"] = submitted_orders
         result["approved_recommendations"] = approved_recommendations
@@ -284,16 +346,66 @@ class TradingWorkspaceService:
             actor="system",
             action="automation.run",
             target_type="trading_automation_profile",
-            target_id=profile.id,
+            target_id=stored_profile.id,
             mode=mode,
             details={
                 "status": status,
                 "submitted_orders": submitted_orders,
                 "approved_recommendations": approved_recommendations,
                 "rejected_signals": rejected_signals,
+                "inherit_from_live": inherit_from_live,
             },
         )
         return result
+
+    def run_scheduled_automation(self, db: Session, mode: str) -> dict:
+        stored_profile, effective_profile, inherit_from_live = self.resolve_profile_pair(db, mode)
+        now = utcnow()
+        interval = max(int(effective_profile.execution_interval_seconds or 300), 60)
+        next_run_at = self._next_scheduled_run_at(stored_profile, effective_profile)
+
+        if not stored_profile.enabled:
+            return self._scheduled_skip_result(mode, "Automation profile is disabled.", next_run_at, inherit_from_live)
+        if not effective_profile.scheduled_execution_enabled:
+            return self._scheduled_skip_result(mode, "Scheduled automation is off for this workspace.", None, inherit_from_live)
+        if not effective_profile.automation_enabled:
+            return self._scheduled_skip_result(mode, "Automation toggle is off for this workspace.", next_run_at, inherit_from_live)
+        if next_run_at is not None and next_run_at > now:
+            return self._scheduled_skip_result(
+                mode,
+                f"Next scheduled automation run is due in {int((next_run_at - now).total_seconds())} seconds.",
+                next_run_at,
+                inherit_from_live,
+            )
+
+        result = self.run_automation(db, mode)
+        stored_profile.last_scheduled_run_at = now
+        result["scheduled"] = True
+        result["interval_seconds"] = interval
+        result["next_scheduled_run_at"] = (now + timedelta(seconds=interval)).isoformat()
+        result["inherit_from_live"] = inherit_from_live
+        return result
+
+    def _scheduled_skip_result(
+        self,
+        mode: str,
+        message: str,
+        next_run_at,
+        inherit_from_live: bool,
+    ) -> dict:
+        return {
+            "mode": mode,
+            "status": "skipped",
+            "message": message,
+            "processed_signals": 0,
+            "submitted_orders": 0,
+            "approved_recommendations": 0,
+            "rejected_signals": 0,
+            "decisions": [],
+            "scheduled": True,
+            "next_scheduled_run_at": next_run_at.isoformat() if next_run_at else None,
+            "inherit_from_live": inherit_from_live,
+        }
 
     def _default_profile_values(self, mode: str) -> dict[str, Any]:
         name = "Live Trading Automation" if mode == "live" else "Simulation Automation"
@@ -301,6 +413,8 @@ class TradingWorkspaceService:
             "name": name,
             "enabled": True,
             "automation_enabled": False,
+            "scheduled_execution_enabled": False,
+            "execution_interval_seconds": 300,
             "approval_mode": "semi_automatic",
             "allowed_strategy_slugs": [],
             "tradable_actions": ["buy", "sell"],
@@ -374,7 +488,7 @@ class TradingWorkspaceService:
         recommendations: list[dict[str, Any]] = []
         for signal in signals:
             evaluation = self._latest_mode_evaluation(db, signal.id, mode)
-            if evaluation is None or evaluation.outcome != "recommended":
+            if evaluation is None or evaluation.outcome not in self._recommendation_outcomes(mode):
                 continue
             recommendations.append(self._recommendation_view(db, signal, evaluation))
             if len(recommendations) >= 10:
@@ -386,7 +500,7 @@ class TradingWorkspaceService:
         if signal is None:
             raise ValueError("Recommendation signal not found.")
         evaluation = self._latest_mode_evaluation(db, signal.id, mode)
-        if evaluation is None or evaluation.outcome != "recommended":
+        if evaluation is None or evaluation.outcome not in self._recommendation_outcomes(mode):
             raise ValueError("This signal is no longer waiting for operator review.")
 
         final_reason = reason or "Rejected from the operator approval queue."
@@ -422,6 +536,53 @@ class TradingWorkspaceService:
             "order_id": None,
         }
 
+    def approve_signal(self, db: Session, mode: str, signal_id: str, reason: str | None = None) -> dict[str, Any]:
+        signal = db.get(Signal, signal_id)
+        if signal is None:
+            raise ValueError("Signal not found.")
+
+        latest_mode_evaluation = self._latest_mode_evaluation(db, signal.id, mode)
+        if latest_mode_evaluation and latest_mode_evaluation.outcome in self._terminal_lane_outcomes:
+            raise ValueError("This signal already has a live/simulation review outcome in the selected lane.")
+
+        outcome = "sent_to_live_workflow" if mode == "live" else "approved"
+        final_reason = reason or (
+            "Sent to the live review queue for guarded operator approval."
+            if mode == "live"
+            else "Approved for simulation review and ready to load into the ticket."
+        )
+        db.add(
+            SignalEvaluation(
+                signal_id=signal.id,
+                approved=True,
+                evaluator=f"{mode}-operator",
+                reason=final_reason,
+                expected_return=signal.estimated_risk_reward,
+                outcome=outcome,
+            )
+        )
+        audit_service.log(
+            db,
+            actor="system",
+            action="signal.approve",
+            target_type="signal",
+            target_id=signal.id,
+            mode=mode,
+            details={"outcome": outcome, "reason": final_reason},
+        )
+        asset = db.get(Asset, signal.asset_id)
+        return {
+            "signal_id": signal.id,
+            "symbol": asset.symbol if asset else signal.asset_id,
+            "action": signal.action,
+            "confidence": signal.confidence,
+            "strategy_slug": signal.metadata_json.get("preferred_strategy"),
+            "provider_type": signal.provider_type,
+            "outcome": outcome,
+            "reason": final_reason,
+            "order_id": None,
+        }
+
     def _automation_candidates(self, db: Session, mode: str, profile: TradingAutomationProfile) -> list[Signal]:
         signals = list(
             db.scalars(
@@ -435,7 +596,7 @@ class TradingWorkspaceService:
         results: list[Signal] = []
         for signal in signals:
             latest_mode_evaluation = self._latest_mode_evaluation(db, signal.id, mode)
-            if latest_mode_evaluation and latest_mode_evaluation.outcome in {"recommended", "executed", "manual_rejected", "rejected"}:
+            if latest_mode_evaluation and latest_mode_evaluation.outcome in self._terminal_lane_outcomes:
                 continue
             if signal.action not in profile.tradable_actions:
                 continue
@@ -622,13 +783,14 @@ class TradingWorkspaceService:
 
     def _signal_view(self, db: Session, signal: Signal) -> dict[str, Any]:
         asset = db.get(Asset, signal.asset_id)
+        strategy_slug = signal.metadata_json.get("preferred_strategy")
         return {
             "id": signal.id,
             "asset_id": signal.asset_id,
             "symbol": asset.symbol if asset else signal.asset_id,
             "asset_name": asset.name if asset else signal.asset_id,
-            "strategy_name": signal.metadata_json.get("preferred_strategy"),
-            "strategy_slug": signal.metadata_json.get("preferred_strategy"),
+            "strategy_name": strategy_slug,
+            "strategy_slug": strategy_slug,
             "action": signal.action,
             "confidence": signal.confidence,
             "status": signal.status,
@@ -645,6 +807,9 @@ class TradingWorkspaceService:
             "related_event_ids": signal.related_event_ids,
             "mode": self._display_signal_mode(signal.mode),
             "source_kind": signal.source_kind,
+            "signal_flavor": self._signal_flavor(signal, strategy_slug),
+            "fresh_news_used": bool(signal.related_news_ids or signal.related_event_ids),
+            "lane_statuses": self._lane_statuses(db, signal.id),
         }
 
     def _recommendation_view(self, db: Session, signal: Signal, evaluation: SignalEvaluation) -> dict[str, Any]:
@@ -683,10 +848,86 @@ class TradingWorkspaceService:
             .limit(1)
         )
 
+    def _lane_statuses(self, db: Session, signal_id: str) -> dict[str, str]:
+        statuses: dict[str, str] = {}
+        for lane in ("simulation", "live"):
+            latest = self._latest_mode_evaluation(db, signal_id, lane)
+            statuses[lane] = latest.outcome if latest and latest.outcome else "candidate"
+        return statuses
+
+    def _recommendation_outcomes(self, mode: str) -> set[str]:
+        return {"sent_to_live_workflow"} if mode == "live" else {"approved"}
+
+    def _signal_flavor(self, signal: Signal, strategy_slug: str | None) -> str:
+        has_news = bool(signal.related_news_ids or signal.related_event_ids)
+        has_indicators = bool(signal.indicators_json)
+        if has_news and strategy_slug == "blended":
+            return "blended"
+        if has_news:
+            return "news-enriched"
+        if has_indicators and signal.ai_rationale:
+            return "technical+ai"
+        if signal.ai_rationale:
+            return "ai-only"
+        return "technical-only"
+
     def _display_signal_mode(self, stored_mode: str | None) -> str:
         if stored_mode in {"live", "simulation", "both", "shared", None}:
             return "shared"
         return stored_mode
+
+    def position_actions(self, db: Session, position_id: str) -> list[dict[str, Any]]:
+        position = db.get(Position, position_id)
+        if position is None:
+            raise ValueError("Position not found.")
+        if position.status != "open":
+            return []
+        actions = [
+            PositionActionRead(
+                key="details",
+                label="View details",
+                description="Open the position detail sheet with provider, notes, and execution context.",
+            ),
+            PositionActionRead(
+                key="edit_stop_loss",
+                label="Edit stop loss",
+                description="Adjust the protective stop-loss level for this position.",
+            ),
+            PositionActionRead(
+                key="edit_take_profit",
+                label="Edit take profit",
+                description="Adjust the take-profit target for this position.",
+            ),
+            PositionActionRead(
+                key="edit_trailing_stop",
+                label="Edit trailing stop",
+                description="Adjust the trailing-stop distance for this position.",
+            ),
+            PositionActionRead(
+                key="close_partial",
+                label="Close partially",
+                description="Close part of the position by percentage while keeping the rest open.",
+                requires_confirmation=True,
+            ),
+            PositionActionRead(
+                key="close_full",
+                label="Close fully",
+                description="Close the entire open position.",
+                destructive=True,
+                requires_confirmation=True,
+            ),
+            PositionActionRead(
+                key="add_note",
+                label="Add note / tag",
+                description="Attach notes or tags to explain manual overrides or trade context.",
+            ),
+            PositionActionRead(
+                key="mark_manual_override",
+                label="Mark manual override",
+                description="Marks this position as manually managed so automation does not silently override operator intent.",
+            ),
+        ]
+        return [item.model_dump() for item in actions]
 
 
 trading_workspace_service = TradingWorkspaceService()

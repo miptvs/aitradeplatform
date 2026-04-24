@@ -4,9 +4,14 @@ AI-assisted trading and portfolio analysis platform built as a Dockerized monore
 
 This iteration upgrades the original MVP in place rather than replacing it:
 
+- keeps one canonical AI-generated signal pool that feeds both Live Trading and Simulation
+- adds shared decision-trail views so you can open a signal, order, trade, or position and follow origin, review, risk, order, trade, position, stops, and audit records
+- adds simulation/live automation parity controls, including “use same settings as Live” for simulation policy inheritance
+- adds scheduled simulation automation controls so eligible signals can be checked on a timer and converted into simulated orders only after risk validation
 - added a dedicated `Live Trading` workspace with guarded manual and automation flows
 - rebuilt `Simulation` to mirror the live trading workflow with the same shared workspace components
 - moved position actions into compact dropdowns/modals for stop edits, partial closes, and manual overrides
+- added provenance chips and `View trace` actions to orders, trades, positions, and the shared Live/Simulation trading workspace
 - added an operator approval queue for semi-automatic/manual-only automation, with review-ticket loading and explicit rejection
 - added live broker sync visibility plus a manual sync action in the live workspace
 - fixed the RSS refresh path so checkpoint overlap, backfill, duplicates, and per-feed diagnostics are visible
@@ -96,6 +101,9 @@ The backend uses the official MCP Python SDK on both sides:
 
 - Live trading is disabled by default and controlled only from the backend
 - Simulation and live flows use separate records and validation paths
+- Signals are generated once, stored canonically, and can then be reviewed into either simulation or live workflows
+- Market data and signals refresh every 5 minutes by default, news refreshes every 10 minutes, and scheduled simulation automation scans every minute to run only when the configured interval is due
+- Orders, trades, and positions can resolve back into the same provenance chain, including manual-only records that have no origin signal
 - Model settings are separated into simulation and actual-trading profiles for both local and remote providers
 - Local model families each get their own simulation and actual-trading profile pair
 - API keys are write-only from the frontend and stored encrypted server-side
@@ -123,4 +131,3 @@ The backend uses the official MCP Python SDK on both sides:
 - Trading212 execution is intentionally not implemented; account sync/manual mirroring is the intended extension path
 - Trading212 ticker validation uses the authenticated instrument metadata API, so you must set `TRADING212_API_KEY` and `TRADING212_API_SECRET` in the backend env for non-seeded ticker verification
 - Authentication is simple local JWT auth suitable for a local deployment, not a hardened multi-user SaaS auth layer
->>>>>>> 9e3dcc8 (first commit, version 0.0.1)

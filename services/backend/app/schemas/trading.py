@@ -9,6 +9,9 @@ from app.schemas.market import AssetRead, StrategyRead
 class TradingAutomationProfileUpsert(BaseModel):
     enabled: bool = True
     automation_enabled: bool = False
+    scheduled_execution_enabled: bool = False
+    execution_interval_seconds: int = 300
+    inherit_from_live: bool = False
     approval_mode: Literal["manual_only", "semi_automatic", "fully_automatic"] = "semi_automatic"
     allowed_strategy_slugs: list[str] = Field(default_factory=list)
     tradable_actions: list[str] = Field(default_factory=lambda: ["buy"])
@@ -30,6 +33,10 @@ class TradingAutomationProfileRead(ORMModel):
     name: str
     enabled: bool
     automation_enabled: bool
+    scheduled_execution_enabled: bool
+    execution_interval_seconds: int
+    inherit_from_live: bool = False
+    effective_source_mode: str = "live"
     approval_mode: str
     allowed_strategy_slugs: list[str]
     tradable_actions: list[str]
@@ -42,9 +49,20 @@ class TradingAutomationProfileRead(ORMModel):
     max_orders_per_run: int
     risk_profile: str
     notes: str | None = None
+    last_run_at: Any | None = None
+    last_scheduled_run_at: Any | None = None
+    next_scheduled_run_at: Any | None = None
     last_run_status: str | None = None
     last_run_message: str | None = None
     config_json: dict[str, Any]
+
+
+class PositionActionRead(BaseModel):
+    key: str
+    label: str
+    description: str
+    destructive: bool = False
+    requires_confirmation: bool = False
 
 
 class TradingAccountSummary(BaseModel):
@@ -117,6 +135,10 @@ class TradingRecommendationRead(BaseModel):
 
 
 class RecommendationRejectRequest(BaseModel):
+    reason: str | None = None
+
+
+class SignalApproveRequest(BaseModel):
     reason: str | None = None
 
 

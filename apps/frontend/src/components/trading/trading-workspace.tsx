@@ -4,7 +4,9 @@ import { useEffect, useMemo, useState } from "react";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 import { Bot, CircleAlert, Coins, RefreshCcw, ShieldCheck } from "lucide-react";
 
+import { ProvenanceDialog } from "@/components/provenance/provenance-dialog";
 import { PositionManagementTable } from "@/components/trading/position-management-table";
+import { SignalTraceDialog } from "@/components/signals/signal-trace-dialog";
 import { SignalsTable } from "@/components/signals/signals-table";
 import { StatsCard } from "@/components/stats-card";
 import { TradesTable } from "@/components/trades/trades-table";
@@ -14,12 +16,23 @@ import { RiskBanner } from "@/components/ui/risk-banner";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useWorkspace } from "@/components/layout/workspace-provider";
 import { useApi } from "@/hooks/use-api";
+import { useProvenanceTrace } from "@/hooks/use-provenance-trace";
 import { api } from "@/lib/api";
 import { formatCurrency, formatPct, formatQuantity } from "@/lib/utils";
-import type { Asset, AssetSearchResult, Position, TradingAutomationProfile, TradingRecommendation, TradingWorkspace as TradingWorkspaceData } from "@/types";
+import type {
+  Asset,
+  AssetSearchResult,
+  Order,
+  Position,
+  Signal,
+  SignalTrace,
+  Trade,
+  TradingAutomationProfile,
+  TradingRecommendation,
+  TradingWorkspace as TradingWorkspaceData,
+} from "@/types";
 
 type TradingMode = "live" | "simulation";
-type PanelMode = "manual" | "automatic";
 type SizingMode = "amount" | "quantity";
 
 const RISK_PRESETS = {
@@ -38,7 +51,8 @@ export function TradingWorkspace({
   description: string;
 }) {
   const workspace = useWorkspace();
-  const [activePanel, setActivePanel] = useState<PanelMode>("automatic");
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const [manualTradingOpen, setManualTradingOpen] = useState(false);
   const [selectedSimulationAccountId, setSelectedSimulationAccountId] = useState("");
   const workspaceState = useApi<TradingWorkspaceData>(
     () => (mode === "live" ? api.getLiveWorkspace() : api.getSimulationWorkspace(selectedSimulationAccountId || undefined)),
@@ -55,6 +69,11 @@ export function TradingWorkspace({
   const [stopDialogPosition, setStopDialogPosition] = useState<Position | null>(null);
   const [closeDialogPosition, setCloseDialogPosition] = useState<Position | null>(null);
   const [detailPosition, setDetailPosition] = useState<Position | null>(null);
+  const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
+  const [signalTrace, setSignalTrace] = useState<SignalTrace | null>(null);
+  const [signalTraceLoading, setSignalTraceLoading] = useState(false);
+  const [signalTraceError, setSignalTraceError] = useState<string | null>(null);
+  const [signalApproveBusy, setSignalApproveBusy] = useState(false);
 
   const [orderForm, setOrderForm] = useState({
     asset_id: "",
@@ -101,6 +120,7 @@ export function TradingWorkspace({
   const [automationForm, setAutomationForm] = useState<TradingAutomationProfile | null>(null);
   const [recommendationBusyId, setRecommendationBusyId] = useState<string | null>(null);
   const [brokerSyncingId, setBrokerSyncingId] = useState<string | null>(null);
+  const provenance = useProvenanceTrace();
 
   const workspaceData = workspaceState.data;
   const localAssetDefaults = useMemo(() => (workspaceData?.assets || []).slice(0, 8).map(toLocalSearchResult), [workspaceData?.assets]);
@@ -260,7 +280,6 @@ export function TradingWorkspace({
       signal_id: recommendation.signal_id,
     }));
     setSearchQuery(recommendation.symbol);
-    setActivePanel("manual");
     setReviewOpen(true);
     setBanner({
       tone: "success",
@@ -302,6 +321,42 @@ export function TradingWorkspace({
     }
   }
 
+  async function handleOpenSignal(signal: Signal) {
+    setSelectedSignal(signal);
+    setSignalTraceLoading(true);
+    setSignalTraceError(null);
+    try {
+      const trace = await api.getSignalTrace(signal.id);
+      setSignalTrace(trace);
+    } catch (error) {
+      setSignalTrace(null);
+      setSignalTraceError(error instanceof Error ? error.message : "Signal trace failed to load.");
+    } finally {
+      setSignalTraceLoading(false);
+    }
+  }
+
+  async function handleApproveCurrentSignal() {
+    if (!selectedSignal) return;
+    try {
+      setSignalApproveBusy(true);
+      const decision =
+        mode === "live"
+          ? await api.approveLiveSignal(selectedSignal.id)
+          : await api.approveSimulationSignal(selectedSignal.id);
+      setBanner({
+        tone: "success",
+        message: decision.reason,
+      });
+      await handleOpenSignal(selectedSignal);
+      workspaceState.reload();
+    } catch (error) {
+      setSignalTraceError(error instanceof Error ? error.message : "Signal approval failed.");
+    } finally {
+      setSignalApproveBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
@@ -311,14 +366,6 @@ export function TradingWorkspace({
           <div className="mt-2 text-sm text-slate-400">{description}</div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <SegmentedControl
-            value={activePanel}
-            onChange={(value) => setActivePanel(value as PanelMode)}
-            options={[
-              { value: "automatic", label: "Automatic Trading" },
-              { value: "manual", label: "Manual Trading" },
-            ]}
-          />
           <button
             type="button"
             onClick={() => workspaceState.reload()}
@@ -342,7 +389,7 @@ export function TradingWorkspace({
         <StatsCard label="Unrealized PnL" value={workspaceData.account.unrealized_pnl} />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1.3fr_0.9fr]">
+      <div className="space-y-4">
         <AccountSummaryPanel
           mode={mode}
           workspaceData={workspaceData}
@@ -366,76 +413,157 @@ export function TradingWorkspace({
           }}
           onSyncLiveBroker={handleSyncLiveBroker}
         />
-        {activePanel === "manual" ? (
-          <OrderEntryPanel
-            mode={mode}
-            workspaceData={workspaceData}
-            providerOptions={providerOptions}
-            searchQuery={searchQuery}
-            searchLoading={searchLoading}
-            searchMessage={searchMessage}
-            searchResults={searchResults}
-            orderForm={orderForm}
-            selectedAsset={selectedAsset}
-            currentCurrency={currentCurrency}
-            derivedQuantity={derivedQuantity}
-            orderNotional={orderNotional}
-            onSearchQueryChange={setSearchQuery}
-            onChooseAsset={(asset) => {
-              setOrderForm((current) => ({
-                ...current,
-                asset_id: asset.asset_id || "",
-                asset_symbol: asset.symbol,
-                asset_name: asset.name,
-                asset_type: asset.asset_type,
-                currency: asset.currency,
-                exchange: asset.exchange || "",
-              }));
-              setManualPositionForm((current) => ({
-                ...current,
-                asset_id: asset.asset_id || "",
-                asset_symbol: asset.symbol,
-                asset_name: asset.name,
-                asset_type: asset.asset_type,
-                currency: asset.currency,
-                exchange: asset.exchange || "",
-              }));
-              setSearchQuery(asset.symbol);
-            }}
-            onChange={setOrderForm}
-            onOpenExistingPosition={() => setManualPositionOpen(true)}
-            onOpenReview={() => setReviewOpen(true)}
-          />
-        ) : (
-          <AutomationControlPanel
-            mode={mode}
-            workspaceData={workspaceData}
-            providerOptions={providerOptions}
-            automationForm={automationForm}
-            onChange={setAutomationForm}
-            onSave={async () => {
-              const saver = mode === "live" ? api.saveLiveAutomation : api.saveSimulationAutomation;
-              const next = await saver({ ...automationForm });
-              setAutomationForm(next);
-              setBanner({ tone: "success", message: "Automation controls saved for this workspace." });
-              workspaceState.reload();
-            }}
-            onRun={async () => {
-              const result =
-                mode === "live"
-                  ? await api.runLiveAutomation()
-                  : await api.runSimulationAutomation(selectedSimulationAccountId || undefined);
-              setBanner({
-                tone: result.status === "success" ? "success" : result.status === "blocked" ? "warn" : "error",
-                message: `${result.message} Processed ${result.processed_signals} signal(s).`,
-              });
-              workspaceState.reload();
-            }}
-          />
-        )}
+
+        <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <button
+              type="button"
+              onClick={() => setManualTradingOpen((current) => !current)}
+              className="flex-1 text-left"
+              title="Open or close the manual order ticket for this account."
+            >
+              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Manual trading controls</div>
+              <div className="mt-1 text-sm text-slate-400">
+                Manual order entry sits directly under the account it affects. Use it for buy/sell tickets, stop levels, and guarded review before submit.
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                Current draft: {orderForm.side.toUpperCase()} {orderForm.asset_symbol || "no symbol selected"} ·{" "}
+                {orderForm.sizing_mode === "amount" ? formatCurrency(Number(orderForm.amount || 0), currentCurrency) : `${orderForm.quantity || 0} qty`}
+              </div>
+            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusBadge status={mode === "live" ? "live" : "simulation"} />
+              <button
+                type="button"
+                onClick={() => setManualPositionOpen(true)}
+                className="rounded-xl border border-border px-3 py-2 text-xs font-medium text-slate-200 hover:bg-white/5"
+                title="Records a position that already exists in your broker or outside this order ticket so this workspace can manage stops and reporting."
+              >
+                Add existing position
+              </button>
+              <button
+                type="button"
+                onClick={() => setManualTradingOpen((current) => !current)}
+                className="rounded-full border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200 hover:bg-white/5"
+              >
+                {manualTradingOpen ? "Close" : "Open"}
+              </button>
+            </div>
+          </div>
+          {manualTradingOpen ? (
+            <div className="mt-4">
+              <OrderEntryPanel
+                mode={mode}
+                workspaceData={workspaceData}
+                providerOptions={providerOptions}
+                searchQuery={searchQuery}
+                searchLoading={searchLoading}
+                searchMessage={searchMessage}
+                searchResults={searchResults}
+                orderForm={orderForm}
+                selectedAsset={selectedAsset}
+                currentCurrency={currentCurrency}
+                derivedQuantity={derivedQuantity}
+                orderNotional={orderNotional}
+                embedded
+                onSearchQueryChange={setSearchQuery}
+                onChooseAsset={(asset) => {
+                  setOrderForm((current) => ({
+                    ...current,
+                    asset_id: asset.asset_id || "",
+                    asset_symbol: asset.symbol,
+                    asset_name: asset.name,
+                    asset_type: asset.asset_type,
+                    currency: asset.currency,
+                    exchange: asset.exchange || "",
+                  }));
+                  setManualPositionForm((current) => ({
+                    ...current,
+                    asset_id: asset.asset_id || "",
+                    asset_symbol: asset.symbol,
+                    asset_name: asset.name,
+                    asset_type: asset.asset_type,
+                    currency: asset.currency,
+                    exchange: asset.exchange || "",
+                  }));
+                  setSearchQuery(asset.symbol);
+                }}
+                onChange={setOrderForm}
+                onOpenExistingPosition={() => setManualPositionOpen(true)}
+                onOpenReview={() => setReviewOpen(true)}
+              />
+            </div>
+          ) : (
+            <div className="mt-4 rounded-2xl border border-border bg-black/20 p-4 text-sm text-slate-300">
+              Open this drawer to create a manual {mode} order. Every ticket still goes through review and risk validation before it can affect the account.
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <button
+            type="button"
+            onClick={() => setAutomationOpen((current) => !current)}
+            className="flex w-full flex-col gap-3 text-left md:flex-row md:items-center md:justify-between"
+            title="Open or close automation settings for this account."
+          >
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Automation controls</div>
+              <div className="mt-1 text-sm text-slate-400">
+                Account-level automation settings live here, directly under the manual ticket they can load or execute.
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusBadge status={automationForm.automation_enabled ? "enabled" : "disabled"} />
+              <span className="rounded-full border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200">
+                {automationOpen ? "Close" : "Open"}
+              </span>
+            </div>
+          </button>
+          {automationOpen ? (
+            <div className="mt-4">
+              <AutomationControlPanel
+                mode={mode}
+                workspaceData={workspaceData}
+                providerOptions={providerOptions}
+                automationForm={automationForm}
+                embedded
+                onChange={setAutomationForm}
+                onSave={async () => {
+                  const saver = mode === "live" ? api.saveLiveAutomation : api.saveSimulationAutomation;
+                  const next = await saver({ ...automationForm });
+                  setAutomationForm(next);
+                  setBanner({ tone: "success", message: "Automation controls saved for this workspace." });
+                  workspaceState.reload();
+                }}
+                onRun={async () => {
+                  const result =
+                    mode === "live"
+                      ? await api.runLiveAutomation()
+                      : await api.runSimulationAutomation(selectedSimulationAccountId || undefined);
+                  setBanner({
+                    tone: result.status === "success" ? "success" : result.status === "blocked" ? "warn" : "error",
+                    message: `${result.message} Processed ${result.processed_signals} signal(s).`,
+                  });
+                  workspaceState.reload();
+                }}
+              />
+            </div>
+          ) : (
+            <div className="mt-4 rounded-2xl border border-border bg-black/20 p-4 text-sm text-slate-300">
+              {automationForm.automation_enabled
+                ? `${automationForm.approval_mode.replace("_", " ")} is enabled at ${formatPct(automationForm.confidence_threshold)} confidence. ${
+                    automationForm.scheduled_execution_enabled
+                      ? `Scheduled checks run every ${formatInterval(automationForm.execution_interval_seconds)}.`
+                      : "Scheduled checks are off."
+                  }`
+                : "Automation is currently disabled. Open this drawer to configure or run it."}
+            </div>
+          )}
+        </section>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+      <div className="space-y-4">
         <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="mb-3 flex items-center justify-between">
             <div>
@@ -465,56 +593,79 @@ export function TradingWorkspace({
               setBanner({ tone: "success", message: `${position.symbol} is now marked as a manual override.` });
               workspaceState.reload();
             }}
+            onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
           />
-        </section>
-
-        <div className="space-y-4">
-          <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <section className="mt-4 rounded-2xl border border-border bg-black/20 p-4">
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Signals available here</div>
-                <div className="mt-1 text-sm text-slate-400">These signal candidates feed both live and simulation. The lane-specific part starts only when you review, approve, or automate against a signal.</div>
+                <div className="mt-1 text-sm text-slate-400">These signal candidates feed both live and simulation. Open any signal to inspect its news, rationale, lane status, and full review-to-execution trace.</div>
               </div>
               <StatusBadge status={workspaceData.account.status} />
             </div>
             <div className="mt-4">
-              <SignalsTable signals={activeSignals} />
+              <SignalsTable signals={activeSignals} onSelectSignal={handleOpenSignal} />
             </div>
           </section>
+        </section>
 
-          <RecommendationQueue
-            mode={mode}
-            recommendations={workspaceData.recommendations}
-            busySignalId={recommendationBusyId}
-            onLoadTicket={loadRecommendationIntoTicket}
-            onReject={handleRejectRecommendation}
-          />
+        <RecommendationQueue
+          mode={mode}
+          recommendations={workspaceData.recommendations}
+          busySignalId={recommendationBusyId}
+          onLoadTicket={loadRecommendationIntoTicket}
+          onReject={handleRejectRecommendation}
+        />
 
-          <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-            <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Safety and broker state</div>
-            <div className="mt-4 space-y-3">
-              <InfoRow icon={<ShieldCheck size={15} />} label="Safety state" value={workspaceData.account.safety_message} />
-              <InfoRow icon={<Coins size={15} />} label="Active account" value={workspaceData.account.account_label} />
-              <InfoRow
-                icon={<Bot size={15} />}
-                label="Automation"
-                value={
-                  automationForm.automation_enabled
-                    ? `${automationForm.approval_mode.replace("_", " ")} · threshold ${formatPct(automationForm.confidence_threshold)}`
-                    : "Disabled"
-                }
-              />
-              <InfoRow
-                icon={<CircleAlert size={15} />}
-                label="Execution"
-                value={String(workspaceData.account.metadata.supports_execution || false) === "true" ? "Broker can execute" : "Scaffold / guarded path"}
-              />
-            </div>
-          </section>
-        </div>
+        <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Safety and broker state</div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <InfoRow icon={<ShieldCheck size={15} />} label="Safety state" value={workspaceData.account.safety_message} />
+            <InfoRow icon={<Coins size={15} />} label="Active account" value={workspaceData.account.account_label} />
+            <InfoRow
+              icon={<Bot size={15} />}
+              label="Automation"
+              value={
+                automationForm.automation_enabled
+                  ? `${automationForm.approval_mode.replace("_", " ")} · threshold ${formatPct(automationForm.confidence_threshold)}`
+                  : "Disabled"
+              }
+            />
+            <InfoRow
+              icon={<ShieldCheck size={15} />}
+              label="Settings source"
+              value={
+                mode === "simulation" && automationForm.inherit_from_live
+                  ? "Simulation inherits live strategy, provider, and risk policy unless overridden"
+                  : "Workspace-specific strategy, provider, and risk policy"
+              }
+            />
+            <InfoRow
+              icon={<Bot size={15} />}
+              label="Provider / threshold"
+              value={`${
+                automationForm.allowed_provider_types.length
+                  ? automationForm.allowed_provider_types.join(", ")
+                  : mode === "simulation"
+                    ? workspace.simulationProviderType
+                    : workspace.liveProviderType
+              } · ${formatPct(automationForm.confidence_threshold)}`}
+            />
+            <InfoRow
+              icon={<CircleAlert size={15} />}
+              label="Execution"
+              value={String(workspaceData.account.metadata.supports_execution || false) === "true" ? "Broker can execute" : "Scaffold / guarded path"}
+            />
+          </div>
+        </section>
       </div>
 
-      <ExecutionHistoryPanel mode={mode} orders={workspaceData.orders} trades={workspaceData.trades} />
+      <ExecutionHistoryPanel
+        mode={mode}
+        orders={workspaceData.orders}
+        trades={workspaceData.trades}
+        onViewTrace={(type, item) => provenance.openTrace({ type, id: item.id })}
+      />
 
       <Dialog
         open={reviewOpen}
@@ -685,7 +836,7 @@ export function TradingWorkspace({
       <Dialog
         open={Boolean(stopDialogPosition)}
         title="Manage stops"
-        description="Adjust protective levels in one place. The helper text is there so you do not need to translate raw trading jargon while you work."
+        description="Adjust protective levels in one place. The decision trail records whether stops began as signal suggestions, ticket defaults, current position settings, or manual edits."
         actions={
           <button type="button" onClick={() => setStopDialogPosition(null)} className="rounded-xl border border-border px-3 py-2 text-sm text-slate-300 hover:bg-white/5">
             Close
@@ -806,6 +957,62 @@ export function TradingWorkspace({
           </div>
         ) : null}
       </Dialog>
+
+      <SignalTraceDialog
+        open={Boolean(selectedSignal)}
+        signal={selectedSignal}
+        trace={signalTrace}
+        loading={signalTraceLoading}
+        error={signalTraceError}
+        onClose={() => {
+          setSelectedSignal(null);
+          setSignalTrace(null);
+          setSignalTraceError(null);
+        }}
+        actions={
+          (() => {
+            const laneStatus = signalTrace?.signal?.lane_statuses?.[mode] || selectedSignal?.lane_statuses?.[mode] || "candidate";
+            const buttonLabel =
+              mode === "live"
+                ? laneStatus === "candidate"
+                  ? "Send to live review"
+                  : `Live: ${laneStatus}`
+                : laneStatus === "candidate"
+                  ? "Approve for simulation"
+                  : `Simulation: ${laneStatus}`;
+
+            return (
+              <button
+                type="button"
+                disabled={laneStatus !== "candidate" || signalApproveBusy}
+                onClick={handleApproveCurrentSignal}
+                className={`rounded-xl border px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-60 ${
+                  mode === "live"
+                    ? "border-rose-500/30 bg-rose-500/10 text-rose-100 hover:bg-rose-500/20"
+                    : "border-cyan-500/30 bg-cyan-500/10 text-cyan-100 hover:bg-cyan-500/20"
+                }`}
+                title={
+                  laneStatus === "candidate"
+                    ? mode === "live"
+                      ? "Queue this shared signal for guarded live review."
+                      : "Queue this shared signal for the simulation workflow."
+                    : "This signal already has a recorded outcome in the current lane."
+                }
+              >
+                {signalApproveBusy ? "Saving..." : buttonLabel}
+              </button>
+            );
+          })()
+        }
+      />
+      <ProvenanceDialog
+        open={Boolean(provenance.target)}
+        signal={provenance.signal}
+        trace={provenance.trace}
+        loading={provenance.loading}
+        error={provenance.error}
+        onClose={provenance.closeTrace}
+      />
     </div>
   );
 }
@@ -957,6 +1164,7 @@ function OrderEntryPanel({
   currentCurrency,
   derivedQuantity,
   orderNotional,
+  embedded = false,
   onSearchQueryChange,
   onChooseAsset,
   onChange,
@@ -975,6 +1183,7 @@ function OrderEntryPanel({
   currentCurrency: string;
   derivedQuantity: number;
   orderNotional: number;
+  embedded?: boolean;
   onSearchQueryChange: (value: string) => void;
   onChooseAsset: (asset: AssetSearchResult) => void;
   onChange: Dispatch<SetStateAction<any>>;
@@ -982,8 +1191,8 @@ function OrderEntryPanel({
   onOpenReview: () => void;
 }) {
   return (
-    <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-      <div className="flex items-center justify-between">
+    <section className={embedded ? "rounded-2xl border border-border bg-black/20 p-4" : "rounded-2xl border border-border bg-panel/90 p-4 shadow-panel"}>
+      {!embedded ? <div className="flex items-center justify-between">
         <div>
           <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Manual trading controls</div>
           <div className="mt-1 text-sm text-slate-400">
@@ -1004,9 +1213,9 @@ function OrderEntryPanel({
             Add existing position
           </button>
         </div>
-      </div>
+      </div> : null}
 
-      <div className="mt-4 grid gap-4">
+      <div className={embedded ? "grid gap-4" : "mt-4 grid gap-4"}>
         <Field label={<HelpTooltip label="Symbol selector" help="Search by ticker or company name. Local assets appear immediately, and broker-backed validation can add verified matches when available." />}>
           <div className="space-y-2">
             <input value={searchQuery} onChange={(event) => onSearchQueryChange(event.target.value)} placeholder="Search ticker or instrument name" className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
@@ -1142,6 +1351,7 @@ function AutomationControlPanel({
   workspaceData,
   providerOptions,
   automationForm,
+  embedded = false,
   onChange,
   onSave,
   onRun,
@@ -1150,13 +1360,16 @@ function AutomationControlPanel({
   workspaceData: TradingWorkspaceData;
   providerOptions: string[];
   automationForm: TradingAutomationProfile;
+  embedded?: boolean;
   onChange: Dispatch<SetStateAction<TradingAutomationProfile | null>>;
   onSave: () => Promise<void>;
   onRun: () => Promise<void>;
 }) {
+  const inheritsLive = mode === "simulation" && automationForm.inherit_from_live;
+
   return (
-    <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-      <div className="flex items-center justify-between">
+    <section className={embedded ? "rounded-2xl border border-border bg-black/20 p-4" : "rounded-2xl border border-border bg-panel/90 p-4 shadow-panel"}>
+      {!embedded ? <div className="flex items-center justify-between">
         <div>
           <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Automation controls</div>
           <div className="mt-1 text-sm text-slate-400">
@@ -1164,31 +1377,87 @@ function AutomationControlPanel({
           </div>
         </div>
         <StatusBadge status={automationForm.automation_enabled ? "enabled" : "disabled"} />
-      </div>
+      </div> : null}
+      {mode === "simulation" ? (
+        <div className="mt-4 space-y-3">
+          <ToggleField
+            label={<HelpTooltip label="Use same settings as Live" help="Keeps Simulation aligned with the live automation policy so your training runs mirror the same strategy, confidence, sizing, and stop defaults." />}
+            checked={automationForm.inherit_from_live}
+            onChange={(checked) => onChange((current) => (current ? { ...current, inherit_from_live: checked } : current))}
+          />
+          {inheritsLive ? (
+            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
+              Simulation is currently inheriting the live automation policy. You can still keep the simulation lane enabled or disabled separately, but the strategy filters, confidence threshold, order notional, and stop defaults now come from live.
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-border bg-black/20 px-4 py-3 text-sm text-slate-300">
+              Simulation is using its own automation overrides. This is useful when you want to train with a looser policy before promoting changes into live.
+            </div>
+          )}
+        </div>
+      ) : null}
       <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <ToggleField
           label={<HelpTooltip label="Automation enabled" help="Allows the system to place or prepare eligible trades without re-entering the ticket manually." />}
           checked={automationForm.automation_enabled}
           onChange={(checked) => onChange((current) => (current ? { ...current, automation_enabled: checked } : current))}
+          disabled={inheritsLive}
+        />
+        <ToggleField
+          label={
+            <HelpTooltip
+              label="Scheduled execution"
+              help={
+                mode === "simulation"
+                  ? "Runs this simulation automation profile on a timer. In fully automatic mode it can create simulated buy/sell orders when eligible signals pass risk checks."
+                  : "Runs this live automation profile on a timer only if live trading and broker execution are explicitly enabled. Keep this off unless you understand the live risk."
+              }
+            />
+          }
+          checked={automationForm.scheduled_execution_enabled}
+          onChange={(checked) => onChange((current) => (current ? { ...current, scheduled_execution_enabled: checked } : current))}
+          disabled={inheritsLive}
         />
         <Field label={<HelpTooltip label="Approval mode" help="Semi-automatic prepares a trade and asks for your approval. Fully automatic can submit the order directly if it passes risk checks." />}>
-          <select value={automationForm.approval_mode} onChange={(event) => onChange((current) => (current ? { ...current, approval_mode: event.target.value } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
+          <select value={automationForm.approval_mode} onChange={(event) => onChange((current) => (current ? { ...current, approval_mode: event.target.value } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60">
             <option value="manual_only">Manual only</option>
             <option value="semi_automatic">Semi-automatic</option>
             <option value="fully_automatic">Fully automatic</option>
           </select>
         </Field>
+        <Field
+          label={
+            <HelpTooltip
+              label="Automation check interval"
+              help="How often the scheduled worker is allowed to run this automation profile. The worker scans every minute, then runs only when this interval is due."
+            />
+          }
+          description={automationForm.scheduled_execution_enabled ? `Next due: ${formatDateTime(automationForm.next_scheduled_run_at)}` : "Timer is off until scheduled execution is enabled."}
+        >
+          <select
+            value={automationForm.execution_interval_seconds}
+            onChange={(event) => onChange((current) => (current ? { ...current, execution_interval_seconds: Number(event.target.value) } : current))}
+            disabled={inheritsLive}
+            className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60"
+          >
+            <option value={60}>Every 1 minute</option>
+            <option value={300}>Every 5 minutes</option>
+            <option value={600}>Every 10 minutes</option>
+            <option value={900}>Every 15 minutes</option>
+            <option value={1800}>Every 30 minutes</option>
+          </select>
+        </Field>
         <Field label="Confidence threshold">
-          <input type="number" step="0.01" min="0" max="1" value={automationForm.confidence_threshold} onChange={(event) => onChange((current) => (current ? { ...current, confidence_threshold: Number(event.target.value) } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+          <input type="number" step="0.01" min="0" max="1" value={automationForm.confidence_threshold} onChange={(event) => onChange((current) => (current ? { ...current, confidence_threshold: Number(event.target.value) } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60" />
         </Field>
         <Field label="Default order notional">
-          <input type="number" min="1" value={automationForm.default_order_notional} onChange={(event) => onChange((current) => (current ? { ...current, default_order_notional: Number(event.target.value) } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+          <input type="number" min="1" value={automationForm.default_order_notional} onChange={(event) => onChange((current) => (current ? { ...current, default_order_notional: Number(event.target.value) } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60" />
         </Field>
         <Field label="Max orders per run">
-          <input type="number" min="1" max="10" value={automationForm.max_orders_per_run} onChange={(event) => onChange((current) => (current ? { ...current, max_orders_per_run: Number(event.target.value) } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+          <input type="number" min="1" max="10" value={automationForm.max_orders_per_run} onChange={(event) => onChange((current) => (current ? { ...current, max_orders_per_run: Number(event.target.value) } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60" />
         </Field>
         <Field label="Risk profile">
-          <select value={automationForm.risk_profile} onChange={(event) => onChange((current) => (current ? { ...current, risk_profile: event.target.value } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
+          <select value={automationForm.risk_profile} onChange={(event) => onChange((current) => (current ? { ...current, risk_profile: event.target.value } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60">
             <option value="conservative">Conservative</option>
             <option value="balanced">Balanced</option>
             <option value="aggressive">Aggressive</option>
@@ -1203,6 +1472,7 @@ function AutomationControlPanel({
           items={workspaceData.strategies.map((strategy) => ({ value: strategy.slug, label: strategy.name }))}
           value={automationForm.allowed_strategy_slugs}
           onChange={(next) => onChange((current) => (current ? { ...current, allowed_strategy_slugs: next } : current))}
+          disabled={inheritsLive}
         />
         <CheckList
           title="Allowed providers"
@@ -1210,6 +1480,7 @@ function AutomationControlPanel({
           items={providerOptions.map((provider) => ({ value: provider, label: provider }))}
           value={automationForm.allowed_provider_types}
           onChange={(next) => onChange((current) => (current ? { ...current, allowed_provider_types: next } : current))}
+          disabled={inheritsLive}
         />
       </div>
 
@@ -1218,11 +1489,13 @@ function AutomationControlPanel({
           label="Allow buys"
           checked={automationForm.tradable_actions.includes("buy")}
           onChange={(checked) => onChange((current) => (current ? { ...current, tradable_actions: toggleListValue(current.tradable_actions, "buy", checked) } : current))}
+          disabled={inheritsLive}
         />
         <ToggleField
           label="Allow sells"
           checked={automationForm.tradable_actions.includes("sell")}
           onChange={(checked) => onChange((current) => (current ? { ...current, tradable_actions: toggleListValue(current.tradable_actions, "sell", checked) } : current))}
+          disabled={inheritsLive}
         />
         <ToggleField
           label="Profile enabled"
@@ -1232,12 +1505,28 @@ function AutomationControlPanel({
       </div>
 
       <Field label="Automation notes" description="Useful for documenting which strategies or signals should stay gated in this environment.">
-        <textarea rows={3} value={automationForm.notes || ""} onChange={(event) => onChange((current) => (current ? { ...current, notes: event.target.value } : current))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+        <textarea rows={3} value={automationForm.notes || ""} onChange={(event) => onChange((current) => (current ? { ...current, notes: event.target.value } : current))} disabled={inheritsLive} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100 disabled:opacity-60" />
       </Field>
 
       <div className="mt-4 rounded-2xl border border-border bg-black/20 p-4 text-sm text-slate-300">
-        <div className="font-semibold text-slate-100">Last run</div>
-        <div className="mt-1">{automationForm.last_run_message || "Automation has not been run yet."}</div>
+        <div className="font-semibold text-slate-100">Automation timing</div>
+        <div className="mt-1">
+          {automationForm.scheduled_execution_enabled
+            ? `Scheduled worker checks this profile every ${formatInterval(automationForm.execution_interval_seconds)}. ${
+                automationForm.approval_mode === "fully_automatic"
+                  ? mode === "simulation"
+                    ? "Eligible signals can become simulated orders automatically."
+                    : "Eligible signals can enter the guarded live workflow automatically."
+                  : "Eligible signals are queued for review because approval mode is not fully automatic."
+              }`
+            : "Scheduled execution is off. Use Run automation now to process eligible signals manually."}
+        </div>
+        <div className="mt-3 grid gap-2 md:grid-cols-3">
+          <SummaryChip label="Last run" value={formatDateTime(automationForm.last_run_at)} />
+          <SummaryChip label="Last scheduled run" value={formatDateTime(automationForm.last_scheduled_run_at)} />
+          <SummaryChip label="Next scheduled run" value={formatDateTime(automationForm.next_scheduled_run_at)} />
+        </div>
+        <div className="mt-3 text-slate-400">{automationForm.last_run_message || "Automation has not been run yet."}</div>
       </div>
 
       <div className="mt-4 flex flex-wrap gap-3">
@@ -1332,16 +1621,26 @@ function RecommendationQueue({
   );
 }
 
-function ExecutionHistoryPanel({ mode, orders, trades }: { mode: TradingMode; orders: any[]; trades: any[] }) {
+function ExecutionHistoryPanel({
+  mode,
+  orders,
+  trades,
+  onViewTrace,
+}: {
+  mode: TradingMode;
+  orders: Order[];
+  trades: Trade[];
+  onViewTrace: (type: "order" | "trade", item: Order | Trade) => void;
+}) {
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
         <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Active {mode} orders</div>
-        <TradesTable orders={orders} />
+        <TradesTable orders={orders} onViewTrace={onViewTrace} />
       </section>
       <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
         <div className="mb-3 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Recent {mode} executions</div>
-        <TradesTable trades={trades} />
+        <TradesTable trades={trades} onViewTrace={onViewTrace} />
       </section>
     </div>
   );
@@ -1365,12 +1664,25 @@ function Field({
   );
 }
 
-function ToggleField({ label, checked, onChange }: { label: ReactNode; checked: boolean; onChange: (value: boolean) => void }) {
+function ToggleField({
+  label,
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  label: ReactNode;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
-      onClick={() => onChange(!checked)}
-      className="flex items-center justify-between rounded-2xl border border-border bg-black/20 px-4 py-3 text-sm text-slate-300 hover:bg-white/5"
+      onClick={() => {
+        if (!disabled) onChange(!checked);
+      }}
+      disabled={disabled}
+      className="flex items-center justify-between rounded-2xl border border-border bg-black/20 px-4 py-3 text-sm text-slate-300 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-60"
     >
       <span>{label}</span>
       <span className={`rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] ${checked ? "bg-emerald-500/15 text-emerald-200" : "bg-slate-500/15 text-slate-400"}`}>
@@ -1386,12 +1698,14 @@ function CheckList({
   items,
   value,
   onChange,
+  disabled = false,
 }: {
   title: string;
   description: string;
   items: Array<{ value: string; label: string }>;
   value: string[];
   onChange: (next: string[]) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="rounded-2xl border border-border bg-black/20 p-4">
@@ -1406,6 +1720,7 @@ function CheckList({
               <input
                 type="checkbox"
                 checked={active}
+                disabled={disabled}
                 onChange={(event) => onChange(toggleListValue(value, item.value, event.target.checked))}
               />
             </label>
@@ -1517,6 +1832,20 @@ function parseOptional(value: string) {
 
 function round(value: number) {
   return Math.round(value * 10_000) / 10_000;
+}
+
+function formatInterval(seconds?: number | null) {
+  const safeSeconds = Math.max(Number(seconds || 300), 60);
+  if (safeSeconds < 120) return "1 minute";
+  const minutes = Math.round(safeSeconds / 60);
+  return `${minutes} minutes`;
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return "Not scheduled";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Not scheduled";
+  return date.toLocaleString();
 }
 
 function toggleListValue(list: string[], value: string, enabled: boolean) {

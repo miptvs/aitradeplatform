@@ -2,7 +2,9 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app.schemas.common import ORMModel
+from app.schemas.common import AuditLogRead, ORMModel
+from app.schemas.market import ExtractedEventRead, NewsArticleRead
+from app.schemas.portfolio import OrderRead, PositionRead, TradeRead
 
 
 class SignalRead(ORMModel):
@@ -26,6 +28,44 @@ class SignalRead(ORMModel):
     mode: str
     source_kind: str
     metadata_json: dict
+    signal_flavor: str = "technical-only"
+    fresh_news_used: bool = False
+    lane_statuses: dict[str, str] = Field(default_factory=dict)
+
+
+class SignalEvaluationRead(ORMModel):
+    id: str
+    signal_id: str
+    approved: bool
+    evaluator: str
+    reason: str | None = None
+    risk_score: float | None = None
+    expected_return: float | None = None
+    realized_return: float | None = None
+    outcome: str | None = None
+    created_at: datetime
+
+
+class SignalDetailRead(SignalRead):
+    symbol: str
+    asset_name: str
+    strategy_slug: str | None = None
+    strategy_name: str | None = None
+    related_news: list[NewsArticleRead] = Field(default_factory=list)
+    related_events: list[ExtractedEventRead] = Field(default_factory=list)
+
+
+class SignalTraceRead(BaseModel):
+    signal: SignalDetailRead | None = None
+    entrypoint: dict = Field(default_factory=dict)
+    summary: dict = Field(default_factory=dict)
+    risk_checks: list[dict] = Field(default_factory=list)
+    stop_history: list[dict] = Field(default_factory=list)
+    evaluations: list[SignalEvaluationRead] = Field(default_factory=list)
+    orders: list[OrderRead] = Field(default_factory=list)
+    positions: list[PositionRead] = Field(default_factory=list)
+    trades: list[TradeRead] = Field(default_factory=list)
+    audit_logs: list[AuditLogRead] = Field(default_factory=list)
 
 
 class SignalGenerationResponse(BaseModel):

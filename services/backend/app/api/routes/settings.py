@@ -8,6 +8,7 @@ from app.schemas.risk import RiskRuleRead
 from app.schemas.settings import SettingsOverview
 from app.services.providers.service import provider_service
 from app.services.risk.service import risk_service
+from app.services.trading.service import trading_workspace_service
 
 router = APIRouter()
 settings = get_settings()
@@ -22,6 +23,8 @@ def overview(db: Session = Depends(get_db)) -> SettingsOverview:
         providers=providers,
         task_mappings=[TaskMappingRead.model_validate(mapping) for mapping in mappings],
         risk_rules=[RiskRuleRead.model_validate(rule) for rule in rules],
+        live_automation=trading_workspace_service.serialize_profile(*trading_workspace_service.resolve_profile_pair(db, "live")),
+        simulation_automation=trading_workspace_service.serialize_profile(*trading_workspace_service.resolve_profile_pair(db, "simulation")),
         live_trading_enabled=settings.enable_live_trading,
     )
 

@@ -14,6 +14,7 @@ from app.services.news.service import news_service
 from app.services.providers.service import provider_service
 from app.services.signals.service import signal_service
 from app.services.simulation.service import simulation_service
+from app.services.trading.service import trading_workspace_service
 from app.utils.time import utcnow
 from app.workers.celery_app import celery_app
 
@@ -62,6 +63,18 @@ def generate_signals() -> dict:
         if signals:
             publish_event("signals.generated", {"count": len(signals)})
         return {"count": len(signals)}
+
+
+@celery_app.task(name="app.tasks.periodic.run_scheduled_simulation_automation")
+def run_scheduled_simulation_automation() -> dict:
+    with SessionLocal() as db:
+        result = trading_workspace_service.run_scheduled_automation(db, "simulation")
+        status = "ok" if result["status"] in {"success", "skipped", "noop"} else ("warn" if result["status"] == "blocked" else "error")
+        _health_event(db, "simulation.automation", status, result["message"], result)
+        db.commit()
+        if result["status"] == "success":
+            publish_event("automation.simulation", result)
+        return result
 
 
 @celery_app.task(name="app.tasks.periodic.provider_health_checks")

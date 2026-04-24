@@ -31,10 +31,21 @@ export function PositionsTable({ positions }: { positions: Position[] }) {
                 <td>{formatCurrency(position.avg_entry_price, position.asset_currency)}</td>
                 <td>{formatCurrency(position.current_price, position.asset_currency)}</td>
                 <td className={position.unrealized_pnl >= 0 ? "text-emerald-300" : "text-rose-300"}>{formatCurrency(position.unrealized_pnl, position.asset_currency)}</td>
-                <td className="text-xs text-slate-300">
-                  <div>SL {position.stop_loss ? formatCurrency(position.stop_loss, position.asset_currency) : "-"}</div>
-                  <div>TP {position.take_profit ? formatCurrency(position.take_profit, position.asset_currency) : "-"}</div>
-                  <div>TR {position.trailing_stop ? formatCurrency(position.trailing_stop, position.asset_currency) : "-"}</div>
+                <td className="min-w-[12rem] text-xs text-slate-300">
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-black/15 px-2.5 py-1.5">
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">SL</span>
+                      <span className="whitespace-nowrap font-medium text-slate-200">{position.stop_loss ? formatCurrency(position.stop_loss, position.asset_currency) : "-"}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-black/15 px-2.5 py-1.5">
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">TP</span>
+                      <span className="whitespace-nowrap font-medium text-slate-200">{position.take_profit ? formatCurrency(position.take_profit, position.asset_currency) : "-"}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-black/15 px-2.5 py-1.5">
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">TR</span>
+                      <span className="whitespace-nowrap font-medium text-slate-200">{position.trailing_stop ? formatCurrency(position.trailing_stop, position.asset_currency) : "-"}</span>
+                    </div>
+                  </div>
                 </td>
                 <td className="text-xs text-slate-300">
                   <div>{position.manual ? "Manual" : "Auto"}</div>

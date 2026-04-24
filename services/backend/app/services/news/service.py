@@ -94,8 +94,14 @@ class NewsService:
         if force_refresh:
             cutoff = refresh_started_at - timedelta(hours=backfill_hours or settings.news_force_backfill_hours)
         else:
-            base_checkpoint = checkpoint or (refresh_started_at - timedelta(hours=settings.news_initial_lookback_hours))
-            cutoff = base_checkpoint - timedelta(minutes=settings.news_refresh_overlap_minutes)
+            if checkpoint:
+                checkpoint_cutoff = checkpoint - timedelta(minutes=settings.news_refresh_overlap_minutes)
+                rolling_cutoff = refresh_started_at - timedelta(hours=settings.news_incremental_backfill_hours)
+                # RSS feeds can expose delayed items whose publication time is older than the newest item seen.
+                # Keep a rolling lookback and let URL/dedupe guards prevent re-imports.
+                cutoff = min(checkpoint_cutoff, rolling_cutoff)
+            else:
+                cutoff = refresh_started_at - timedelta(hours=settings.news_initial_lookback_hours)
 
         recent_articles = list(
             db.scalars(
@@ -262,6 +268,8 @@ class NewsService:
                     "date_skipped": date_skipped,
                     "latest_article_id": latest_article_id,
                     "cutoff": cutoff.isoformat(),
+                    "checkpoint": checkpoint.isoformat() if checkpoint else None,
+                    "rolling_backfill_hours": settings.news_incremental_backfill_hours if not force_refresh else backfill_hours or settings.news_force_backfill_hours,
                     "latest_seen_published_at": latest_seen_published_at.isoformat() if latest_seen_published_at else None,
                     "last_successful_fetch_time": last_successful_refresh.isoformat() if last_successful_refresh else None,
                     "force_refresh": force_refresh,
@@ -281,6 +289,8 @@ class NewsService:
             "date_skipped": date_skipped,
             "latest_article_id": latest_article_id,
             "cutoff": cutoff.isoformat(),
+            "checkpoint": checkpoint.isoformat() if checkpoint else None,
+            "rolling_backfill_hours": settings.news_incremental_backfill_hours if not force_refresh else backfill_hours or settings.news_force_backfill_hours,
             "latest_seen_published_at": latest_seen_published_at.isoformat() if latest_seen_published_at else None,
             "force_refresh": force_refresh,
             "last_successful_fetch_time": last_successful_refresh.isoformat() if last_successful_refresh else None,
@@ -375,7 +385,10 @@ class NewsService:
                 f"{date_skipped} older item{'s' if date_skipped != 1 else ''} were skipped since {cutoff.isoformat()}."
             )
             if not force_refresh:
-                message = f"{message} Use force refresh or backfill to re-read recent feed history."
+                message = (
+                    f"{message} Latest refresh keeps a rolling {settings.news_incremental_backfill_hours}h overlap "
+                    "to catch delayed RSS items; use force refresh or backfill for a wider re-read."
+                )
         if feeds_failed:
             message = f"{message} {feeds_failed} feed{'s' if feeds_failed != 1 else ''} failed."
         return message

@@ -10,7 +10,7 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { useApi } from "@/hooks/use-api";
 import { api } from "@/lib/api";
 import { formatPct } from "@/lib/utils";
-import type { BrokerAccount, ProviderConfig, SettingsOverview } from "@/types";
+import type { BrokerAccount, ProviderConfig, SettingsOverview, TradingAutomationProfile } from "@/types";
 
 function summarizeRiskRule(rule: SettingsOverview["risk_rules"][number]) {
   if (rule.rule_type === "daily_max_loss") {
@@ -44,6 +44,31 @@ function summarizeRiskRule(rule: SettingsOverview["risk_rules"][number]) {
     }
   }
   return null;
+}
+
+function summarizeAutomation(profile: TradingAutomationProfile) {
+  return `${profile.approval_mode.split("_").join(" ")} · threshold ${formatPct(profile.confidence_threshold)} · ${profile.default_order_notional.toFixed(0)} default notional`;
+}
+
+function toAutomationPayload(profile: TradingAutomationProfile) {
+  return {
+    enabled: profile.enabled,
+    automation_enabled: profile.automation_enabled,
+    inherit_from_live: profile.inherit_from_live,
+    approval_mode: profile.approval_mode,
+    allowed_strategy_slugs: profile.allowed_strategy_slugs,
+    tradable_actions: profile.tradable_actions,
+    allowed_provider_types: profile.allowed_provider_types,
+    confidence_threshold: profile.confidence_threshold,
+    default_order_notional: profile.default_order_notional,
+    stop_loss_pct: profile.stop_loss_pct,
+    take_profit_pct: profile.take_profit_pct,
+    trailing_stop_pct: profile.trailing_stop_pct,
+    max_orders_per_run: profile.max_orders_per_run,
+    risk_profile: profile.risk_profile,
+    notes: profile.notes,
+    config_json: profile.config_json,
+  };
 }
 
 export default function SettingsPage() {
@@ -91,6 +116,22 @@ export default function SettingsPage() {
       return {
         ...current,
         risk_rules: current.risk_rules.map((rule) => (rule.id === saved.id ? saved : rule)),
+      };
+    });
+  }
+
+  async function handleSimulationInheritanceChange(checked: boolean) {
+    if (!settingsState) return;
+    const saved = await api.saveSimulationAutomation({
+      ...toAutomationPayload(settingsState.simulation_automation),
+      inherit_from_live: checked,
+    });
+    setMessage(checked ? "Simulation now inherits the live automation policy." : "Simulation now uses its own automation overrides.");
+    setSettingsState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        simulation_automation: saved,
       };
     });
   }
@@ -148,7 +189,51 @@ export default function SettingsPage() {
           </div>
         </div>
         <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-          <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Operational notes</div>
+          <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Automation parity</div>
+          <div className="space-y-3 text-sm text-slate-300">
+            <div className="rounded-xl border border-border bg-black/20 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-medium text-slate-100">Live automation</div>
+                  <div className="mt-1 text-xs text-slate-400">This is the guarded production policy used by the Live Trading workspace.</div>
+                </div>
+                <StatusBadge status={settingsState.live_automation.automation_enabled ? "enabled" : "disabled"} />
+              </div>
+              <div className="mt-3 text-sm text-slate-200">{summarizeAutomation(settingsState.live_automation)}</div>
+            </div>
+            <div className="rounded-xl border border-border bg-black/20 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-medium text-slate-100">Simulation automation</div>
+                  <div className="mt-1 text-xs text-slate-400">
+                    Use the same policy as Live when you want training and production review to stay aligned. Turn it off when you want a safe override for experimentation.
+                  </div>
+                </div>
+                <StatusBadge status={settingsState.simulation_automation.inherit_from_live ? "shared" : "custom"} />
+              </div>
+              <label className="mt-4 flex items-center justify-between rounded-xl border border-border px-3 py-3">
+                <div>
+                  <div className="text-sm font-medium text-slate-100">Use same settings as Live</div>
+                  <div className="mt-1 text-xs text-slate-400">
+                    This keeps Simulation on the same strategy, threshold, sizing, and stop defaults as the live automation profile.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={settingsState.simulation_automation.inherit_from_live}
+                  onChange={(event) => handleSimulationInheritanceChange(event.target.checked)}
+                  className="h-4 w-4 rounded border-border bg-slate-900"
+                />
+              </label>
+              <div className="mt-3 text-sm text-slate-200">
+                {settingsState.simulation_automation.inherit_from_live
+                  ? `Currently inheriting from ${settingsState.simulation_automation.effective_source_mode}. ${summarizeAutomation(settingsState.simulation_automation)}`
+                  : summarizeAutomation(settingsState.simulation_automation)}
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-4 mt-6 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Operational notes</div>
           <div className="space-y-3 text-sm text-slate-300">
             <div className="rounded-xl border border-border bg-black/20 p-3">
               Trading212 credentials can now be saved here for backend-only ticker validation. Execution remains intentionally scaffolded.

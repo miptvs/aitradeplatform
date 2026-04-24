@@ -2,11 +2,12 @@
 
 import { useMemo, useState } from "react";
 
+import { SignalTraceDialog } from "@/components/signals/signal-trace-dialog";
 import { useWorkspace } from "@/components/layout/workspace-provider";
 import { SignalsTable } from "@/components/signals/signals-table";
 import { useApi } from "@/hooks/use-api";
 import { api } from "@/lib/api";
-import type { SignalRefreshResult } from "@/types";
+import type { Signal, SignalRefreshResult, SignalTrace } from "@/types";
 
 export default function SignalsPage() {
   const workspace = useWorkspace();
@@ -16,6 +17,11 @@ export default function SignalsPage() {
   const [strategyFilter, setStrategyFilter] = useState("");
   const [refreshResult, setRefreshResult] = useState<SignalRefreshResult | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
+  const [signalTrace, setSignalTrace] = useState<SignalTrace | null>(null);
+  const [traceLoading, setTraceLoading] = useState(false);
+  const [traceError, setTraceError] = useState<string | null>(null);
+  const [approvingLane, setApprovingLane] = useState<"live" | "simulation" | null>(null);
 
   const filtered = useMemo(() => {
     if (!data) return [];
@@ -30,7 +36,7 @@ export default function SignalsPage() {
   async function handleGenerate() {
     setRefreshing(true);
     try {
-      const result = await api.generateSignals(workspace.signalProviderType);
+      const result = await api.generateSignals(workspace.signalProviderType, { forceRefresh: true });
       setRefreshResult(result);
       reload();
     } catch (err) {
@@ -49,8 +55,52 @@ export default function SignalsPage() {
     }
   }
 
+  async function handleOpenTrace(signal: Signal) {
+    setSelectedSignal(signal);
+    setTraceLoading(true);
+    setTraceError(null);
+    try {
+      const trace = await api.getSignalTrace(signal.id);
+      setSignalTrace(trace);
+    } catch (err) {
+      setTraceError(err instanceof Error ? err.message : "Signal trace failed to load.");
+      setSignalTrace(null);
+    } finally {
+      setTraceLoading(false);
+    }
+  }
+
+  async function handleApprove(lane: "live" | "simulation") {
+    if (!selectedSignal) return;
+    try {
+      setApprovingLane(lane);
+      const decision =
+        lane === "live" ? await api.approveLiveSignal(selectedSignal.id) : await api.approveSimulationSignal(selectedSignal.id);
+      setRefreshResult((current) => ({
+        provider_type: current?.provider_type || workspace.signalProviderType,
+        status: "success",
+        created_signal_ids: current?.created_signal_ids || [],
+        created_count: current?.created_count || 0,
+        message: decision.reason,
+        detail: `${decision.symbol} moved into the ${lane === "live" ? "live review queue" : "simulation review queue"}.`,
+        market_report: current?.market_report || {},
+        news_report: current?.news_report || {},
+      }));
+      await handleOpenTrace(selectedSignal);
+      reload();
+    } catch (err) {
+      setTraceError(err instanceof Error ? err.message : `Failed to approve signal for ${lane}.`);
+    } finally {
+      setApprovingLane(null);
+    }
+  }
+
   if (loading || !data) return <div className="text-sm text-slate-400">Loading signals...</div>;
   if (error) return <div className="text-sm text-rose-300">Signals failed to load: {error}</div>;
+
+  const detailLaneStatuses = signalTrace?.signal?.lane_statuses || selectedSignal?.lane_statuses || {};
+  const liveLaneReady = (detailLaneStatuses.live || "candidate") === "candidate";
+  const simulationLaneReady = (detailLaneStatuses.simulation || "candidate") === "candidate";
 
   return (
     <div className="space-y-6">
@@ -89,7 +139,10 @@ export default function SignalsPage() {
               Created signals: <span className="text-slate-100">{refreshResult.created_count}</span>
             </div>
             <div>
-              Market data updates: <span className="text-slate-100">{String(refreshResult.market_report.snapshots_updated ?? 0)}</span>
+              Market data new / updated:{" "}
+              <span className="text-slate-100">
+                {String(refreshResult.market_report.snapshots_created ?? 0)} / {String(refreshResult.market_report.snapshots_updated ?? 0)}
+              </span>
             </div>
             <div>
               News articles added: <span className="text-slate-100">{String(refreshResult.news_report.articles_added ?? 0)}</span>
@@ -106,20 +159,59 @@ export default function SignalsPage() {
         <input value={symbolFilter} onChange={(event) => setSymbolFilter(event.target.value)} placeholder="Filter by symbol" className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
         <select value={actionFilter} onChange={(event) => setActionFilter(event.target.value)} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
           <option value="">All actions</option>
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
+          <option value="buy">Buy / Open</option>
+          <option value="sell">Sell / Close</option>
           <option value="hold">Hold</option>
         </select>
         <input value={strategyFilter} onChange={(event) => setStrategyFilter(event.target.value)} placeholder="Filter by strategy slug" className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
       </div>
 
       {filtered.length ? (
-        <SignalsTable signals={filtered} />
+        <SignalsTable signals={filtered} onSelectSignal={handleOpenTrace} />
       ) : (
         <div className="rounded-2xl border border-border bg-panel/90 p-6 text-sm text-slate-300 shadow-panel">
           No real signals are stored yet for <span style={{ color: workspace.theme.primary }}>{workspace.label}</span>. Refresh after market data and provider connectivity are available.
         </div>
       )}
+
+      <SignalTraceDialog
+        open={Boolean(selectedSignal)}
+        signal={selectedSignal}
+        trace={signalTrace}
+        loading={traceLoading}
+        error={traceError}
+        onClose={() => {
+          setSelectedSignal(null);
+          setSignalTrace(null);
+          setTraceError(null);
+        }}
+        actions={
+          <>
+            <button
+              type="button"
+              disabled={!selectedSignal || !liveLaneReady || approvingLane !== null}
+              onClick={() => handleApprove("live")}
+              className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-100 hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              title={liveLaneReady ? "Send this shared signal into the guarded live review workflow." : "This signal already has a live-lane outcome."}
+            >
+              {approvingLane === "live" ? "Sending..." : liveLaneReady ? "Send to live review" : `Live: ${detailLaneStatuses.live || "queued"}`}
+            </button>
+            <button
+              type="button"
+              disabled={!selectedSignal || !simulationLaneReady || approvingLane !== null}
+              onClick={() => handleApprove("simulation")}
+              className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              title={simulationLaneReady ? "Approve this shared signal for the simulation workflow." : "This signal already has a simulation-lane outcome."}
+            >
+              {approvingLane === "simulation"
+                ? "Approving..."
+                : simulationLaneReady
+                  ? "Approve for simulation"
+                  : `Simulation: ${detailLaneStatuses.simulation || "queued"}`}
+            </button>
+          </>
+        }
+      />
     </div>
   );
 }

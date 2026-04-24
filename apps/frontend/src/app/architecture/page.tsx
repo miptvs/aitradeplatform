@@ -58,7 +58,7 @@ export default function ArchitecturePage() {
         </div>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+      <div className="space-y-4">
         <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="text-sm font-semibold uppercase tracking-[0.18em]" style={{ color: workspace.theme.primary }}>
             Active Topology
@@ -136,7 +136,7 @@ export default function ArchitecturePage() {
           <div className="text-sm font-semibold uppercase tracking-[0.18em]" style={{ color: workspace.theme.primary }}>
             Current Workspace
           </div>
-          <div className="mt-4 space-y-3">
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             <InfoCard label="Frontend origin" value={`http://${workspace.host}:${workspace.port}`} status={frontendStatus} helper="This page is already being served, so the active frontend is up." />
             <InfoCard label="Backend origin" value="http://localhost:8000/api/v1" status={backendStatus} helper="Checked via the backend readiness endpoint." />
             <InfoCard label="Database" value={data.ready.details.database || "unknown"} status={databaseStatus} />
@@ -160,52 +160,54 @@ export default function ArchitecturePage() {
             <InfoCard label="Active simulation account" value={activeSimulationAccount ? `${activeSimulationAccount.name} (${activeSimulationAccount.starting_cash.toFixed(2)} starting cash)` : "No simulation account"} />
           </div>
 
-          <div className="mt-4 rounded-xl border border-border bg-black/20 p-3 text-sm leading-6 text-slate-300">
-            <div>
-              <span className="text-slate-100">Why `http://localhost:8000/mcp/` looks odd:</span> MCP streamable HTTP is a protocol transport, so a plain browser GET can show an accept-header error instead of a page.
+          <div className="mt-4 grid gap-4 xl:grid-cols-3">
+            <div className="rounded-xl border border-border bg-black/20 p-3 text-sm leading-6 text-slate-300 xl:col-span-1">
+              <div>
+                <span className="text-slate-100">Why `http://localhost:8000/mcp/` looks odd:</span> MCP streamable HTTP is a protocol transport, so a plain browser GET can show an accept-header error instead of a page.
+              </div>
+              <div className="mt-2">
+                <span className="text-slate-100">Why `http://backend:8000/mcp/` does not load:</span> `backend` is the Docker-internal hostname, so it only resolves from containers on the Compose network, not from your host browser.
+              </div>
             </div>
-            <div className="mt-2">
-              <span className="text-slate-100">Why `http://backend:8000/mcp/` does not load:</span> `backend` is the Docker-internal hostname, so it only resolves from containers on the Compose network, not from your host browser.
-            </div>
-          </div>
 
-          <div className="mt-4 rounded-xl border border-border bg-black/20 p-3">
-            <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Provider health</div>
-            <div className="mt-3 space-y-2">
-              {currentHealth.length ? (
-                currentHealth.map((provider) => (
-                  <div key={provider.provider_type} className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm text-slate-100">{provider.provider_type}</div>
-                      <div className="text-xs text-slate-400">{provider.message}</div>
-                    </div>
-                    <StatusBadge status={provider.status} />
-                  </div>
-                ))
-              ) : (
-                <div className="text-sm text-slate-400">No provider health events recorded yet for this workspace.</div>
-              )}
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-xl border border-border bg-black/20 p-3">
-            <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Broker accounts</div>
-            <div className="mt-3 space-y-2">
-              {data.brokerAccounts.length ? (
-                data.brokerAccounts.map((account) => (
-                  <div key={account.id} className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm text-slate-100">{account.name}</div>
-                      <div className="text-xs text-slate-400">
-                        {account.broker_type} · {account.mode} · {account.enabled ? "enabled" : "disabled"}
+            <div className="rounded-xl border border-border bg-black/20 p-3">
+              <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Provider health</div>
+              <div className="mt-3 space-y-2">
+                {currentHealth.length ? (
+                  currentHealth.map((provider) => (
+                    <div key={provider.provider_type} className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm text-slate-100">{provider.provider_type}</div>
+                        <div className="text-xs text-slate-400">{provider.message}</div>
                       </div>
+                      <StatusBadge status={provider.status} />
                     </div>
-                    <StatusBadge status={account.status || "disabled"} />
-                  </div>
-                ))
-              ) : (
-                <div className="text-sm text-slate-400">No broker accounts configured yet.</div>
-              )}
+                  ))
+                ) : (
+                  <div className="text-sm text-slate-400">No provider health events recorded yet for this workspace.</div>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-border bg-black/20 p-3">
+              <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Broker accounts</div>
+              <div className="mt-3 space-y-2">
+                {data.brokerAccounts.length ? (
+                  data.brokerAccounts.map((account) => (
+                    <div key={account.id} className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm text-slate-100">{account.name}</div>
+                        <div className="text-xs text-slate-400">
+                          {account.broker_type} · {account.mode} · {account.enabled ? "enabled" : "disabled"}
+                        </div>
+                      </div>
+                      <StatusBadge status={account.status || "disabled"} />
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-slate-400">No broker accounts configured yet.</div>
+                )}
+              </div>
             </div>
           </div>
         </div>

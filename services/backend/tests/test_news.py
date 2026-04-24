@@ -123,6 +123,48 @@ def test_refresh_latest_news_only_imports_items_after_last_refresh(monkeypatch) 
     assert any(article.url == "https://example.com/new" for article in articles)
 
 
+def test_refresh_latest_news_imports_delayed_items_inside_rolling_window(monkeypatch) -> None:
+    db = build_session()
+    db.add(Asset(symbol="MSFT", name="Microsoft Corp.", asset_type="stock", sector="Technology", exchange="NASDAQ", currency="USD"))
+    latest_seen = utcnow()
+    db.add(
+        SystemHealthEvent(
+            component="news.rss_refresh",
+            status="ok",
+            message="Previous refresh saw a newer top-of-feed item",
+            metadata_json={"latest_seen_published_at": latest_seen.isoformat()},
+            observed_at=latest_seen,
+        )
+    )
+    db.commit()
+
+    delayed_item = latest_seen - timedelta(hours=24)
+    feed_xml = f"""
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Microsoft gains after cloud analyst upgrade</title>
+          <link>https://example.com/msft-delayed</link>
+          <guid>msft-delayed</guid>
+          <description>A delayed RSS item is still inside the rolling overlap window.</description>
+          <source>Example Markets</source>
+          <pubDate>{format_datetime(delayed_item)}</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """.strip()
+
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://example.com/rss"])
+    monkeypatch.setattr(news_service, "_fetch_feed", lambda _: feed_xml)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+
+    assert result["articles_added"] == 1
+    assert result["feed_reports"][0]["added_count"] == 1
+    assert db.query(NewsArticle).filter(NewsArticle.url == "https://example.com/msft-delayed").one()
+
+
 def test_refresh_latest_news_force_refresh_backfills_recent_items(monkeypatch) -> None:
     db = build_session()
     db.add(Asset(symbol="QQQ", name="Invesco QQQ Trust", asset_type="etf", sector="Index", exchange="NASDAQ", currency="USD"))

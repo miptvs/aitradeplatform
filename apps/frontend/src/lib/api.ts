@@ -18,11 +18,14 @@ import type {
   PortfolioSnapshot,
   PortfolioSummary,
   Position,
+  PositionAction,
   ProviderConfig,
   ProviderHealth,
   SettingsOverview,
   Signal,
+  SignalDetail,
   SignalRefreshResult,
+  SignalTrace,
   SimulationAccount,
   SimulationSummary,
   SimulationVsLive,
@@ -99,8 +102,16 @@ export const api = {
     return request<Trade[]>(`/trades${suffix}`);
   },
   getSignals: (providerType?: string) => request<Signal[]>(`/signals${providerType ? `?provider_type=${encodeURIComponent(providerType)}` : ""}`),
-  generateSignals: (providerType: string) =>
-    request<SignalRefreshResult>(`/signals/refresh?provider_type=${encodeURIComponent(providerType)}`, { method: "POST" }),
+  getSignalDetail: (signalId: string) => request<SignalDetail>(`/signals/${encodeURIComponent(signalId)}`),
+  getSignalTrace: (signalId: string) => request<SignalTrace>(`/signals/${encodeURIComponent(signalId)}/trace`),
+  getOrderTrace: (orderId: string) => request<SignalTrace>(`/orders/${encodeURIComponent(orderId)}/trace`),
+  getTradeTrace: (tradeId: string) => request<SignalTrace>(`/trades/${encodeURIComponent(tradeId)}/trace`),
+  getPositionTrace: (positionId: string) => request<SignalTrace>(`/positions/${encodeURIComponent(positionId)}/trace`),
+  generateSignals: (providerType: string, options?: { forceRefresh?: boolean }) => {
+    const search = new URLSearchParams({ provider_type: providerType });
+    if (options?.forceRefresh) search.set("force_refresh", "true");
+    return request<SignalRefreshResult>(`/signals/refresh?${search.toString()}`, { method: "POST" });
+  },
   getNews: () => request<NewsArticle[]>("/news"),
   getNewsDiagnostics: () => request<NewsRefreshDiagnostics>("/news/diagnostics"),
   refreshNews: (payload?: { force_refresh?: boolean; backfill_hours?: number | null }) =>
@@ -131,8 +142,10 @@ export const api = {
   createLiveOrder: (payload: Record<string, unknown>) => request<Order>("/live/orders", { method: "POST", body: JSON.stringify(payload) }),
   updateSimulationStops: (id: string, payload: Record<string, unknown>) =>
     request<Position>(`/simulation/positions/${id}/stops`, { method: "PATCH", body: JSON.stringify(payload) }),
+  getSimulationPositionActions: (id: string) => request<PositionAction[]>(`/simulation/positions/${id}/actions`),
   updateLiveStops: (id: string, payload: Record<string, unknown>) =>
     request<Position>(`/live/positions/${id}/stops`, { method: "PATCH", body: JSON.stringify(payload) }),
+  getLivePositionActions: (id: string) => request<PositionAction[]>(`/live/positions/${id}/actions`),
   closeSimulationPosition: (id: string, options?: { quantity?: number; closePercent?: number; exitPrice?: number }) => {
     const params = new URLSearchParams();
     if (options?.quantity !== undefined) params.set("quantity", String(options.quantity));
@@ -154,12 +167,16 @@ export const api = {
     request<TradingAutomationProfile>("/simulation/automation", { method: "PUT", body: JSON.stringify(payload) }),
   runSimulationAutomation: (accountId?: string) =>
     request<AutomationRunResult>(`/simulation/automation/run${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ""}`, { method: "POST" }),
+  approveSimulationSignal: (signalId: string, reason?: string) =>
+    request<AutomationDecision>(`/simulation/signals/${signalId}/approve`, { method: "POST", body: JSON.stringify({ reason }) }),
   rejectSimulationRecommendation: (signalId: string, reason?: string) =>
     request<AutomationDecision>(`/simulation/recommendations/${signalId}/reject`, { method: "POST", body: JSON.stringify({ reason }) }),
   getLiveAutomation: () => request<TradingAutomationProfile>("/live/automation"),
   saveLiveAutomation: (payload: Record<string, unknown>) =>
     request<TradingAutomationProfile>("/live/automation", { method: "PUT", body: JSON.stringify(payload) }),
   runLiveAutomation: () => request<AutomationRunResult>("/live/automation/run", { method: "POST" }),
+  approveLiveSignal: (signalId: string, reason?: string) =>
+    request<AutomationDecision>(`/live/signals/${signalId}/approve`, { method: "POST", body: JSON.stringify({ reason }) }),
   rejectLiveRecommendation: (signalId: string, reason?: string) =>
     request<AutomationDecision>(`/live/recommendations/${signalId}/reject`, { method: "POST", body: JSON.stringify({ reason }) }),
   syncLiveBroker: (brokerAccountId?: string) =>

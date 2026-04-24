@@ -4,10 +4,13 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.models.audit import AuditLog
 from app.models.asset import Asset
 from app.models.news import ExtractedEvent, NewsArticle
-from app.models.signal import Signal
+from app.models.portfolio import Order, Position, Trade
+from app.models.signal import Signal, SignalEvaluation
 from app.models.strategy import Strategy
+from app.services.portfolio.service import portfolio_service
 from app.services.market_data.service import market_data_service
 from app.services.mcp.client import mcp_client_service
 from app.services.providers.service import provider_service
@@ -25,9 +28,54 @@ class SignalService:
         signals = list(db.scalars(query.order_by(desc(Signal.occurred_at)).limit(200)))
         return [self._signal_view(db, signal) for signal in signals]
 
-    def generate_signals(self, db: Session, provider_type: str | None = None) -> list[Signal]:
+    def get_signal(self, db: Session, signal_id: str) -> dict:
+        signal = db.get(Signal, signal_id)
+        if signal is None:
+            raise ValueError("Signal not found.")
+        return self._signal_detail_view(db, signal)
+
+    def get_signal_trace(self, db: Session, signal_id: str) -> dict:
+        signal = db.get(Signal, signal_id)
+        if signal is None:
+            raise ValueError("Signal not found.")
+        return self._build_trace(db, signal=signal, entrypoint_type="signal", entrypoint_id=signal.id)
+
+    def get_order_trace(self, db: Session, order_id: str) -> dict:
+        order = db.get(Order, order_id)
+        if order is None:
+            raise ValueError("Order not found.")
+        signal = db.get(Signal, order.signal_id) if order.signal_id else None
+        return self._build_trace(db, signal=signal, entrypoint_type="order", entrypoint_id=order.id, seed_orders=[order])
+
+    def get_trade_trace(self, db: Session, trade_id: str) -> dict:
+        trade = db.get(Trade, trade_id)
+        if trade is None:
+            raise ValueError("Trade not found.")
+        seed_orders = [db.get(Order, trade.order_id)] if trade.order_id else []
+        seed_orders = [order for order in seed_orders if order is not None]
+        signal = self._root_signal_from_components(db, orders=seed_orders, positions=[], trades=[trade])
+        return self._build_trace(db, signal=signal, entrypoint_type="trade", entrypoint_id=trade.id, seed_orders=seed_orders, seed_trades=[trade])
+
+    def get_position_trace(self, db: Session, position_id: str) -> dict:
+        position = db.get(Position, position_id)
+        if position is None:
+            raise ValueError("Position not found.")
+        seed_orders = list(db.scalars(select(Order).where(Order.position_id == position.id).order_by(desc(Order.created_at)).limit(50)))
+        seed_trades = list(db.scalars(select(Trade).where(Trade.position_id == position.id).order_by(desc(Trade.executed_at)).limit(100)))
+        signal = self._root_signal_from_components(db, orders=seed_orders, positions=[position], trades=seed_trades)
+        return self._build_trace(
+            db,
+            signal=signal,
+            entrypoint_type="position",
+            entrypoint_id=position.id,
+            seed_orders=seed_orders,
+            seed_positions=[position],
+            seed_trades=seed_trades,
+        )
+
+    def generate_signals(self, db: Session, provider_type: str | None = None, *, force_refresh: bool = False) -> list[Signal]:
         if provider_type:
-            return self._generate_for_provider(db, provider_type)
+            return self._generate_for_provider(db, provider_type, force_refresh=force_refresh)
 
         created: list[Signal] = []
         for config in provider_service.list_configs(db):
@@ -35,12 +83,12 @@ class SignalService:
             if not config.enabled or profile.trading_mode != "simulation":
                 continue
             try:
-                created.extend(self._generate_for_provider(db, config.provider_type))
+                created.extend(self._generate_for_provider(db, config.provider_type, force_refresh=force_refresh))
             except Exception:
                 continue
         return created
 
-    def _generate_for_provider(self, db: Session, provider_type: str) -> list[Signal]:
+    def _generate_for_provider(self, db: Session, provider_type: str, *, force_refresh: bool = False) -> list[Signal]:
         config = provider_service.get_config(db, provider_type)
         if config is None:
             raise ValueError(f"Provider config not found for {provider_type}")
@@ -54,6 +102,11 @@ class SignalService:
         provider_errors: list[str] = []
         candidate_limit = 1 if profile.deployment_scope == "local" else 2
         provider_timeout = 12 if profile.deployment_scope == "local" else 20
+        held_asset_ids = {
+            item
+            for item in db.scalars(select(Position.asset_id).where(Position.status == "open")).all()
+            if item is not None
+        }
 
         candidates: list[dict[str, Any]] = []
         for asset in self._eligible_assets(db):
@@ -67,7 +120,7 @@ class SignalService:
                 .order_by(desc(Signal.occurred_at))
                 .limit(1)
             )
-            if latest_existing and (utcnow() - latest_existing.occurred_at).total_seconds() < 900:
+            if not force_refresh and latest_existing and (utcnow() - latest_existing.occurred_at).total_seconds() < 900:
                 continue
 
             closes = [item.close_price for item in history]
@@ -77,9 +130,14 @@ class SignalService:
             indicator_payload = self._build_indicator_payload(closes, volumes)
             decisions = self._build_strategy_decisions(indicator_payload, latest_news, latest_event)
             preferred_slug, preferred_decision = self._select_preferred_decision(decisions)
+            is_held = asset.id in held_asset_ids
             score = preferred_decision.confidence
             if preferred_decision.action != "hold":
                 score += 0.15
+            if is_held:
+                score += 0.04
+            if is_held and preferred_decision.action == "sell":
+                score += 0.18
             if latest_news and latest_news.impact_score:
                 score += latest_news.impact_score * 0.1
             if latest_event and latest_event.impact_score:
@@ -93,11 +151,31 @@ class SignalService:
                     "preferred_decision": preferred_decision,
                     "latest_news": latest_news,
                     "latest_event": latest_event,
+                    "is_held": is_held,
                     "score": score,
                 }
             )
 
-        for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True)[:candidate_limit]:
+        ranked_candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
+        selected_candidates: list[dict[str, Any]] = []
+        exit_candidate = next(
+            (
+                item
+                for item in ranked_candidates
+                if item["is_held"] and item["preferred_decision"].action == "sell"
+            ),
+            None,
+        )
+        if exit_candidate is not None:
+            selected_candidates.append(exit_candidate)
+        for candidate in ranked_candidates:
+            if candidate in selected_candidates:
+                continue
+            if len(selected_candidates) >= candidate_limit:
+                break
+            selected_candidates.append(candidate)
+
+        for candidate in selected_candidates:
             asset = candidate["asset"]
             indicator_payload = candidate["indicator_payload"]
             decisions = candidate["decisions"]
@@ -105,6 +183,7 @@ class SignalService:
             preferred_decision = candidate["preferred_decision"]
             latest_news = candidate["latest_news"]
             latest_event = candidate["latest_event"]
+            is_held = candidate["is_held"]
             strategy = strategies.get(preferred_slug)
             mcp_context = mcp_client_service.get_signal_context(symbol=asset.symbol, mode=profile.trading_mode)
             prompt = self._signal_prompt(
@@ -183,6 +262,8 @@ class SignalService:
                     "provider_vendor": profile.vendor_key,
                     "preferred_strategy": preferred_slug,
                     "generation_profile_mode": profile.trading_mode,
+                    "trade_intent": "close_long" if is_held and action == "sell" else ("open_long" if action == "buy" else "observe"),
+                    "is_held_asset": is_held,
                     "news_title": latest_news.title if latest_news else None,
                     "event_type": latest_event.event_type if latest_event else None,
                     "mcp_context_used": bool(mcp_context),
@@ -192,12 +273,220 @@ class SignalService:
             db.flush()
             created.append(signal)
 
+        created.extend(
+            self._generate_position_exit_signals(
+                db,
+                provider_type=provider_type,
+                config=config,
+                profile=profile,
+                strategies=strategies,
+                recent_news=recent_news,
+                force_refresh=force_refresh,
+            )
+        )
+
         if not created and provider_errors:
             if len(provider_errors) == 1:
                 raise ValueError(provider_errors[0])
             raise ValueError(f"{provider_errors[0]} (+{len(provider_errors) - 1} more provider errors)")
 
         return created
+
+    def _generate_position_exit_signals(
+        self,
+        db: Session,
+        *,
+        provider_type: str,
+        config,
+        profile,
+        strategies: dict[str, Strategy],
+        recent_news: list[NewsArticle],
+        force_refresh: bool = False,
+    ) -> list[Signal]:
+        created: list[Signal] = []
+        positions = list(
+            db.scalars(
+                select(Position)
+                .where(Position.status == "open", Position.quantity > 0)
+                .order_by(desc(Position.updated_at))
+                .limit(12)
+            )
+        )
+        if not positions:
+            return created
+
+        strategy = strategies.get("blended")
+        for position in positions:
+            asset = db.get(Asset, position.asset_id)
+            if asset is None:
+                continue
+
+            if not force_refresh and self._recent_close_signal_exists(db, asset.id, provider_type):
+                continue
+
+            history = market_data_service.get_history(db, asset.id, limit=90)
+            if len(history) < 30 or not self._history_is_real(history):
+                continue
+
+            closes = [item.close_price for item in history]
+            volumes = [item.volume for item in history]
+            latest_news = self._latest_news_for_symbol(recent_news, asset.symbol)
+            latest_event = self._latest_event_for_symbol(db, asset.symbol)
+            indicator_payload = self._build_indicator_payload(closes, volumes)
+            decisions = self._build_strategy_decisions(indicator_payload, latest_news, latest_event)
+            exit_decision = self._position_exit_decision(position, asset.symbol, indicator_payload, decisions)
+            if exit_decision is None:
+                continue
+
+            signal = Signal(
+                asset_id=asset.id,
+                strategy_id=strategy.id if strategy else None,
+                action="sell",
+                confidence=exit_decision["confidence"],
+                status="candidate",
+                occurred_at=utcnow(),
+                indicators_json={
+                    **indicator_payload,
+                    "strategy_votes": {
+                        slug: {
+                            "action": decision.action,
+                            "confidence": decision.confidence,
+                            "rationale": decision.rationale,
+                        }
+                        for slug, decision in decisions.items()
+                    },
+                    "position_context": {
+                        "position_id": position.id,
+                        "quantity": position.quantity,
+                        "avg_entry_price": position.avg_entry_price,
+                        "current_price": position.current_price,
+                        "unrealized_pnl": position.unrealized_pnl,
+                        "stop_loss": position.stop_loss,
+                        "take_profit": position.take_profit,
+                        "trailing_stop": position.trailing_stop,
+                    },
+                },
+                related_news_ids=[latest_news.id] if latest_news else [],
+                related_event_ids=[latest_event.id] if latest_event else [],
+                ai_rationale=exit_decision["rationale"],
+                suggested_entry=round(float(position.current_price or indicator_payload["close"]), 2),
+                suggested_stop_loss=None,
+                suggested_take_profit=None,
+                estimated_risk_reward=None,
+                provider_type=provider_type,
+                model_name=f"{config.default_model or profile.default_model}+exit-rules",
+                mode="both",
+                source_kind="agent",
+                metadata_json={
+                    "symbol": asset.symbol,
+                    "provider_vendor": profile.vendor_key,
+                    "preferred_strategy": "blended",
+                    "generation_profile_mode": profile.trading_mode,
+                    "generation_stage": "position_exit_scan",
+                    "trade_intent": "close_long",
+                    "is_held_asset": True,
+                    "position_id": position.id,
+                    "exit_trigger": exit_decision["trigger"],
+                    "news_title": latest_news.title if latest_news else None,
+                    "event_type": latest_event.event_type if latest_event else None,
+                    "mcp_context_used": False,
+                },
+            )
+            db.add(signal)
+            db.flush()
+            created.append(signal)
+            if len(created) >= 3:
+                break
+
+        return created
+
+    def _recent_close_signal_exists(self, db: Session, asset_id: str, provider_type: str) -> bool:
+        recent_signals = list(
+            db.scalars(
+                select(Signal)
+                .where(
+                    Signal.asset_id == asset_id,
+                    Signal.provider_type == provider_type,
+                    Signal.source_kind == "agent",
+                    Signal.action == "sell",
+                )
+                .order_by(desc(Signal.occurred_at))
+                .limit(5)
+            )
+        )
+        for signal in recent_signals:
+            if signal.metadata_json.get("trade_intent") != "close_long":
+                continue
+            if (utcnow() - signal.occurred_at).total_seconds() < 900:
+                return True
+        return False
+
+    def _position_exit_decision(
+        self,
+        position: Position,
+        symbol: str,
+        indicators: dict[str, float],
+        decisions: dict[str, StrategyDecision],
+    ) -> dict[str, Any] | None:
+        current = float(position.current_price or indicators["close"])
+        avg_entry = float(position.avg_entry_price or current)
+
+        if position.stop_loss and current <= float(position.stop_loss):
+            return {
+                "confidence": 0.95,
+                "trigger": "stop_loss_breached",
+                "rationale": (
+                    f"Close signal: {symbol} is at {current:.2f}, below the configured stop loss "
+                    f"of {float(position.stop_loss):.2f}. Exit review is required before the loss expands."
+                ),
+            }
+        if position.take_profit and current >= float(position.take_profit):
+            return {
+                "confidence": 0.9,
+                "trigger": "take_profit_reached",
+                "rationale": (
+                    f"Close signal: {symbol} reached the configured take-profit level. "
+                    "The position should be reviewed for a full or partial exit."
+                ),
+            }
+
+        sell_votes = [decision for decision in decisions.values() if decision.action == "sell"]
+        buy_votes = [decision for decision in decisions.values() if decision.action == "buy"]
+        strongest_sell = max((decision.confidence for decision in sell_votes), default=0.0)
+        strongest_buy = max((decision.confidence for decision in buy_votes), default=0.0)
+        momentum_negative = (indicators.get("momentum_10") or 0) < 0
+        macd_negative = (indicators.get("macd_histogram") or 0) < 0
+        below_trend = current < float(indicators.get("sma_30") or current)
+
+        if strongest_sell >= 0.62 and strongest_sell >= strongest_buy:
+            return {
+                "confidence": round(min(0.86, strongest_sell + 0.08), 2),
+                "trigger": "bearish_strategy_vote",
+                "rationale": (
+                    f"Close signal: strategy votes have turned bearish for the open {symbol} position. "
+                    "A sell candidate was generated so the position can be reviewed or reduced."
+                ),
+            }
+        if current < avg_entry and momentum_negative and (macd_negative or below_trend) and strongest_buy < 0.62:
+            return {
+                "confidence": 0.61,
+                "trigger": "capital_protection",
+                "rationale": (
+                    f"Close signal: {symbol} is below entry while momentum is negative and the strategy stack "
+                    "does not show a strong buy thesis. This is a capital-protection exit candidate."
+                ),
+            }
+        if strongest_sell >= 0.60 and current < avg_entry and (momentum_negative or macd_negative or below_trend):
+            return {
+                "confidence": round(max(0.52, min(0.57, strongest_sell - 0.05)), 2),
+                "trigger": "mixed_exit_watch",
+                "rationale": (
+                    f"Close watch: {symbol} has a credible bearish strategy vote while the position is below entry, "
+                    "but the broader thesis is mixed. This sell signal is intentionally below the default automation "
+                    "threshold so it shows up for review without auto-closing the position."
+                ),
+            }
+        return None
 
     def _eligible_assets(self, db: Session) -> list[Asset]:
         return list(db.scalars(select(Asset).where(Asset.is_active.is_(True)).order_by(Asset.symbol).limit(16)))
@@ -298,7 +587,276 @@ class SignalService:
             "asset_name": asset.name if asset else signal.asset_id,
             "strategy_slug": strategy.slug if strategy else None,
             "strategy_name": strategy.name if strategy else None,
+            "signal_flavor": self._signal_flavor(signal, strategy.slug if strategy else None),
+            "fresh_news_used": bool(signal.related_news_ids or signal.related_event_ids),
+            "lane_statuses": self._lane_statuses(db, signal.id),
         }
+
+    def _signal_detail_view(self, db: Session, signal: Signal) -> dict:
+        base = self._signal_view(db, signal)
+        related_news = [db.get(NewsArticle, item_id) for item_id in signal.related_news_ids]
+        related_events = [db.get(ExtractedEvent, item_id) for item_id in signal.related_event_ids]
+        return {
+            **base,
+            "related_news": [to_plain_dict(item) for item in related_news if item is not None],
+            "related_events": [to_plain_dict(item) for item in related_events if item is not None],
+        }
+
+    def _build_trace(
+        self,
+        db: Session,
+        *,
+        signal: Signal | None,
+        entrypoint_type: str,
+        entrypoint_id: str,
+        seed_orders: list[Order] | None = None,
+        seed_positions: list[Position] | None = None,
+        seed_trades: list[Trade] | None = None,
+    ) -> dict:
+        orders = self._merge_by_id(seed_orders or [])
+        positions = self._merge_by_id(seed_positions or [])
+        trades = self._merge_by_id(seed_trades or [])
+
+        if signal is not None:
+            signal_orders = list(db.scalars(select(Order).where(Order.signal_id == signal.id).order_by(desc(Order.created_at)).limit(50)))
+            orders = self._merge_by_id([*orders, *signal_orders])
+
+        if orders:
+            order_position_ids = [order.position_id for order in orders if order.position_id]
+            if order_position_ids:
+                positions = self._merge_by_id([*positions, *[item for item in (db.get(Position, item_id) for item_id in order_position_ids) if item is not None]])
+            order_ids = [order.id for order in orders]
+            trades = self._merge_by_id(
+                [
+                    *trades,
+                    *list(db.scalars(select(Trade).where(Trade.order_id.in_(order_ids)).order_by(desc(Trade.executed_at)).limit(100))),
+                ]
+            )
+
+        if positions:
+            position_ids = [position.id for position in positions]
+            orders = self._merge_by_id(
+                [
+                    *orders,
+                    *list(db.scalars(select(Order).where(Order.position_id.in_(position_ids)).order_by(desc(Order.created_at)).limit(100))),
+                ]
+            )
+            trades = self._merge_by_id(
+                [
+                    *trades,
+                    *list(db.scalars(select(Trade).where(Trade.position_id.in_(position_ids)).order_by(desc(Trade.executed_at)).limit(100))),
+                ]
+            )
+
+        if signal is None:
+            signal = self._root_signal_from_components(db, orders=orders, positions=positions, trades=trades)
+            if signal is not None:
+                signal_orders = list(db.scalars(select(Order).where(Order.signal_id == signal.id).order_by(desc(Order.created_at)).limit(50)))
+                orders = self._merge_by_id([*orders, *signal_orders])
+
+        evaluations = []
+        if signal is not None:
+            evaluations = list(
+                db.scalars(
+                    select(SignalEvaluation)
+                    .where(SignalEvaluation.signal_id == signal.id)
+                    .order_by(desc(SignalEvaluation.created_at))
+                    .limit(50)
+                )
+            )
+
+        target_ids = {
+            entrypoint_id,
+            *(item.id for item in ([signal] if signal is not None else [])),
+            *(order.id for order in orders),
+            *(position.id for position in positions),
+            *(trade.id for trade in trades),
+        }
+        audit_logs = (
+            list(
+                db.scalars(
+                    select(AuditLog)
+                    .where(AuditLog.target_id.in_(list(target_ids)))
+                    .order_by(desc(AuditLog.occurred_at))
+                    .limit(100)
+                )
+            )
+            if target_ids
+            else []
+        )
+
+        return {
+            "signal": self._signal_detail_view(db, signal) if signal is not None else None,
+            "entrypoint": self._entrypoint_view(db, entrypoint_type, entrypoint_id),
+            "summary": self._trace_summary(signal, orders, positions, trades),
+            "risk_checks": self._risk_checks_from_orders(orders),
+            "stop_history": self._stop_history(signal, orders, positions, audit_logs),
+            "evaluations": [to_plain_dict(item) for item in evaluations],
+            "orders": [portfolio_service._order_view(db, order) for order in orders],
+            "positions": [portfolio_service._position_view(db, position) for position in positions],
+            "trades": [portfolio_service._trade_view(db, trade) for trade in trades],
+            "audit_logs": [to_plain_dict(item) for item in audit_logs],
+        }
+
+    def _root_signal_from_components(
+        self,
+        db: Session,
+        *,
+        orders: list[Order],
+        positions: list[Position],
+        trades: list[Trade],
+    ) -> Signal | None:
+        for order in orders:
+            if order.signal_id:
+                signal = db.get(Signal, order.signal_id)
+                if signal is not None:
+                    return signal
+        order_ids = [trade.order_id for trade in trades if trade.order_id]
+        if order_ids:
+            order = db.scalar(select(Order).where(Order.id.in_(order_ids), Order.signal_id.is_not(None)).order_by(desc(Order.created_at)).limit(1))
+            if order and order.signal_id:
+                return db.get(Signal, order.signal_id)
+        position_ids = [position.id for position in positions]
+        if position_ids:
+            order = db.scalar(select(Order).where(Order.position_id.in_(position_ids), Order.signal_id.is_not(None)).order_by(desc(Order.created_at)).limit(1))
+            if order and order.signal_id:
+                return db.get(Signal, order.signal_id)
+        return None
+
+    def _entrypoint_view(self, db: Session, entrypoint_type: str, entrypoint_id: str) -> dict[str, Any]:
+        if entrypoint_type == "signal":
+            signal = db.get(Signal, entrypoint_id)
+            return {"type": "signal", "id": entrypoint_id, "label": signal.action if signal else "signal"}
+        if entrypoint_type == "order":
+            order = db.get(Order, entrypoint_id)
+            return {"type": "order", "id": entrypoint_id, "label": f"{order.side} order" if order else "order"}
+        if entrypoint_type == "trade":
+            trade = db.get(Trade, entrypoint_id)
+            return {"type": "trade", "id": entrypoint_id, "label": f"{trade.side} trade" if trade else "trade"}
+        if entrypoint_type == "position":
+            position = db.get(Position, entrypoint_id)
+            return {"type": "position", "id": entrypoint_id, "label": position.status if position else "position"}
+        return {"type": entrypoint_type, "id": entrypoint_id, "label": entrypoint_type}
+
+    def _trace_summary(self, signal: Signal | None, orders: list[Order], positions: list[Position], trades: list[Trade]) -> dict[str, Any]:
+        primary_order = orders[0] if orders else None
+        primary_position = positions[0] if positions else None
+        primary_trade = trades[0] if trades else None
+        mode = (primary_order or primary_position or primary_trade).mode if (primary_order or primary_position or primary_trade) else None
+        manual = primary_order.manual if primary_order is not None else primary_position.manual if primary_position is not None else None
+        return {
+            "mode": mode or (signal.mode if signal is not None else None),
+            "execution_mode": "manual" if manual is True else "auto" if manual is False else "signal-only",
+            "signal_linked": signal is not None,
+            "strategy": (
+                (primary_order.strategy_name if primary_order else None)
+                or (primary_position.strategy_name if primary_position else None)
+                or (primary_trade.strategy_name if primary_trade else None)
+                or (signal.metadata_json.get("preferred_strategy") if signal else None)
+            ),
+            "provider_type": (
+                (primary_order.provider_type if primary_order else None)
+                or (primary_position.provider_type if primary_position else None)
+                or (primary_trade.provider_type if primary_trade else None)
+                or (signal.provider_type if signal else None)
+            ),
+            "model_name": (
+                (primary_order.model_name if primary_order else None)
+                or (primary_position.model_name if primary_position else None)
+                or (primary_trade.model_name if primary_trade else None)
+                or (signal.model_name if signal else None)
+            ),
+            "orders_count": len(orders),
+            "positions_count": len(positions),
+            "trades_count": len(trades),
+        }
+
+    def _risk_checks_from_orders(self, orders: list[Order]) -> list[dict[str, Any]]:
+        checks: list[dict[str, Any]] = []
+        for order in orders:
+            for index, check in enumerate((order.audit_context or {}).get("risk_checks", [])):
+                checks.append(
+                    {
+                        **check,
+                        "order_id": order.id,
+                        "order_status": order.status,
+                        "order_rejection_reason": order.rejection_reason,
+                        "index": index,
+                    }
+                )
+        return checks
+
+    def _stop_history(
+        self,
+        signal: Signal | None,
+        orders: list[Order],
+        positions: list[Position],
+        audit_logs: list[AuditLog],
+    ) -> list[dict[str, Any]]:
+        history: list[dict[str, Any]] = []
+        if signal is not None and any([signal.suggested_stop_loss, signal.suggested_take_profit]):
+            history.append(
+                {
+                    "source": "signal_suggestion",
+                    "label": "Initial AI/strategy suggestion",
+                    "signal_id": signal.id,
+                    "stop_loss": signal.suggested_stop_loss,
+                    "take_profit": signal.suggested_take_profit,
+                    "trailing_stop": None,
+                    "observed_at": signal.occurred_at.isoformat(),
+                }
+            )
+        for order in orders:
+            protective_levels = (order.audit_context or {}).get("protective_levels", {})
+            if any(protective_levels.get(key) is not None for key in ("stop_loss", "take_profit", "trailing_stop")):
+                history.append(
+                    {
+                        "source": "order_ticket",
+                        "label": "Order ticket protective levels",
+                        "order_id": order.id,
+                        "stop_loss": protective_levels.get("stop_loss"),
+                        "take_profit": protective_levels.get("take_profit"),
+                        "trailing_stop": protective_levels.get("trailing_stop"),
+                        "observed_at": order.created_at.isoformat(),
+                    }
+                )
+        for position in positions:
+            if any([position.stop_loss, position.take_profit, position.trailing_stop]):
+                history.append(
+                    {
+                        "source": "manual_override" if position.manual_override else "current_position",
+                        "label": "Current position stop settings",
+                        "position_id": position.id,
+                        "stop_loss": position.stop_loss,
+                        "take_profit": position.take_profit,
+                        "trailing_stop": position.trailing_stop,
+                        "observed_at": position.updated_at.isoformat(),
+                    }
+                )
+        for audit in audit_logs:
+            if audit.action != "position.update":
+                continue
+            details = audit.details_json or {}
+            if any(key in details for key in ("stop_loss", "take_profit", "trailing_stop")):
+                history.append(
+                    {
+                        "source": "manual_edit",
+                        "label": "Manual stop edit",
+                        "position_id": audit.target_id,
+                        "stop_loss": details.get("stop_loss"),
+                        "take_profit": details.get("take_profit"),
+                        "trailing_stop": details.get("trailing_stop"),
+                        "observed_at": audit.occurred_at.isoformat(),
+                    }
+                )
+        return history
+
+    def _merge_by_id(self, items: list[Any]) -> list[Any]:
+        merged: dict[str, Any] = {}
+        for item in items:
+            if item is not None:
+                merged[item.id] = item
+        return list(merged.values())
 
     def _latest_news_for_symbol(self, recent_news: list[NewsArticle], symbol: str) -> NewsArticle | None:
         for article in recent_news:
@@ -413,6 +971,55 @@ class SignalService:
         risk = max(entry - stop_loss, 0.01)
         reward = max(take_profit - entry, 0.0)
         return round(reward / risk, 2)
+
+    def _latest_mode_evaluation(self, db: Session, signal_id: str, mode: str) -> SignalEvaluation | None:
+        return db.scalar(
+            select(SignalEvaluation)
+            .where(
+                SignalEvaluation.signal_id == signal_id,
+                SignalEvaluation.evaluator.startswith(f"{mode}-"),
+            )
+            .order_by(desc(SignalEvaluation.created_at))
+            .limit(1)
+        )
+
+    def _lane_statuses(self, db: Session, signal_id: str) -> dict[str, str]:
+        statuses: dict[str, str] = {}
+        for lane in ("simulation", "live"):
+            evaluation = self._latest_mode_evaluation(db, signal_id, lane)
+            statuses[lane] = evaluation.outcome if evaluation and evaluation.outcome else "candidate"
+        return statuses
+
+    def _signal_flavor(self, signal: Signal, strategy_slug: str | None) -> str:
+        has_news = bool(signal.related_news_ids or signal.related_event_ids)
+        has_indicators = bool(signal.indicators_json)
+        if has_news and strategy_slug == "blended":
+            return "blended"
+        if has_news:
+            return "news-enriched"
+        if has_indicators and signal.ai_rationale:
+            return "technical+ai"
+        if signal.ai_rationale:
+            return "ai-only"
+        return "technical-only"
+
+    def _signal_positions(self, db: Session, signal: Signal, orders: list[Order]) -> list[Position]:
+        position_ids = {order.position_id for order in orders if order.position_id}
+        positions = [db.get(Position, position_id) for position_id in position_ids]
+        return [item for item in positions if item is not None]
+
+    def _signal_trades(self, db: Session, orders: list[Order], positions: list[Position]) -> list[Trade]:
+        order_ids = {order.id for order in orders}
+        position_ids = {position.id for position in positions}
+        trades = list(
+            db.scalars(
+                select(Trade)
+                .where((Trade.order_id.in_(list(order_ids)) if order_ids else False) | (Trade.position_id.in_(list(position_ids)) if position_ids else False))
+                .order_by(desc(Trade.executed_at))
+                .limit(100)
+            )
+        ) if order_ids or position_ids else []
+        return trades
 
 
 signal_service = SignalService()

@@ -1,17 +1,19 @@
 "use client";
 
-import { CSSProperties, PropsWithChildren } from "react";
+import { CSSProperties, PropsWithChildren, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 
 import { Sidebar } from "@/components/layout/sidebar";
 import { useWorkspace } from "@/components/layout/workspace-provider";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useEventStream } from "@/hooks/use-event-stream";
+import { cn } from "@/lib/utils";
 
 export function AppShell({ children }: PropsWithChildren) {
   const { connected, events } = useEventStream();
   const pathname = usePathname();
   const workspace = useWorkspace();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const latest = events[0];
   const remoteLinks = workspace.links.filter((link) => link.scope === "remote");
   const localLinks = workspace.links.filter((link) => link.scope === "local");
@@ -22,10 +24,23 @@ export function AppShell({ children }: PropsWithChildren) {
     boxShadow: workspace.theme.panelGlow,
   };
 
+  useEffect(() => {
+    const saved = window.localStorage.getItem("ai-trader-sidebar-collapsed");
+    if (saved === "true") setSidebarCollapsed(true);
+  }, []);
+
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem("ai-trader-sidebar-collapsed", String(next));
+      return next;
+    });
+  }
+
   return (
     <div className="min-h-screen px-4 py-4 text-ink md:px-6" style={shellStyle}>
-      <div className="mx-auto grid max-w-[1680px] gap-4 lg:grid-cols-[280px_1fr]">
-        <Sidebar />
+      <div className={cn("mx-auto grid max-w-[1680px] gap-4 transition-[grid-template-columns]", sidebarCollapsed ? "lg:grid-cols-[88px_1fr]" : "lg:grid-cols-[280px_1fr]")}>
+        <Sidebar collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
         <main className="rounded-[28px] border border-border bg-slate-950/60 p-4 shadow-panel backdrop-blur md:p-6" style={panelStyle}>
           <div className="mb-6 flex flex-col gap-3 rounded-2xl border border-border bg-panel/70 px-4 py-4 lg:flex-row lg:items-center lg:justify-between" style={panelStyle}>
             <div>

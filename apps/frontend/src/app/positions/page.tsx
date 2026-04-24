@@ -3,10 +3,12 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
+import { ProvenanceDialog } from "@/components/provenance/provenance-dialog";
 import { PositionManagementTable } from "@/components/trading/position-management-table";
 import { Dialog } from "@/components/ui/dialog";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useApi } from "@/hooks/use-api";
+import { useProvenanceTrace } from "@/hooks/use-provenance-trace";
 import { api } from "@/lib/api";
 import { formatCurrency, formatQuantity } from "@/lib/utils";
 import type { Asset, AssetSearchResult, Position } from "@/types";
@@ -24,9 +26,11 @@ export default function PositionsPage() {
     ]);
     return { positions, assets, strategies, simulationAccounts, brokerAccounts };
   });
+  const provenance = useProvenanceTrace();
 
   const [filterMode, setFilterMode] = useState<"all" | "live" | "simulation">("all");
   const [message, setMessage] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<AssetSearchResult[]>([]);
   const [searchMessage, setSearchMessage] = useState("");
@@ -140,12 +144,25 @@ export default function PositionsPage() {
 
       {message ? <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-200 shadow-panel">{message}</div> : null}
 
-      <div className="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
-        <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Create manual position</div>
-          <div className="mt-1 text-sm text-slate-400">
-            This is for mirroring an existing fill or seeding a starting line before automation takes over. Small budgets and fractional quantities are supported.
-          </div>
+      <div className="flex flex-col gap-4">
+        <section className="order-2 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <button
+            type="button"
+            onClick={() => setCreateOpen((current) => !current)}
+            className="flex w-full flex-col gap-2 text-left md:flex-row md:items-center md:justify-between"
+            title="Open or close the manual position form."
+          >
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Create manual position</div>
+              <div className="mt-1 text-sm text-slate-400">
+                Dropdown drawer below the ledger for mirroring an existing fill or seeding a starting line. Small budgets and fractional quantities are supported.
+              </div>
+            </div>
+            <span className="rounded-full border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200">
+              {createOpen ? "Close" : "Open"}
+            </span>
+          </button>
+          {createOpen ? (
           <form
             className="mt-4 space-y-4"
             onSubmit={async (event) => {
@@ -187,6 +204,7 @@ export default function PositionsPage() {
                   notes: "",
                 }));
                 setSearchQuery("");
+                setCreateOpen(false);
                 state.reload();
               } catch (error) {
                 setMessage(error instanceof Error ? error.message : "Manual position creation failed.");
@@ -326,9 +344,14 @@ export default function PositionsPage() {
 
             <button className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">Create position</button>
           </form>
+          ) : (
+            <div className="mt-4 rounded-2xl border border-border bg-black/20 p-4 text-sm text-slate-400">
+              Manual position creation is collapsed to keep the current ledger readable. Open it when you need to mirror an existing broker position or seed a simulation line.
+            </div>
+          )}
         </section>
 
-        <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+        <section className="order-1 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Current positions</div>
@@ -365,6 +388,7 @@ export default function PositionsPage() {
                 setMessage(`${position.symbol} marked as manual override.`);
                 state.reload();
               }}
+              onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
             />
           </div>
         </section>
@@ -373,7 +397,7 @@ export default function PositionsPage() {
       <Dialog
         open={Boolean(stopPosition)}
         title="Edit stop settings"
-        description="Stops are managed in a modal here so the ledger stays compact and readable."
+        description="Stops are managed in a modal here so the ledger stays compact and readable. The decision trail shows whether current stops came from a signal suggestion, a ticket, or a manual override."
         actions={<button type="button" onClick={() => setStopPosition(null)} className="rounded-xl border border-border px-3 py-2 text-sm text-slate-300 hover:bg-white/5">Close</button>}
       >
         <form
@@ -472,6 +496,15 @@ export default function PositionsPage() {
           </div>
         ) : null}
       </Dialog>
+
+      <ProvenanceDialog
+        open={Boolean(provenance.target)}
+        signal={provenance.signal}
+        trace={provenance.trace}
+        loading={provenance.loading}
+        error={provenance.error}
+        onClose={provenance.closeTrace}
+      />
     </div>
   );
 }

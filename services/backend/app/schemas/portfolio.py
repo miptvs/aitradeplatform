@@ -48,6 +48,10 @@ class PositionUpdate(BaseModel):
 class PositionRead(ORMModel):
     id: str
     asset_id: str
+    symbol: str | None = None
+    asset_name: str | None = None
+    asset_currency: str | None = None
+    signal_id: str | None = None
     broker_account_id: str | None = None
     simulation_account_id: str | None = None
     mode: str
@@ -104,6 +108,8 @@ class OrderCreate(BaseModel):
 class OrderRead(ORMModel):
     id: str
     asset_id: str
+    symbol: str | None = None
+    asset_name: str | None = None
     broker_account_id: str | None = None
     signal_id: str | None = None
     position_id: str | None = None
@@ -137,9 +143,13 @@ class OrderRead(ORMModel):
 class TradeRead(ORMModel):
     id: str
     asset_id: str
+    symbol: str | None = None
+    asset_name: str | None = None
     order_id: str | None = None
     position_id: str | None = None
+    signal_id: str | None = None
     mode: str
+    manual: bool = True
     side: str
     quantity: float
     price: float

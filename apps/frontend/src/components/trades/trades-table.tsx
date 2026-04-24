@@ -2,14 +2,22 @@
 
 import { useMemo, useState } from "react";
 
-import { ModeBadge } from "@/components/ui/mode-badge";
+import { ProvenanceChips, TraceButton } from "@/components/provenance/provenance-chips";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { formatCurrency } from "@/lib/utils";
 import type { Order, Trade } from "@/types";
 
 type SortMode = "newest" | "oldest" | "symbol" | "largest";
 
-export function TradesTable({ trades, orders }: { trades?: Trade[]; orders?: Order[] }) {
+export function TradesTable({
+  trades,
+  orders,
+  onViewTrace,
+}: {
+  trades?: Trade[];
+  orders?: Order[];
+  onViewTrace?: (type: "order" | "trade", item: Order | Trade) => void;
+}) {
   const rows = useMemo(() => [...(trades || orders || [])], [orders, trades]);
   const [sortMode, setSortMode] = useState<SortMode>("newest");
 
@@ -51,7 +59,7 @@ export function TradesTable({ trades, orders }: { trades?: Trade[]; orders?: Ord
             <tr>
               <th>Time</th>
               <th>Symbol</th>
-              <th>Mode</th>
+              <th>Provenance</th>
               <th>Side</th>
               <th>Qty</th>
               <th>Price</th>
@@ -68,9 +76,14 @@ export function TradesTable({ trades, orders }: { trades?: Trade[]; orders?: Ord
                 <td>
                   <div className="font-semibold text-slate-100">{row.symbol}</div>
                   <div className="text-xs text-slate-400">{row.asset_name}</div>
+                  {onViewTrace ? (
+                    <div className="mt-2">
+                      <TraceButton label="Trace" onClick={() => onViewTrace("status" in row ? "order" : "trade", row)} />
+                    </div>
+                  ) : null}
                 </td>
                 <td>
-                  <ModeBadge mode={row.mode} />
+                  <ProvenanceChips item={row} />
                 </td>
                 <td className="uppercase">{row.side}</td>
                 <td>{row.quantity}</td>

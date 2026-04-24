@@ -7,9 +7,13 @@ from app.models.asset import Asset, MarketSnapshot
 from app.models.audit import Alert
 from app.models.base import Base
 from app.models.health import SystemHealthEvent
+from app.models.portfolio import Order, Position, Trade
 from app.models.signal import Signal, SignalEvaluation
 from app.models.simulation import SimulationAccount
+from app.schemas.portfolio import PositionCreate
 from app.schemas.trading import TradingAutomationProfileUpsert
+from app.services.portfolio.service import portfolio_service
+from app.services.signals.service import signal_service
 from app.services.trading.service import trading_workspace_service
 from app.utils.time import utcnow
 
@@ -88,7 +92,29 @@ def test_simulation_automation_can_submit_order_from_candidate_signal() -> None:
     assert updated_signal is not None
     assert updated_signal.status == "candidate"
     assert evaluation is not None
-    assert evaluation.outcome == "executed"
+    assert evaluation.outcome == "simulated"
+
+    order = db.scalar(select(Order).where(Order.signal_id == updated_signal.id))
+    assert order is not None
+    trade = db.scalar(select(Trade).where(Trade.order_id == order.id))
+    assert trade is not None
+    position = db.get(Position, order.position_id)
+    assert position is not None
+
+    order_trace = signal_service.get_order_trace(db, order.id)
+    trade_trace = signal_service.get_trade_trace(db, trade.id)
+    position_trace = signal_service.get_position_trace(db, position.id)
+
+    assert order_trace["entrypoint"]["type"] == "order"
+    assert trade_trace["entrypoint"]["type"] == "trade"
+    assert position_trace["entrypoint"]["type"] == "position"
+    assert order_trace["signal"]["id"] == updated_signal.id
+    assert trade_trace["signal"]["id"] == updated_signal.id
+    assert position_trace["signal"]["id"] == updated_signal.id
+    assert order_trace["orders"][0]["id"] == order.id
+    assert trade.id in {item["id"] for item in position_trace["trades"]}
+    assert order_trace["risk_checks"] is not None
+    assert position_trace["stop_history"]
 
 
 def test_workspaces_share_the_same_signal_pool() -> None:
@@ -130,6 +156,39 @@ def test_workspaces_share_the_same_signal_pool() -> None:
     assert next(item for item in simulation_workspace["signals"] if item["id"] == signal.id)["mode"] == "shared"
 
 
+def test_manual_position_trace_remains_useful_without_signal() -> None:
+    db = build_session()
+    asset = Asset(symbol="MANL", name="Manual Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+
+    position = portfolio_service.create_manual_position(
+        db,
+        PositionCreate(
+            asset_id=asset.id,
+            mode="simulation",
+            quantity=2,
+            avg_entry_price=25,
+            current_price=26,
+            stop_loss=24,
+            take_profit=30,
+            trailing_stop=1,
+            strategy_name="manual-check",
+            notes="Imported existing manual line.",
+        ),
+    )
+    db.commit()
+
+    trace = signal_service.get_position_trace(db, position.id)
+
+    assert trace["signal"] is None
+    assert trace["summary"]["signal_linked"] is False
+    assert trace["summary"]["execution_mode"] == "manual"
+    assert trace["entrypoint"]["type"] == "position"
+    assert trace["positions"][0]["symbol"] == "MANL"
+    assert trace["stop_history"][0]["source"] in {"manual_override", "current_position"}
+
+
 def test_recommendations_stay_lane_specific_even_when_signals_are_shared() -> None:
     db = build_session()
     asset = Asset(symbol="QUEUE", name="Queue Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
@@ -163,7 +222,7 @@ def test_recommendations_stay_lane_specific_even_when_signals_are_shared() -> No
             approved=True,
             evaluator="simulation-automation",
             reason="Prepared for manual review.",
-            outcome="recommended",
+            outcome="approved",
         )
     )
     db.commit()
@@ -209,7 +268,7 @@ def test_reject_recommendation_records_lane_rejection_without_changing_shared_si
             approved=True,
             evaluator="simulation-automation",
             reason="Prepared for operator review.",
-            outcome="recommended",
+            outcome="approved",
         )
     )
     db.commit()
@@ -266,3 +325,46 @@ def test_workspace_hides_stale_news_error_alert_when_latest_health_is_warn() -> 
     workspace = trading_workspace_service.get_workspace(db, "simulation")
 
     assert workspace["alerts"] == []
+
+
+def test_simulation_workspace_can_inherit_live_automation_policy() -> None:
+    db = build_session()
+
+    trading_workspace_service.upsert_profile(
+        db,
+        "live",
+        TradingAutomationProfileUpsert(
+            automation_enabled=True,
+            approval_mode="fully_automatic",
+            confidence_threshold=0.73,
+            default_order_notional=250,
+            stop_loss_pct=0.025,
+            take_profit_pct=0.07,
+            trailing_stop_pct=0.015,
+            allowed_strategy_slugs=["trend-following"],
+            allowed_provider_types=["openai_simulation"],
+            tradable_actions=["buy", "sell"],
+        ),
+    )
+    trading_workspace_service.upsert_profile(
+        db,
+        "simulation",
+        TradingAutomationProfileUpsert(
+            enabled=True,
+            automation_enabled=False,
+            inherit_from_live=True,
+            approval_mode="manual_only",
+            confidence_threshold=0.4,
+            default_order_notional=50,
+        ),
+    )
+    db.commit()
+
+    workspace = trading_workspace_service.get_workspace(db, "simulation")
+
+    assert workspace["automation"]["inherit_from_live"] is True
+    assert workspace["automation"]["effective_source_mode"] == "live"
+    assert workspace["automation"]["automation_enabled"] is True
+    assert workspace["automation"]["approval_mode"] == "fully_automatic"
+    assert workspace["automation"]["confidence_threshold"] == 0.73
+    assert workspace["automation"]["default_order_notional"] == 250

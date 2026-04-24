@@ -1,7 +1,7 @@
 import { Eye, Flag, PencilLine, Shield, XCircle } from "lucide-react";
 
+import { ProvenanceChips, TraceButton } from "@/components/provenance/provenance-chips";
 import { ActionMenu, ActionMenuButton } from "@/components/ui/action-menu";
-import { ModeBadge } from "@/components/ui/mode-badge";
 import { formatCurrency, formatQuantity } from "@/lib/utils";
 import type { Position } from "@/types";
 
@@ -12,6 +12,7 @@ export function PositionManagementTable({
   onEditStops,
   onClose,
   onMarkOverride,
+  onViewTrace,
 }: {
   positions: Position[];
   emptyMessage: string;
@@ -19,6 +20,7 @@ export function PositionManagementTable({
   onEditStops: (position: Position) => void;
   onClose: (position: Position) => void;
   onMarkOverride: (position: Position) => void;
+  onViewTrace?: (position: Position) => void;
 }) {
   if (!positions.length) {
     return <div className="rounded-2xl border border-border bg-panel/90 p-5 text-sm text-slate-400 shadow-panel">{emptyMessage}</div>;
@@ -48,11 +50,15 @@ export function PositionManagementTable({
                   <td>
                     <div className="font-semibold text-slate-100">{position.symbol}</div>
                     <div className="text-xs text-slate-400">{position.asset_name}</div>
+                    {onViewTrace ? (
+                      <div className="mt-2">
+                        <TraceButton label="Trace" onClick={() => onViewTrace(position)} />
+                      </div>
+                    ) : null}
                   </td>
                   <td>
                     <div className="flex flex-wrap gap-2">
-                      <ModeBadge mode={position.mode} />
-                      <MiniBadge tone={position.manual ? "neutral" : "accent"} label={position.manual ? "Manual" : "Auto"} />
+                      <ProvenanceChips item={position} />
                       {position.manual_override ? <MiniBadge tone="warning" label="Override" /> : null}
                     </div>
                   </td>
@@ -68,17 +74,27 @@ export function PositionManagementTable({
                     <div>{formatCurrency(position.unrealized_pnl, position.asset_currency)}</div>
                     <div className="text-xs text-slate-400">Realized {formatCurrency(position.realized_pnl, position.asset_currency)}</div>
                   </td>
-                  <td className="text-xs text-slate-300">
-                    <div title="Automatically closes the trade if price moves against you to this level.">
-                      SL {position.stop_loss ? formatCurrency(position.stop_loss, position.asset_currency) : "-"}
+                  <td className="min-w-[12rem] text-xs text-slate-300">
+                    <div className="space-y-1.5">
+                      <StopValue
+                        label="SL"
+                        title="Automatically closes the trade if price moves against you to this level."
+                        value={position.stop_loss ? formatCurrency(position.stop_loss, position.asset_currency) : "-"}
+                      />
+                      <StopValue
+                        label="TP"
+                        title="Automatically closes the trade once the target profit price is reached."
+                        value={position.take_profit ? formatCurrency(position.take_profit, position.asset_currency) : "-"}
+                      />
+                      <StopValue
+                        label="TR"
+                        title="Moves the stop as price rises, helping protect profits."
+                        value={position.trailing_stop ? formatCurrency(position.trailing_stop, position.asset_currency) : "-"}
+                      />
+                      <div className="pt-1">
+                        {hasStops ? <MiniBadge tone="success" label="Stops active" /> : <MiniBadge tone="neutral" label="No stops" />}
+                      </div>
                     </div>
-                    <div title="Automatically closes the trade once the target profit price is reached.">
-                      TP {position.take_profit ? formatCurrency(position.take_profit, position.asset_currency) : "-"}
-                    </div>
-                    <div title="Moves the stop as price rises, helping protect profits.">
-                      TR {position.trailing_stop ? formatCurrency(position.trailing_stop, position.asset_currency) : "-"}
-                    </div>
-                    {hasStops ? <div className="mt-1"><MiniBadge tone="success" label="Stop active" /></div> : null}
                   </td>
                   <td className="text-xs text-slate-300">
                     <div>{position.strategy_name || "-"}</div>
@@ -87,6 +103,11 @@ export function PositionManagementTable({
                   </td>
                   <td className="text-right">
                     <ActionMenu>
+                      {onViewTrace ? (
+                        <ActionMenuButton title="Open the full decision trail: origin signal, risk checks, orders, trades, stops, and audit events." onClick={() => onViewTrace(position)}>
+                          <span className="flex items-center gap-2"><Shield size={14} /> View trace</span>
+                        </ActionMenuButton>
+                      ) : null}
                       <ActionMenuButton title="Inspect the full position metadata and notes." onClick={() => onViewDetails(position)}>
                         <span className="flex items-center gap-2"><Eye size={14} /> View details</span>
                       </ActionMenuButton>
@@ -123,5 +144,14 @@ function MiniBadge({ label, tone }: { label: string; tone: "neutral" | "accent" 
         : tone === "success"
           ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-200"
           : "border-slate-500/30 bg-slate-500/15 text-slate-200";
-  return <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${className}`}>{label}</span>;
+  return <span className={`inline-flex whitespace-nowrap rounded-full border px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${className}`}>{label}</span>;
+}
+
+function StopValue({ label, value, title }: { label: string; value: string; title: string }) {
+  return (
+    <div title={title} className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-black/15 px-2.5 py-1.5">
+      <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">{label}</span>
+      <span className="whitespace-nowrap font-medium text-slate-200">{value}</span>
+    </div>
+  );
 }

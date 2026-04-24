@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.schemas.signal import SignalGenerationResponse
+from app.schemas.signal import SignalDetailRead, SignalGenerationResponse, SignalRead, SignalTraceRead
 from app.services.events.service import publish_event
 from app.services.market_data.service import market_data_service
 from app.services.news.service import news_service
@@ -12,13 +12,33 @@ from app.services.signals.service import signal_service
 router = APIRouter()
 
 
-@router.get("/")
-def list_signals(provider_type: str | None = Query(default=None), db: Session = Depends(get_db)) -> list[dict]:
-    return signal_service.list_signals(db, provider_type=provider_type)
+@router.get("/", response_model=list[SignalRead])
+def list_signals(provider_type: str | None = Query(default=None), db: Session = Depends(get_db)) -> list[SignalRead]:
+    return [SignalRead.model_validate(item) for item in signal_service.list_signals(db, provider_type=provider_type)]
+
+
+@router.get("/{signal_id}", response_model=SignalDetailRead)
+def get_signal(signal_id: str, db: Session = Depends(get_db)) -> SignalDetailRead:
+    try:
+        return SignalDetailRead.model_validate(signal_service.get_signal(db, signal_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{signal_id}/trace", response_model=SignalTraceRead)
+def get_signal_trace(signal_id: str, db: Session = Depends(get_db)) -> SignalTraceRead:
+    try:
+        return SignalTraceRead.model_validate(signal_service.get_signal_trace(db, signal_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/refresh", response_model=SignalGenerationResponse)
-def refresh_signals(provider_type: str = Query(...), db: Session = Depends(get_db)) -> SignalGenerationResponse:
+def refresh_signals(
+    provider_type: str = Query(...),
+    force_refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> SignalGenerationResponse:
     market_report = {"snapshots_created": 0, "snapshots_updated": 0, "assets_refreshed": 0, "assets_failed": 0, "errors": []}
     news_report = {"articles_added": 0, "feeds_checked": 0, "feeds_failed": 0, "errors": []}
     refresh_notes: list[str] = []
@@ -30,13 +50,13 @@ def refresh_signals(provider_type: str = Query(...), db: Session = Depends(get_d
         market_report = {**market_report, "errors": [str(exc)]}
 
     try:
-        news_report = news_service.refresh_latest_news(db)
+        news_report = news_service.refresh_latest_news(db, force_refresh=force_refresh)
     except Exception as exc:
         refresh_notes.append(f"News refresh failed: {exc}")
         news_report = {**news_report, "errors": [str(exc)]}
 
     try:
-        signals = signal_service.generate_signals(db, provider_type=provider_type)
+        signals = signal_service.generate_signals(db, provider_type=provider_type, force_refresh=force_refresh)
     except ValueError as exc:
         db.commit()
         return SignalGenerationResponse(
@@ -64,7 +84,7 @@ def refresh_signals(provider_type: str = Query(...), db: Session = Depends(get_d
     else:
         notes_suffix = f" {' '.join(refresh_notes)}" if refresh_notes else ""
         message = (
-            f"Refresh completed for {provider_type}, but no fresh signals qualified yet. "
+            f"{'Manual refresh' if force_refresh else 'Refresh'} completed for {provider_type}, but no signals qualified yet. "
             f"Market data: +{market_report['snapshots_created']} new / {market_report['snapshots_updated']} updated. "
             f"News: +{news_report['articles_added']} RSS articles.{notes_suffix}"
         )
@@ -83,7 +103,7 @@ def refresh_signals(provider_type: str = Query(...), db: Session = Depends(get_d
 
 @router.post("/generate-demo", response_model=SignalGenerationResponse)
 def generate_demo_signals_alias(provider_type: str = Query(...), db: Session = Depends(get_db)) -> SignalGenerationResponse:
-    return refresh_signals(provider_type=provider_type, db=db)
+    return refresh_signals(provider_type=provider_type, force_refresh=True, db=db)
 
 
 def _blocked_refresh_message(db: Session, provider_type: str, detail: str, refresh_notes: list[str]) -> str:
