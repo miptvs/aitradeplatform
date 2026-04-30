@@ -25,12 +25,24 @@ class AlertService:
             stmt = stmt.where(Alert.title == title)
         return db.scalar(stmt.limit(1)) is not None
 
-    def resolve_alerts(self, db: Session, *, source_ref: str | None = None, title: str | None = None) -> int:
+    def resolve_alerts(
+        self,
+        db: Session,
+        *,
+        source_ref: str | None = None,
+        title: str | None = None,
+        mode: str | None = None,
+        category: str | None = None,
+    ) -> int:
         stmt = select(Alert).where(Alert.status == "open")
         if source_ref is not None:
             stmt = stmt.where(Alert.source_ref == source_ref)
         if title is not None:
             stmt = stmt.where(Alert.title == title)
+        if mode is not None:
+            stmt = stmt.where(Alert.mode == mode)
+        if category is not None:
+            stmt = stmt.where(Alert.category == category)
 
         updated = 0
         for alert in db.scalars(stmt):

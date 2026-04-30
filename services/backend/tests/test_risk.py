@@ -134,3 +134,54 @@ def test_daily_max_loss_uses_pct_of_account_value() -> None:
     daily_loss_check = next(check for check in result.checks if check.rule == "daily_max_loss")
     assert daily_loss_check.details["limit_pct"] == 0.025
     assert daily_loss_check.details["limit_amount"] == -2500
+
+
+def test_cash_reserve_blocks_order_that_would_spend_reserved_cash() -> None:
+    db = build_session()
+    asset = Asset(symbol="CASH", name="Cash Reserve Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow() - timedelta(minutes=1),
+            open_price=100,
+            high_price=101,
+            low_price=99,
+            close_price=100,
+            volume=1000,
+            source="test",
+        )
+    )
+    account = SimulationAccount(name="Reserve Sim", starting_cash=10000, cash_balance=10000, fees_bps=0, slippage_bps=0, latency_ms=0)
+    db.add(account)
+    db.add(RiskRule(name="Kill Switch", scope="global", rule_type="kill_switch", enabled=True, config_json={"active": False}))
+    db.add(
+        RiskRule(
+            name="Cash Reserve",
+            scope="global",
+            rule_type="cash_reserve",
+            enabled=True,
+            config_json={"min_cash_reserve_pct": 0.2},
+        )
+    )
+    db.commit()
+
+    result = risk_service.validate_order(
+        db,
+        RiskValidationRequest(
+            asset_id=asset.id,
+            mode="simulation",
+            side="buy",
+            quantity=90,
+            requested_price=100,
+            simulation_account_id=account.id,
+        ),
+    )
+
+    assert result.approved is False
+    assert any("cash reserve" in reason.lower() for reason in result.rejection_reasons)
+    reserve_check = next(check for check in result.checks if check.rule == "cash_reserve")
+    assert reserve_check.details["reserve_pct"] == 0.2
+    assert reserve_check.details["available_to_trade"] == 8000
+    assert reserve_check.details["required"] == 9000

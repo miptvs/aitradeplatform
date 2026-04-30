@@ -36,6 +36,23 @@ def create_position(payload: PositionCreate, db: Session = Depends(get_db)) -> P
     return PositionRead.model_validate(position)
 
 
+@router.delete("/closed")
+def clean_closed_positions(
+    mode: str | None = Query(default=None),
+    simulation_account_id: str | None = Query(default=None),
+    broker_account_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = portfolio_service.archive_closed_positions(
+        db,
+        mode=mode,
+        simulation_account_id=simulation_account_id,
+        broker_account_id=broker_account_id,
+    )
+    db.commit()
+    return result
+
+
 @router.patch("/{position_id}", response_model=PositionRead)
 def update_position(position_id: str, payload: PositionUpdate, db: Session = Depends(get_db)) -> PositionRead:
     try:

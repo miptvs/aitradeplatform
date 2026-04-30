@@ -1,4 +1,5 @@
 import type { Order, Signal, Trade } from "@/types";
+import { formatDateTime } from "@/lib/utils";
 
 export function RecentActivity({ orders, trades, signals }: { orders: Order[]; trades: Trade[]; signals: Signal[] }) {
   const items = [
@@ -16,7 +17,7 @@ export function RecentActivity({ orders, trades, signals }: { orders: Order[]; t
         {items.map((item) => (
           <div key={item.id} className="rounded-xl border border-border bg-black/20 px-3 py-2">
             <div className="text-sm font-medium text-slate-100">{item.label}</div>
-            <div className="text-xs text-slate-400">{item.meta.slice(0, 16).replace("T", " ")}</div>
+            <div className="text-xs text-slate-400">{formatDateTime(item.meta)}</div>
           </div>
         ))}
       </div>

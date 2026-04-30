@@ -6,6 +6,7 @@ import { NewsList } from "@/components/news/news-list";
 import { StatsCard } from "@/components/stats-card";
 import { useApi } from "@/hooks/use-api";
 import { api } from "@/lib/api";
+import { formatDateTime } from "@/lib/utils";
 
 export default function NewsPage() {
   const { data, loading, error, reload } = useApi(async () => {
@@ -13,7 +14,7 @@ export default function NewsPage() {
     return { news, events, diagnostics };
   });
   const [refreshing, setRefreshing] = useState<"latest" | "force" | null>(null);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState<{ tone: "success" | "warning" | "error"; text: string } | null>(null);
   const [backfillHours, setBackfillHours] = useState("24");
 
   async function handleRefresh(kind: "latest" | "force") {
@@ -23,17 +24,17 @@ export default function NewsPage() {
         kind === "force"
           ? await api.refreshNews({ force_refresh: true, backfill_hours: Number(backfillHours) })
           : await api.refreshNews({ force_refresh: false });
-      setMessage(result.message);
+      setMessage({ tone: result.feeds_failed ? "warning" : "success", text: result.message });
       await reload();
     } catch (refreshError) {
-      setMessage(refreshError instanceof Error ? refreshError.message : "News refresh failed.");
+      setMessage({ tone: "error", text: refreshError instanceof Error ? refreshError.message : "News refresh failed." });
     } finally {
       setRefreshing(null);
     }
   }
 
   if (loading || !data) return <div className="text-sm text-slate-400">Loading market intelligence...</div>;
-  if (error) return <div className="text-sm text-rose-300">News failed to load: {error}</div>;
+  if (error) return <SeverityBanner tone="error" message={`News failed to load: ${error}`} />;
 
   const diagnostics = data.diagnostics;
 
@@ -80,11 +81,17 @@ export default function NewsPage() {
         </div>
       </div>
 
-      {message ? <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-200 shadow-panel">{message}</div> : null}
+      {message ? <SeverityBanner tone={message.tone} message={message.text} /> : null}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
+        <StatsCard
+          label="Last run"
+          value={formatRunType(diagnostics.run_type)}
+          kind="text"
+          detail={formatDateTime(diagnostics.observed_at, { includeYear: false, fallback: "Not recorded yet" })}
+        />
         <StatsCard label="Feeds checked" value={diagnostics.feeds_checked} kind="text" />
-        <StatsCard label="Articles added" value={diagnostics.articles_added} kind="text" />
+        <StatsCard label="New news" value={diagnostics.articles_added} kind="text" detail="RSS articles added in that run" />
         <StatsCard label="Duplicates skipped" value={diagnostics.duplicates_skipped} kind="text" />
         <StatsCard label="Older skipped" value={diagnostics.date_skipped} kind="text" />
         <StatsCard label="Feeds failed" value={diagnostics.feeds_failed} kind="text" />
@@ -93,10 +100,10 @@ export default function NewsPage() {
       <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
         <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Latest refresh diagnostics</div>
         <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-          <InfoRow label="Last status" value={diagnostics.message} />
-          <InfoRow label="Checkpoint used" value={diagnostics.cutoff} />
-          <InfoRow label="Last successful fetch" value={diagnostics.last_successful_fetch_time || "n/a"} />
-          <InfoRow label="Latest article seen" value={diagnostics.latest_seen_published_at || "n/a"} />
+          <InfoRow label="Last status" value={humanRefreshMessage(diagnostics)} />
+          <InfoRow label="Read articles since" value={formatDateTime(diagnostics.cutoff)} />
+          <InfoRow label="Last successful fetch" value={formatOptionalDateTime(diagnostics.last_successful_fetch_time)} />
+          <InfoRow label="Newest article found" value={formatOptionalDateTime(diagnostics.latest_seen_published_at)} />
         </div>
         {!diagnostics.feed_reports.length ? (
           <div className="mt-4 rounded-2xl border border-dashed border-border bg-black/20 px-4 py-3 text-sm text-slate-400">
@@ -151,4 +158,53 @@ function InfoRow({ label, value }: { label: string; value: string }) {
       <div className="mt-1 text-sm text-slate-200">{value}</div>
     </div>
   );
+}
+
+function SeverityBanner({ tone, message }: { tone: "success" | "warning" | "error"; message: string }) {
+  const styles = {
+    success: "border-emerald-500/30 bg-emerald-500/10 text-emerald-100",
+    warning: "border-amber-500/30 bg-amber-500/10 text-amber-100",
+    error: "border-rose-500/30 bg-rose-500/10 text-rose-100",
+  }[tone];
+  const label = tone === "success" ? "OK" : tone === "warning" ? "Warning" : "Error";
+  return (
+    <div className={`rounded-2xl border px-4 py-3 text-sm shadow-panel ${styles}`}>
+      <div className="text-[11px] font-semibold uppercase tracking-[0.16em] opacity-80">{label}</div>
+      <div className="mt-1">{message}</div>
+    </div>
+  );
+}
+
+function formatRunType(value?: string | null) {
+  if (!value || value === "none") return "No run";
+  return value === "automatic" ? "Automatic" : "Manual";
+}
+
+function formatOptionalDateTime(value?: string | null) {
+  return formatDateTime(value, { fallback: "Not recorded yet" });
+}
+
+function humanRefreshMessage(diagnostics: {
+  articles_added: number;
+  feeds_checked: number;
+  feeds_failed: number;
+  duplicates_skipped: number;
+  date_skipped: number;
+  force_refresh: boolean;
+}) {
+  const mode = diagnostics.force_refresh ? "Backfill" : "Refresh";
+  const parts = [
+    `${mode} found ${diagnostics.articles_added} new article${diagnostics.articles_added === 1 ? "" : "s"}`,
+    `checked ${diagnostics.feeds_checked} feed${diagnostics.feeds_checked === 1 ? "" : "s"}`,
+  ];
+  if (diagnostics.duplicates_skipped) {
+    parts.push(`skipped ${diagnostics.duplicates_skipped} duplicate${diagnostics.duplicates_skipped === 1 ? "" : "s"}`);
+  }
+  if (diagnostics.date_skipped) {
+    parts.push(`ignored ${diagnostics.date_skipped} older item${diagnostics.date_skipped === 1 ? "" : "s"}`);
+  }
+  if (diagnostics.feeds_failed) {
+    parts.push(`${diagnostics.feeds_failed} feed${diagnostics.feeds_failed === 1 ? "" : "s"} failed`);
+  }
+  return `${parts.join(", ")}.`;
 }

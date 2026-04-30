@@ -7,6 +7,7 @@ from app.core.database import SessionLocal
 from app.core.security import hash_password
 from app.models.asset import Asset, MarketSnapshot, Watchlist, WatchlistItem
 from app.models.audit import Alert
+from app.models.broker import BrokerAccount
 from app.models.health import SystemHealthEvent
 from app.models.simulation import SimulationAccount
 from app.models.strategy import Strategy
@@ -112,6 +113,12 @@ def seed_demo() -> None:
             RiskRuleUpsert(name="Max Open Positions", rule_type="max_open_positions", config_json={"max_open_positions": 8}, description="Limit open book size."),
             RiskRuleUpsert(name="Max Sector Exposure", rule_type="max_sector_exposure", config_json={"max_sector_pct": 0.45}, description="Limit total sector concentration."),
             RiskRuleUpsert(
+                name="Cash Reserve",
+                rule_type="cash_reserve",
+                config_json={"min_cash_reserve_pct": 0.2, "simulation_override_pct": None, "live_override_pct": None},
+                description="Always keep this percentage of account value uninvested as cash.",
+            ),
+            RiskRuleUpsert(
                 name="Daily Max Loss",
                 rule_type="daily_max_loss",
                 config_json={"max_daily_loss_pct": 0.025},
@@ -130,25 +137,27 @@ def seed_demo() -> None:
             BrokerAccountCreate(
                 name="Paper Mirror",
                 broker_type="paper",
-                mode="live",
-                enabled=True,
-                live_trading_enabled=False,
-                base_url=None,
-                settings_json={"available_cash": 25000, "notes": "Local scaffold only"},
-            ),
-        )
-        broker_service.upsert_account(
-            db,
-            BrokerAccountCreate(
-                name="Trading212 Scaffold",
-                broker_type="trading212",
-                mode="live",
+                mode="paper",
                 enabled=False,
                 live_trading_enabled=False,
-                base_url="https://live.trading212.com/api/v0",
-                settings_json={"sync_mode": "manual-mirror", "supported_actions": ["sync_account", "sync_positions", "sync_orders"]},
+                base_url=None,
+                settings_json={"notes": "Local scaffold only; never used as live cash."},
             ),
         )
+        trading212_account = db.scalar(select(BrokerAccount).where(BrokerAccount.broker_type == "trading212", BrokerAccount.mode == "live"))
+        if trading212_account is None:
+            broker_service.upsert_account(
+                db,
+                BrokerAccountCreate(
+                    name="Trading212 Scaffold",
+                    broker_type="trading212",
+                    mode="live",
+                    enabled=False,
+                    live_trading_enabled=False,
+                    base_url="https://live.trading212.com/api/v0",
+                    settings_json={"sync_mode": "manual-mirror", "supported_actions": ["sync_account", "sync_positions", "sync_orders"]},
+                ),
+            )
 
         simulation_account = db.scalar(select(SimulationAccount).where(SimulationAccount.name == "Primary Simulation"))
         if simulation_account is None:
@@ -156,6 +165,7 @@ def seed_demo() -> None:
                 db,
                 SimulationAccountCreate(name="Primary Simulation", starting_cash=1000, fees_bps=5, slippage_bps=2, latency_ms=50),
             )
+        simulation_service.ensure_model_accounts(db)
         trading_workspace_service.get_or_create_profile(db, "live")
         trading_workspace_service.get_or_create_profile(db, "simulation")
 

@@ -14,6 +14,11 @@ This iteration upgrades the original MVP in place rather than replacing it:
 - added provenance chips and `View trace` actions to orders, trades, positions, and the shared Live/Simulation trading workspace
 - added an operator approval queue for semi-automatic/manual-only automation, with review-ticket loading and explicit rejection
 - added live broker sync visibility plus a manual sync action in the live workspace
+- removed fake live balances: Live Trading now shows Trading212 disconnected/not-synced until a real broker cash sync succeeds
+- added the configurable “Always keep X% in cash” reserve rule with available-to-trade cash shown in Live and Simulation
+- expanded signal/trading actions beyond buy/sell to include close/reduce long and simulated short/cover-short workflows
+- added separate simulation accounts per provider/model so models can compete side by side
+- locked live automation to exactly one configured live model profile
 - fixed the RSS refresh path so checkpoint overlap, backfill, duplicates, and per-feed diagnostics are visible
 - preserved the existing provider, risk, audit, broker, and signal foundations instead of resetting the repo
 
@@ -28,7 +33,9 @@ See [iteration-progress.md](./docs/iteration-progress.md) for a concise analysis
 - Ollama sidecar image that preloads the configured local model catalog on startup
 - Remote paid-provider scaffolds for `ChatGPT / OpenAI`, `Claude / Anthropic`, `Gemini / Google`, and `DeepSeek API`
 - Central risk engine that validates orders before any simulated or live workflow
+- Cash reserve rule that blocks buy-like orders which would spend the configured cash reserve
 - First-class simulation engine with separate accounts, cash, slippage, fees, latency, and audit history
+- Per-model simulation ledgers for comparing provider/model performance independently
 - Broker adapter layer with `paper` and `Trading212` scaffold implementations
 - Real MCP server mounted at `/mcp/` plus backend MCP client integration for standardized tool-based trading context
 - Trading212-backed ticker validation for manual position search when backend API credentials are configured
@@ -101,6 +108,10 @@ The backend uses the official MCP Python SDK on both sides:
 
 - Live trading is disabled by default and controlled only from the backend
 - Simulation and live flows use separate records and validation paths
+- Live balance comes only from Trading212 sync. If Trading212 is missing, disabled, or failing, the UI shows not connected instead of fake money.
+- Trading212 sync also mirrors accessible live holdings and pies into the Live Trading workspace; these are local ledger mirrors, not fake execution.
+- Live automation is locked to exactly one configured live model. Simulation can still use many model accounts independently.
+- Live short execution is not exposed for Trading212 because the adapter does not confirm support. Shorting is simulation-only when enabled per simulation account.
 - Signals are generated once, stored canonically, and can then be reviewed into either simulation or live workflows
 - Market data and signals refresh every 5 minutes by default, news refreshes every 10 minutes, and scheduled simulation automation scans every minute to run only when the configured interval is due
 - Orders, trades, and positions can resolve back into the same provenance chain, including manual-only records that have no origin signal
@@ -128,6 +139,7 @@ The backend uses the official MCP Python SDK on both sides:
 - News now refreshes from real RSS feeds with checkpoint overlap and per-feed diagnostics, but it is still RSS-first rather than a commercial market-data/news feed stack
 - Market data uses lightweight external refreshes suitable for a local-first MVP, not institutional-grade real-time feeds
 - Local-model signal generation depends on Ollama health and model speed; when a model is too slow or unhealthy the app now reports that clearly instead of showing fake signals
-- Trading212 execution is intentionally not implemented; account sync/manual mirroring is the intended extension path
+- Trading212 account cash, holdings, and pies sync is implemented for live display when API permissions allow it. Trading212 execution is intentionally not implemented; account sync/manual mirroring is the intended extension path
 - Trading212 ticker validation uses the authenticated instrument metadata API, so you must set `TRADING212_API_KEY` and `TRADING212_API_SECRET` in the backend env for non-seeded ticker verification
+- Simulation shorts are simplified for MVP comparison and do not model borrow fees, locate availability, or margin calls yet
 - Authentication is simple local JWT auth suitable for a local deployment, not a hardened multi-user SaaS auth layer

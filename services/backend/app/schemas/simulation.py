@@ -7,29 +7,41 @@ from app.schemas.common import ORMModel
 
 class SimulationAccountCreate(BaseModel):
     name: str = "Primary Simulation"
+    provider_type: str | None = None
+    model_name: str | None = None
     starting_cash: float = 1000
     fees_bps: float = 5
     slippage_bps: float = 2
     latency_ms: int = 50
+    min_cash_reserve_percent: float | None = None
+    short_enabled: bool = False
 
 
 class SimulationAccountUpdate(BaseModel):
     name: str | None = None
+    provider_type: str | None = None
+    model_name: str | None = None
     starting_cash: float | None = None
     fees_bps: float | None = None
     slippage_bps: float | None = None
     latency_ms: int | None = None
+    min_cash_reserve_percent: float | None = None
+    short_enabled: bool | None = None
     is_active: bool | None = None
 
 
 class SimulationAccountRead(ORMModel):
     id: str
     name: str
+    provider_type: str | None = None
+    model_name: str | None = None
     starting_cash: float
     cash_balance: float
     fees_bps: float
     slippage_bps: float
     latency_ms: int
+    min_cash_reserve_percent: float | None = None
+    short_enabled: bool
     is_active: bool
     reset_count: int
 
@@ -83,6 +95,8 @@ class SimulationTradeRead(ORMModel):
     fees: float
     realized_pnl: float
     rationale: str | None = None
+    provider_type: str | None = None
+    model_name: str | None = None
     executed_at: datetime
 
 

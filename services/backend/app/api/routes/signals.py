@@ -17,6 +17,11 @@ def list_signals(provider_type: str | None = Query(default=None), db: Session = 
     return [SignalRead.model_validate(item) for item in signal_service.list_signals(db, provider_type=provider_type)]
 
 
+@router.get("/diagnostics", response_model=SignalGenerationResponse)
+def diagnostics(provider_type: str | None = Query(default=None), db: Session = Depends(get_db)) -> SignalGenerationResponse:
+    return SignalGenerationResponse.model_validate(signal_service.latest_generation_diagnostics(db, provider_type=provider_type))
+
+
 @router.get("/{signal_id}", response_model=SignalDetailRead)
 def get_signal(signal_id: str, db: Session = Depends(get_db)) -> SignalDetailRead:
     try:
@@ -39,6 +44,7 @@ def refresh_signals(
     force_refresh: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> SignalGenerationResponse:
+    run_type = "manual"
     market_report = {"snapshots_created": 0, "snapshots_updated": 0, "assets_refreshed": 0, "assets_failed": 0, "errors": []}
     news_report = {"articles_added": 0, "feeds_checked": 0, "feeds_failed": 0, "errors": []}
     refresh_notes: list[str] = []
@@ -50,7 +56,7 @@ def refresh_signals(
         market_report = {**market_report, "errors": [str(exc)]}
 
     try:
-        news_report = news_service.refresh_latest_news(db, force_refresh=force_refresh)
+        news_report = news_service.refresh_latest_news(db, force_refresh=force_refresh, run_type=run_type)
     except Exception as exc:
         refresh_notes.append(f"News refresh failed: {exc}")
         news_report = {**news_report, "errors": [str(exc)]}
@@ -58,21 +64,31 @@ def refresh_signals(
     try:
         signals = signal_service.generate_signals(db, provider_type=provider_type, force_refresh=force_refresh)
     except ValueError as exc:
-        db.commit()
-        return SignalGenerationResponse(
+        message = _blocked_refresh_message(db, provider_type, str(exc), refresh_notes)
+        summary = signal_service.record_generation_diagnostics(
+            db,
             provider_type=provider_type,
             status="blocked",
-            created_signal_ids=[],
+            run_type=run_type,
+            message=message,
             created_count=0,
-            message=_blocked_refresh_message(db, provider_type, str(exc), refresh_notes),
             detail=str(exc),
             market_report=market_report,
             news_report=news_report,
         )
-
-    db.commit()
-    for signal in signals[:5]:
-        publish_event("signal.created", {"signal_id": signal.id, "asset_id": signal.asset_id, "action": signal.action})
+        db.commit()
+        return SignalGenerationResponse(
+            provider_type=provider_type,
+            status="blocked",
+            run_type=run_type,
+            observed_at=summary["observed_at"],
+            created_signal_ids=[],
+            created_count=0,
+            message=message,
+            detail=str(exc),
+            market_report=market_report,
+            news_report=news_report,
+        )
 
     if signals:
         message = (
@@ -90,9 +106,25 @@ def refresh_signals(
         )
         status = "noop"
 
+    summary = signal_service.record_generation_diagnostics(
+        db,
+        provider_type=provider_type,
+        status=status,
+        run_type=run_type,
+        message=message,
+        created_signal_ids=[signal.id for signal in signals],
+        created_count=len(signals),
+        market_report=market_report,
+        news_report=news_report,
+    )
+    db.commit()
+    for signal in signals[:5]:
+        publish_event("signal.created", {"signal_id": signal.id, "asset_id": signal.asset_id, "action": signal.action})
     return SignalGenerationResponse(
         provider_type=provider_type,
         status=status,
+        run_type=run_type,
+        observed_at=summary["observed_at"],
         created_signal_ids=[signal.id for signal in signals],
         created_count=len(signals),
         message=message,

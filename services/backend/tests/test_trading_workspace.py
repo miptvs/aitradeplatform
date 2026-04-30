@@ -6,8 +6,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models.asset import Asset, MarketSnapshot
 from app.models.audit import Alert
 from app.models.base import Base
+from app.models.broker import BrokerAccount
 from app.models.health import SystemHealthEvent
 from app.models.portfolio import Order, Position, Trade
+from app.models.provider import ProviderConfig
+from app.models.risk import RiskRule
 from app.models.signal import Signal, SignalEvaluation
 from app.models.simulation import SimulationAccount
 from app.schemas.portfolio import PositionCreate
@@ -115,6 +118,76 @@ def test_simulation_automation_can_submit_order_from_candidate_signal() -> None:
     assert trade.id in {item["id"] for item in position_trace["trades"]}
     assert order_trace["risk_checks"] is not None
     assert position_trace["stop_history"]
+
+
+def test_automation_skips_buy_when_cash_reserve_leaves_no_trade_budget() -> None:
+    db = build_session()
+    asset = Asset(symbol="RESV", name="Reserve Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow() - timedelta(minutes=1),
+            open_price=100,
+            high_price=101,
+            low_price=99,
+            close_price=100,
+            volume=1000,
+            source="test",
+        )
+    )
+    account = SimulationAccount(name="Reserve Sim", starting_cash=100, cash_balance=100, fees_bps=0, slippage_bps=0, latency_ms=0, is_active=True)
+    db.add(account)
+    db.add(
+        RiskRule(
+            name="Cash Reserve",
+            scope="global",
+            rule_type="cash_reserve",
+            enabled=True,
+            config_json={"min_cash_reserve_pct": 1.0},
+        )
+    )
+    db.add(
+        Signal(
+            asset_id=asset.id,
+            action="buy",
+            confidence=0.95,
+            status="candidate",
+            occurred_at=utcnow(),
+            indicators_json={},
+            related_news_ids=[],
+            related_event_ids=[],
+            ai_rationale="Would normally qualify, but cash is reserved.",
+            suggested_entry=100,
+            provider_type="openai_simulation",
+            model_name="gpt-5-mini",
+            mode="both",
+            source_kind="agent",
+            metadata_json={"preferred_strategy": "trend-following"},
+        )
+    )
+    db.flush()
+    trading_workspace_service.upsert_profile(
+        db,
+        "simulation",
+        TradingAutomationProfileUpsert(
+            automation_enabled=True,
+            approval_mode="fully_automatic",
+            confidence_threshold=0.5,
+            default_order_notional=100,
+            max_orders_per_run=1,
+        ),
+    )
+    db.commit()
+
+    result = trading_workspace_service.run_automation(db, "simulation", simulation_account_id=account.id)
+    db.commit()
+
+    assert result["submitted_orders"] == 0
+    assert result["rejected_signals"] == 1
+    assert "cash reserve" in result["decisions"][0]["reason"].lower()
+    assert db.scalar(select(Order).where(Order.asset_id == asset.id)) is None
 
 
 def test_workspaces_share_the_same_signal_pool() -> None:
@@ -368,3 +441,124 @@ def test_simulation_workspace_can_inherit_live_automation_policy() -> None:
     assert workspace["automation"]["approval_mode"] == "fully_automatic"
     assert workspace["automation"]["confidence_threshold"] == 0.73
     assert workspace["automation"]["default_order_notional"] == 250
+
+
+def test_live_workspace_does_not_show_fake_cash_without_trading212_sync() -> None:
+    db = build_session()
+
+    workspace = trading_workspace_service.get_workspace(db, "live")
+
+    assert workspace["account"]["status"] == "disconnected"
+    assert workspace["account"]["cash_available"] == 0
+    assert workspace["account"]["available_to_trade_cash"] == 0
+    assert "Trading212 not connected" in workspace["account"]["safety_message"]
+
+
+def test_live_automation_blocks_when_no_live_model_is_configured() -> None:
+    db = build_session()
+    asset = Asset(symbol="LIVE", name="Live Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.add(
+        BrokerAccount(
+            name="Trading212 Live",
+            broker_type="trading212",
+            mode="live",
+            enabled=True,
+            live_trading_enabled=False,
+            status="connected",
+            settings_json={"available_cash": 1000, "total_value": 1000, "currency": "USD"},
+        )
+    )
+    db.flush()
+    db.add(
+        Signal(
+            asset_id=asset.id,
+            action="buy",
+            confidence=0.9,
+            status="candidate",
+            occurred_at=utcnow(),
+            indicators_json={},
+            related_news_ids=[],
+            related_event_ids=[],
+            ai_rationale="Live candidate.",
+            suggested_entry=100,
+            provider_type="openai_live",
+            model_name="gpt-5.2",
+            mode="both",
+            source_kind="agent",
+            metadata_json={"preferred_strategy": "trend-following"},
+        )
+    )
+    trading_workspace_service.upsert_profile(
+        db,
+        "live",
+        TradingAutomationProfileUpsert(
+            automation_enabled=True,
+            approval_mode="fully_automatic",
+            confidence_threshold=0.5,
+            default_order_notional=100,
+        ),
+    )
+    db.commit()
+
+    result = trading_workspace_service.run_automation(db, "live")
+
+    assert result["status"] == "blocked"
+    assert "exactly one configured Live trading model" in result["message"]
+
+
+def test_live_signal_approval_rejects_wrong_model_profile() -> None:
+    db = build_session()
+    asset = Asset(symbol="WRONG", name="Wrong Model Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.add(
+        ProviderConfig(
+            provider_type="openai_live",
+            name="ChatGPT / OpenAI / Actual Trading",
+            enabled=True,
+            base_url="https://api.openai.com/v1",
+            default_model="gpt-5.2",
+            temperature=0.2,
+            max_tokens=512,
+            context_window=400000,
+            tool_calling_enabled=True,
+            reasoning_mode="minimal",
+            task_defaults={},
+            settings_json={},
+        )
+    )
+    db.flush()
+    signal = Signal(
+        asset_id=asset.id,
+        action="buy",
+        confidence=0.9,
+        status="candidate",
+        occurred_at=utcnow(),
+        indicators_json={},
+        related_news_ids=[],
+        related_event_ids=[],
+        ai_rationale="Wrong live model.",
+        suggested_entry=100,
+        provider_type="deepseek_live",
+        model_name="deepseek-reasoner",
+        mode="both",
+        source_kind="agent",
+        metadata_json={"preferred_strategy": "trend-following"},
+    )
+    db.add(signal)
+    trading_workspace_service.upsert_profile(
+        db,
+        "live",
+        TradingAutomationProfileUpsert(
+            allowed_provider_types=["openai_live"],
+            config_json={"live_model_provider_type": "openai_live"},
+        ),
+    )
+    db.commit()
+
+    try:
+        trading_workspace_service.approve_signal(db, "live", signal.id)
+    except ValueError as exc:
+        assert "locked to openai_live" in str(exc)
+    else:
+        raise AssertionError("Expected live approval to reject the wrong provider profile.")

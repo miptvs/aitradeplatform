@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 
 import { ProvenanceChips, TraceButton } from "@/components/provenance/provenance-chips";
 import { StatusBadge } from "@/components/ui/status-badge";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatDateTime } from "@/lib/utils";
 import type { Order, Trade } from "@/types";
 
 type SortMode = "newest" | "oldest" | "symbol" | "largest";
@@ -72,7 +72,7 @@ export function TradesTable({
           <tbody>
             {sortedRows.map((row: Trade | Order) => (
               <tr key={row.id}>
-                <td>{rowTime(row).slice(0, 16).replace("T", " ")}</td>
+                <td>{formatDateTime(rowTime(row))}</td>
                 <td>
                   <div className="font-semibold text-slate-100">{row.symbol}</div>
                   <div className="text-xs text-slate-400">{row.asset_name}</div>

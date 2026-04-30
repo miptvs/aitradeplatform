@@ -55,6 +55,8 @@ class NewsService:
         if event is None:
             return {
                 "message": "No RSS refresh has been recorded yet.",
+                "run_type": "none",
+                "observed_at": None,
                 "articles_added": 0,
                 "feeds_checked": 0,
                 "feeds_failed": 0,
@@ -71,6 +73,8 @@ class NewsService:
         metadata = event.metadata_json or {}
         return {
             "message": event.message,
+            "run_type": metadata.get("run_type", "manual"),
+            "observed_at": event.observed_at.isoformat(),
             "articles_added": metadata.get("articles_added", 0),
             "feeds_checked": metadata.get("feeds_checked", 0),
             "feeds_failed": metadata.get("feeds_failed", 0),
@@ -85,7 +89,14 @@ class NewsService:
             "feed_reports": metadata.get("feed_reports", []),
         }
 
-    def refresh_latest_news(self, db: Session, *, force_refresh: bool = False, backfill_hours: int | None = None) -> dict:
+    def refresh_latest_news(
+        self,
+        db: Session,
+        *,
+        force_refresh: bool = False,
+        backfill_hours: int | None = None,
+        run_type: str = "manual",
+    ) -> dict:
         refresh_started_at = utcnow()
         feed_urls = self._build_feed_urls(db)
         tracked_assets = list(db.scalars(select(Asset).where(Asset.is_active.is_(True)).order_by(Asset.symbol)))
@@ -261,6 +272,7 @@ class NewsService:
                 status=status,
                 message=message,
                 metadata_json={
+                    "run_type": run_type,
                     "articles_added": articles_added,
                     "feeds_checked": len(feed_urls),
                     "feeds_failed": feeds_failed,
@@ -282,6 +294,8 @@ class NewsService:
 
         return {
             "message": message,
+            "run_type": run_type,
+            "observed_at": refresh_started_at.isoformat(),
             "articles_added": articles_added,
             "feeds_checked": len(feed_urls),
             "feeds_failed": feeds_failed,

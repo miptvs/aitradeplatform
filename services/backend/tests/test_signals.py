@@ -227,3 +227,10 @@ def test_position_exit_decision_creates_low_confidence_sell_watch() -> None:
     assert decision is not None
     assert decision["trigger"] == "mixed_exit_watch"
     assert decision["confidence"] < 0.58
+
+
+def test_signal_action_normalization_supports_sell_short_and_close_actions() -> None:
+    assert signal_service._normalize_action("SHORT", "hold") == "short"
+    assert signal_service._normalize_action("close position", "hold") == "close_long"
+    assert signal_service._normalize_action("trim", "hold") == "reduce_long"
+    assert signal_service._normalize_action("buy to cover", "hold") == "cover_short"

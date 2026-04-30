@@ -90,3 +90,66 @@
 - Automatic trading is now usable for live/simulation workflows, but richer approval queues and explicit “rejected by rule X” timelines can still be expanded further.
 - Stop history now records signal suggestions, ticket levels, current position levels, and manual edits where those events exist; future work can add a dedicated normalized stop-events table if stop automation becomes more complex.
 - Provider settings are still intentionally split into simulation/live profiles; only automation policy inheritance is shared/overridable today.
+
+## 2026-04-24 Trading Controls Upgrade
+
+### Existing
+
+- The repo already had shared live/simulation trading workspaces, automation profiles, Trading212 broker scaffolding, canonical signal records, risk validation, and simulation fills.
+- Simulation orders already persisted provider/model on orders, but accounts were not model-specific and simulated trades did not carry provider/model identity.
+- Trading212 credentials and manual sync UI existed, but live account summary could still fall back to seeded paper cash.
+
+### Missing
+
+- No configurable “always keep X% in cash” risk rule.
+- Signal actions and automation were still biased toward `buy`/`sell`, with no first-class `close_long`, `reduce_long`, `short`, or `cover_short` action semantics.
+- Simulation accounts were not isolated per provider/model, making model-vs-model comparison impossible.
+- Live balance was not strictly sourced from Trading212.
+- Live automation could still be configured with broad provider allow-lists instead of exactly one live model.
+
+### Fixed In This Iteration
+
+- Added a persisted `cash_reserve` risk rule and account summary fields for total cash, reserve amount, and available-to-trade cash.
+- Risk validation now blocks buy-like actions that would breach the cash reserve and returns actionable reserve details.
+- Expanded signal normalization and prompts to support `BUY`, `SELL`, `HOLD`, `CLOSE_LONG`, `REDUCE_LONG`, `SHORT`, and `COVER_SHORT`.
+- Position exit scanning now emits `close_long` signals for held long positions instead of ambiguous sell-only signals.
+- Simulation execution now supports short and cover-short flows when `short_enabled` is set on the selected simulation account.
+- Added per-model simulation accounts keyed by provider profile/model, plus comparison metrics for cash, value, return, win rate, drawdown, and trade count.
+- Trading212 sync now uses real account cash/info responses and persists synced cash, invested value, total value, realized/unrealized PnL, currency, and last sync metadata.
+- Live workspace no longer displays fake paper cash; it shows Trading212 disconnected/not-synced states until a real sync succeeds.
+- Live automation and live signal approval now require exactly one configured live provider/model and reject signals from the wrong live profile.
+- Frontend settings now include a dedicated live-model selector and editable cash reserve rule.
+- Live/Simulation workspaces now show cash reserve, available-to-trade cash, model comparison, short-simulation toggles, and expanded action controls.
+
+### Remaining TODOs
+
+- Trading212 execution remains intentionally unavailable until a fully verified live execution adapter is implemented.
+- Trading212 live shorting is not exposed because the current adapter does not confirm short execution support.
+- Provider health checks can be made stricter before live automation by requiring a fresh successful check within a configurable window.
+- Simulation short accounting is intentionally simple for MVP comparison; margin, borrow cost, and locate rules are future work.
+
+## 2026-04-29 Account Isolation And Broker Sync Fixes
+
+### Existing
+
+- Cash reserve validation existed, but automation could still create rejected buy orders when no available-to-trade cash remained.
+- Per-model simulation accounts existed, but several risk checks still counted all simulation positions/orders together.
+- Simulation reset cleared simulation-specific rows but not every generic order/trade/position row shown by the shared workspace.
+- Trading212 account cash sync existed, while live holdings and pies were still scaffold-only.
+
+### Fixed In This Iteration
+
+- Automation now skips buy-like orders before submission when cash reserve leaves no available cash, so the rejection feed is not spammed by orders that were never processed.
+- Fractional automation sizing now caps buy notional to available-to-trade cash and divides remaining budget across the run, supporting small live accounts around 100 EUR.
+- Risk checks for duplicate orders, position count, sector exposure, daily loss, drawdown, and loss streak now scope to the selected simulation account or broker account.
+- Simulation reset now clears the generic orders, trades, fills, positions, snapshots, simulation orders, and simulation trades for the selected model account only.
+- Closed positions are shown separately below active positions and can be cleaned from the workspace without deleting audit/trade history.
+- Position closing now handles fractional quantities, full-close defaults, short quantities, already-closed positions, and missing market data more gracefully.
+- Trading212 sync now fetches account summary, positions, and pies when API permissions allow it; live positions are mirrored into the local live ledger as broker-synced holdings.
+- Live account summary and broker status now show synced Trading212 holdings/pies counts and pie details, while direct execution remains disabled unless a future adapter verifies support.
+
+### Remaining TODOs
+
+- Trading212 order execution and live shorting remain intentionally unsupported.
+- Trading212 pies are displayed as synced broker metadata; pie-level rebalancing/editing is not implemented.
+- Broker-synced live positions are local mirrors. Closing them in the app updates the local ledger only unless a future verified execution adapter is added.

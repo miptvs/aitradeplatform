@@ -14,7 +14,7 @@ class TradingAutomationProfileUpsert(BaseModel):
     inherit_from_live: bool = False
     approval_mode: Literal["manual_only", "semi_automatic", "fully_automatic"] = "semi_automatic"
     allowed_strategy_slugs: list[str] = Field(default_factory=list)
-    tradable_actions: list[str] = Field(default_factory=lambda: ["buy"])
+    tradable_actions: list[str] = Field(default_factory=lambda: ["buy", "sell", "close_long", "reduce_long"])
     allowed_provider_types: list[str] = Field(default_factory=list)
     confidence_threshold: float = 0.58
     default_order_notional: float = 100.0
@@ -73,7 +73,11 @@ class TradingAccountSummary(BaseModel):
     status: str
     base_currency: str
     total_value: float
+    total_cash: float = 0
     cash_available: float
+    available_to_trade_cash: float = 0
+    cash_reserve_percent: float = 0
+    cash_reserve_amount: float = 0
     equity: float
     realized_pnl: float
     unrealized_pnl: float

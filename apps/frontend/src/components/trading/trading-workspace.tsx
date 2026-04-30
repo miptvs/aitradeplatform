@@ -18,7 +18,7 @@ import { useWorkspace } from "@/components/layout/workspace-provider";
 import { useApi } from "@/hooks/use-api";
 import { useProvenanceTrace } from "@/hooks/use-provenance-trace";
 import { api } from "@/lib/api";
-import { formatCurrency, formatPct, formatQuantity } from "@/lib/utils";
+import { formatCurrency, formatDateTime, formatPct, formatQuantity } from "@/lib/utils";
 import type {
   Asset,
   AssetSearchResult,
@@ -40,6 +40,15 @@ const RISK_PRESETS = {
   balanced: { stopLossPct: 0.03, takeProfitPct: 0.06, trailingStopPct: 0.02 },
   aggressive: { stopLossPct: 0.05, takeProfitPct: 0.1, trailingStopPct: 0.03 },
 } as const;
+
+const TRADE_ACTIONS = [
+  { value: "buy", label: "Buy / open long", help: "Uses cash to buy or add to a long position." },
+  { value: "sell", label: "Sell / reduce long", help: "Sells existing long holdings. Live shorting is not assumed." },
+  { value: "close_long", label: "Close long", help: "Exit an existing long position." },
+  { value: "reduce_long", label: "Reduce long", help: "Trim part of an existing long position." },
+  { value: "short", label: "Short (simulation)", help: "Open a simulated short if short simulation is enabled." },
+  { value: "cover_short", label: "Cover short", help: "Close or reduce an existing simulated short." },
+] as const;
 
 export function TradingWorkspace({
   mode,
@@ -120,29 +129,41 @@ export function TradingWorkspace({
   const [automationForm, setAutomationForm] = useState<TradingAutomationProfile | null>(null);
   const [recommendationBusyId, setRecommendationBusyId] = useState<string | null>(null);
   const [brokerSyncingId, setBrokerSyncingId] = useState<string | null>(null);
+  const [clearRiskBusy, setClearRiskBusy] = useState(false);
   const provenance = useProvenanceTrace();
 
   const workspaceData = workspaceState.data;
   const localAssetDefaults = useMemo(() => (workspaceData?.assets || []).slice(0, 8).map(toLocalSearchResult), [workspaceData?.assets]);
   const providerOptions = useMemo(
-    () =>
-      Array.from(
+    () => {
+      const simulationAccountProviders = ((workspaceData?.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || [])
+        .map((account) => String(account.provider_type || ""))
+        .filter(Boolean);
+      const liveModelProvider = String(workspaceData?.controls.live_model_provider_type || "");
+      return Array.from(
         new Set([
-          mode === "simulation" ? workspace.simulationProviderType : workspace.liveProviderType,
+          mode === "simulation" ? workspace.simulationProviderType : liveModelProvider || workspace.liveProviderType,
           workspace.signalProviderType,
+          ...simulationAccountProviders,
           "manual",
-        ])
-      ),
-    [mode, workspace.liveProviderType, workspace.signalProviderType, workspace.simulationProviderType]
+        ].filter(Boolean))
+      );
+    },
+    [mode, workspace.liveProviderType, workspace.signalProviderType, workspace.simulationProviderType, workspaceData?.controls]
   );
 
   useEffect(() => {
     if (mode !== "simulation" || !workspaceData) return;
     const controlAccountId = String((workspaceData.controls.active_simulation_account_id as string | undefined) || "");
-    if (controlAccountId && !selectedSimulationAccountId) {
-      setSelectedSimulationAccountId(controlAccountId);
+    const simulationAccounts = (workspaceData.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || [];
+    const workspaceAccount = simulationAccounts.find(
+      (account) => String(account.provider_type || "") === workspace.simulationProviderType
+    );
+    const preferredAccountId = String(workspaceAccount?.id || controlAccountId || "");
+    if (preferredAccountId && !selectedSimulationAccountId) {
+      setSelectedSimulationAccountId(preferredAccountId);
     }
-  }, [mode, selectedSimulationAccountId, workspaceData]);
+  }, [mode, selectedSimulationAccountId, workspace.simulationProviderType, workspaceData]);
 
   useEffect(() => {
     if (!workspaceData) return;
@@ -242,8 +263,10 @@ export function TradingWorkspace({
   const orderNotional = requestedPrice > 0 ? derivedQuantity * requestedPrice : 0;
   const simulationAccounts = (workspaceData.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || [];
   const brokerAccounts = (workspaceData.controls.broker_accounts as Array<Record<string, unknown>> | undefined) || [];
+  const openPositions = workspaceData.positions.filter((position) => position.status === "open");
+  const closedPositions = workspaceData.positions.filter((position) => position.status === "closed");
   const closePreviewPct = closePercent ? Number(closePercent) : 100;
-  const closePreviewQty = closeDialogPosition ? (closeDialogPosition.quantity * closePreviewPct) / 100 : 0;
+  const closePreviewQty = closeDialogPosition ? (Math.abs(closeDialogPosition.quantity) * closePreviewPct) / 100 : 0;
 
   function loadRecommendationIntoTicket(recommendation: TradingRecommendation) {
     if (!workspaceData || !automationForm) return;
@@ -251,9 +274,16 @@ export function TradingWorkspace({
     const suggestedEntry = recommendation.suggested_entry || asset?.latest_price || 0;
     const trailingStop =
       automationForm.trailing_stop_pct && suggestedEntry > 0 ? String(round(suggestedEntry * automationForm.trailing_stop_pct)) : "";
+    const cappedNotional = Math.max(
+      0,
+      Math.min(
+        automationForm.default_order_notional,
+        Number(workspaceData.account.available_to_trade_cash || automationForm.default_order_notional)
+      )
+    );
     const derivedQuantityFromNotional =
-      automationForm.default_order_notional > 0 && suggestedEntry > 0
-        ? String(Math.round((automationForm.default_order_notional / suggestedEntry) * 1_000_000) / 1_000_000)
+      cappedNotional > 0 && suggestedEntry > 0
+        ? String(Math.round((cappedNotional / suggestedEntry) * 1_000_000) / 1_000_000)
         : "";
 
     setOrderForm((current) => ({
@@ -267,7 +297,7 @@ export function TradingWorkspace({
       side: recommendation.action,
       order_type: "market",
       sizing_mode: "amount",
-      amount: String(automationForm.default_order_notional),
+      amount: String(cappedNotional),
       quantity: derivedQuantityFromNotional,
       requested_price: suggestedEntry ? String(suggestedEntry) : current.requested_price,
       stop_loss: recommendation.suggested_stop_loss ? String(recommendation.suggested_stop_loss) : current.stop_loss,
@@ -311,7 +341,7 @@ export function TradingWorkspace({
       const result = await api.syncLiveBroker(brokerAccountId);
       setBanner({
         tone: result.status === "ok" ? "success" : result.status === "warn" ? "warn" : "error",
-        message: `${result.message} Account: ${result.account_message} Positions: ${result.positions_message} Orders: ${result.orders_message}`,
+        message: `${result.message} Account: ${result.account_message} Positions: ${result.positions_message} Pies: ${result.pies_message || "not checked"} Orders: ${result.orders_message}`,
       });
       workspaceState.reload();
     } catch (error) {
@@ -357,6 +387,27 @@ export function TradingWorkspace({
     }
   }
 
+  async function handleClearRiskNotices() {
+    try {
+      setClearRiskBusy(true);
+      const result = await api.clearAlerts({ mode, category: "risk" });
+      setBanner({
+        tone: "success",
+        message: result.resolved
+          ? `Cleaned up ${result.resolved} ${mode} risk notice${result.resolved === 1 ? "" : "s"}.`
+          : "No open risk notices needed cleanup.",
+      });
+      workspaceState.reload();
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        message: error instanceof Error ? error.message : "Risk notice cleanup failed.",
+      });
+    } finally {
+      setClearRiskBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
@@ -379,11 +430,12 @@ export function TradingWorkspace({
       </div>
 
       {banner ? <Banner tone={banner.tone} message={banner.message} /> : null}
-      <RiskBanner alerts={workspaceData.alerts} />
+      <RiskBanner alerts={workspaceData.alerts} mode={mode} onClear={handleClearRiskNotices} clearBusy={clearRiskBusy} />
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
         <StatsCard label="Account Value" value={workspaceData.account.total_value} />
-        <StatsCard label="Cash Available" value={workspaceData.account.cash_available} />
+        <StatsCard label="Total Cash" value={workspaceData.account.total_cash ?? workspaceData.account.cash_available} />
+        <StatsCard label="Available To Trade" value={workspaceData.account.available_to_trade_cash ?? workspaceData.account.cash_available} />
         <StatsCard label="Equity" value={workspaceData.account.equity} />
         <StatsCard label="Realized PnL" value={workspaceData.account.realized_pnl} />
         <StatsCard label="Unrealized PnL" value={workspaceData.account.unrealized_pnl} />
@@ -402,7 +454,7 @@ export function TradingWorkspace({
             if (!selectedSimulationAccountId) return;
             if (!window.confirm("Reset this simulation account back to its configured starting balance?")) return;
             await api.resetSimulationAccount(selectedSimulationAccountId);
-            setBanner({ tone: "success", message: "Simulation account reset to its configured clean state." });
+            setBanner({ tone: "success", message: "Simulation account reset. Cash, positions, orders, trades, and snapshots for this account were cleaned." });
             workspaceState.reload();
           }}
           onSaveSimulationSettings={async (payload) => {
@@ -572,7 +624,7 @@ export function TradingWorkspace({
             </div>
           </div>
           <PositionManagementTable
-            positions={workspaceData.positions}
+            positions={openPositions}
             emptyMessage={`No ${mode} positions yet. Use the order ticket or record an existing fill to get started.`}
             onViewDetails={setDetailPosition}
             onEditStops={(position) => {
@@ -595,6 +647,44 @@ export function TradingWorkspace({
             }}
             onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
           />
+          <section className="mt-4 rounded-2xl border border-border bg-black/20 p-4">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Closed {mode} positions</div>
+                <div className="mt-1 text-sm text-slate-400">Closed lines stay visible for review until you clean them from the active workspace view.</div>
+              </div>
+              <button
+                type="button"
+                disabled={!closedPositions.length}
+                onClick={async () => {
+                  const result =
+                    mode === "live"
+                      ? await api.cleanLiveClosedPositions()
+                      : await api.cleanSimulationClosedPositions(selectedSimulationAccountId || undefined);
+                  setBanner({ tone: "success", message: `${result.archived} closed position${result.archived === 1 ? "" : "s"} cleaned from this workspace.` });
+                  workspaceState.reload();
+                }}
+                className="rounded-xl border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Clean closed
+              </button>
+            </div>
+            <div className="mt-4">
+              <PositionManagementTable
+                positions={closedPositions}
+                emptyMessage={`No closed ${mode} positions to review.`}
+                onViewDetails={setDetailPosition}
+                onEditStops={setStopDialogPosition}
+                onClose={setCloseDialogPosition}
+                onMarkOverride={async (position) => {
+                  await api.updatePosition(position.id, { manual_override: true });
+                  setBanner({ tone: "success", message: `${position.symbol} is now marked as a manual override.` });
+                  workspaceState.reload();
+                }}
+                onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
+              />
+            </div>
+          </section>
           <section className="mt-4 rounded-2xl border border-border bg-black/20 p-4">
             <div className="flex items-center justify-between">
               <div>
@@ -690,6 +780,18 @@ export function TradingWorkspace({
             type="button"
             onClick={async () => {
               try {
+                const buyLike = ["buy", "short"].includes(orderForm.side);
+                const availableToTrade = Number(workspaceData.account.available_to_trade_cash || 0);
+                if (buyLike && orderNotional > availableToTrade) {
+                  setBanner({
+                    tone: "warn",
+                    message:
+                      availableToTrade <= 0
+                        ? "Order not processed because the cash reserve rule leaves no available-to-trade cash. Insufficient balance checks still apply to submitted orders."
+                        : `Order not processed because it would breach the cash reserve. Available to trade is ${formatCurrency(availableToTrade, currentCurrency)}.`,
+                  });
+                  return;
+                }
                 const basePayload = {
                   asset_id: orderForm.asset_id,
                   side: orderForm.side,
@@ -898,8 +1000,8 @@ export function TradingWorkspace({
             {closeDialogPosition ? (
               <>
                 <div className="font-semibold text-slate-100">{closeDialogPosition.symbol}</div>
-                <div className="mt-2">Current quantity: {formatQuantity(closeDialogPosition.quantity, 6)}</div>
-                <div className="mt-1">Preview close size: {formatQuantity(closePreviewQty || closeDialogPosition.quantity, 6)}</div>
+                <div className="mt-2">Current quantity: {formatQuantity(Math.abs(closeDialogPosition.quantity), 6)}</div>
+                <div className="mt-1">Preview close size: {formatQuantity(closePreviewQty || Math.abs(closeDialogPosition.quantity), 6)}</div>
               </>
             ) : null}
           </div>
@@ -1040,7 +1142,7 @@ function AccountSummaryPanel({
   onSaveSimulationSettings: (payload: Record<string, unknown>) => Promise<void>;
   onSyncLiveBroker: (brokerAccountId?: string) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState({ starting_cash: 1000, fees_bps: 5, slippage_bps: 2, latency_ms: 50 });
+  const [draft, setDraft] = useState({ starting_cash: 1000, fees_bps: 5, slippage_bps: 2, latency_ms: 50, min_cash_reserve_percent: "", short_enabled: false });
 
   useEffect(() => {
     if (mode !== "simulation") return;
@@ -1051,6 +1153,11 @@ function AccountSummaryPanel({
       fees_bps: Number(current.fees_bps || 0),
       slippage_bps: Number(current.slippage_bps || 0),
       latency_ms: Number(current.latency_ms || 0),
+      min_cash_reserve_percent:
+        current.min_cash_reserve_percent === null || current.min_cash_reserve_percent === undefined
+          ? ""
+          : String(Number(current.min_cash_reserve_percent) * 100),
+      short_enabled: Boolean(current.short_enabled),
     });
   }, [mode, selectedSimulationAccountId, simulationAccounts]);
 
@@ -1068,6 +1175,8 @@ function AccountSummaryPanel({
         <SummaryChip label="Active orders" value={String(workspaceData.account.active_orders_count)} />
         <SummaryChip label="Trade count" value={String(workspaceData.account.total_trades_count)} />
         <SummaryChip label="Execution" value={workspaceData.account.live_execution_enabled ? "enabled" : "guarded"} />
+        <SummaryChip label="Cash reserve" value={`${formatPct(workspaceData.account.cash_reserve_percent || 0)} · ${formatCurrency(workspaceData.account.cash_reserve_amount || 0, workspaceData.account.base_currency)}`} />
+        <SummaryChip label="Available to trade" value={formatCurrency(workspaceData.account.available_to_trade_cash || 0, workspaceData.account.base_currency)} />
       </div>
 
       {mode === "simulation" ? (
@@ -1095,15 +1204,38 @@ function AccountSummaryPanel({
             <Field label="Latency (ms)">
               <input type="number" value={draft.latency_ms} onChange={(event) => setDraft((current) => ({ ...current, latency_ms: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
             </Field>
+            <Field label={<HelpTooltip label="Cash reserve override" help="Leave blank to inherit the shared cash reserve rule. Enter a percentage to give this model account its own reserve." />}>
+              <input type="number" step="0.5" value={draft.min_cash_reserve_percent} onChange={(event) => setDraft((current) => ({ ...current, min_cash_reserve_percent: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" placeholder="Inherit" />
+            </Field>
+            <ToggleField
+              label={<HelpTooltip label="Short simulation" help="Allows this simulation account to open short trades that profit if price falls. Live availability depends on broker support and is disabled for Trading212 here." />}
+              checked={draft.short_enabled}
+              onChange={(checked) => setDraft((current) => ({ ...current, short_enabled: checked }))}
+            />
           </div>
           <div className="flex flex-wrap gap-3">
-            <button type="button" onClick={() => onSaveSimulationSettings(draft)} className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">
+            <button
+              type="button"
+              onClick={() =>
+                onSaveSimulationSettings({
+                  ...draft,
+                  min_cash_reserve_percent:
+                    draft.min_cash_reserve_percent === "" ? null : Math.max(0, Number(draft.min_cash_reserve_percent)) / 100,
+                })
+              }
+              className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20"
+            >
               Save sim settings
             </button>
             <button type="button" onClick={onResetSimulation} className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-100 hover:bg-amber-500/20">
               Reset simulation account
             </button>
           </div>
+          <SimulationModelComparison
+            accounts={simulationAccounts}
+            selectedSimulationAccountId={selectedSimulationAccountId}
+            onChangeSimulationAccount={onChangeSimulationAccount}
+          />
         </div>
       ) : (
         <div className="mt-4 space-y-3 rounded-2xl border border-border bg-black/20 p-4">
@@ -1138,9 +1270,28 @@ function AccountSummaryPanel({
               <div className="mt-3 grid gap-2 md:grid-cols-2">
                 <SummaryChip label="Execution" value={account.supports_execution ? "supported" : "guarded/off"} />
                 <SummaryChip label="Sync" value={account.supports_sync ? "available" : "not supported"} />
+                <SummaryChip label="Cash" value={account.available_cash === null || account.available_cash === undefined ? "Not synced" : formatCurrency(Number(account.available_cash), String(account.currency || "USD"))} />
+                <SummaryChip label="Portfolio" value={account.total_value === null || account.total_value === undefined ? "Not synced" : formatCurrency(Number(account.total_value), String(account.currency || "USD"))} />
+                <SummaryChip label="Synced positions" value={String((account.synced_positions as Array<Record<string, unknown>> | undefined)?.length || 0)} />
+                <SummaryChip label="Synced pies" value={String((account.synced_pies as Array<Record<string, unknown>> | undefined)?.length || 0)} />
                 <SummaryChip label="Last sync status" value={String(account.last_sync_status || "Never run")} />
                 <SummaryChip label="Last sync time" value={String(account.last_sync_completed_at || account.last_sync_started_at || "n/a")} />
               </div>
+              {Array.isArray(account.synced_pies) && account.synced_pies.length ? (
+                <div className="mt-3 rounded-2xl border border-border bg-black/20 p-3">
+                  <div className="text-xs uppercase tracking-[0.18em] text-slate-500">Trading212 pies</div>
+                  <div className="mt-2 grid gap-2 md:grid-cols-2">
+                    {account.synced_pies.slice(0, 6).map((pie) => (
+                      <div key={String(pie.id)} className="rounded-xl border border-border/70 px-3 py-2 text-xs text-slate-300">
+                        <div className="font-semibold text-slate-100">Pie #{String(pie.id)}</div>
+                        <div className="mt-1">Status: {String(pie.status || "unknown")}</div>
+                        <div>Cash: {formatCurrency(Number(pie.cash || 0), String(account.currency || "USD"))}</div>
+                        <div>Result: {formatCurrency(Number(pie.result || 0), String(account.currency || "USD"))}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               {account.last_sync_message ? <div className="mt-3 text-xs text-slate-400">{String(account.last_sync_message)}</div> : null}
             </div>
           ))}
@@ -1148,6 +1299,64 @@ function AccountSummaryPanel({
         </div>
       )}
     </section>
+  );
+}
+
+function SimulationModelComparison({
+  accounts,
+  selectedSimulationAccountId,
+  onChangeSimulationAccount,
+}: {
+  accounts: Array<Record<string, unknown>>;
+  selectedSimulationAccountId: string;
+  onChangeSimulationAccount: (value: string) => void;
+}) {
+  if (!accounts.length) return null;
+  return (
+    <div className="rounded-2xl border border-border bg-black/20 p-4">
+      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="text-sm font-semibold text-slate-100">Model account comparison</div>
+          <div className="mt-1 text-xs text-slate-400">Each provider/model gets its own simulated cash, positions, orders, trades, and PnL so models can compete cleanly.</div>
+        </div>
+        <StatusBadge status="simulation" />
+      </div>
+      <div className="mt-4 overflow-x-auto">
+        <table className="min-w-full text-xs">
+          <thead>
+            <tr>
+              <th>Model account</th>
+              <th>Cash</th>
+              <th>Value</th>
+              <th>Return</th>
+              <th>Win rate</th>
+              <th>Drawdown</th>
+              <th>Trades</th>
+              <th>Shorts</th>
+            </tr>
+          </thead>
+          <tbody>
+            {accounts.map((account) => (
+              <tr key={String(account.id)} className={String(account.id) === selectedSimulationAccountId ? "bg-cyan-500/5" : undefined}>
+                <td>
+                  <button type="button" onClick={() => onChangeSimulationAccount(String(account.id))} className="text-left hover:text-cyan-100">
+                    <div className="font-semibold text-slate-100">{String(account.name)}</div>
+                    <div className="text-[11px] text-slate-400">{String(account.provider_type || "manual")} · {String(account.model_name || "model unset")}</div>
+                  </button>
+                </td>
+                <td>{formatCurrency(Number(account.cash_balance || 0))}</td>
+                <td>{formatCurrency(Number(account.portfolio_value ?? account.cash_balance ?? 0))}</td>
+                <td>{formatPct(Number(account.total_return || 0))}</td>
+                <td>{formatPct(Number(account.win_rate || 0))}</td>
+                <td>{formatPct(Number(account.max_drawdown || 0))}</td>
+                <td>{String(account.trade_count ?? 0)}</td>
+                <td>{Boolean(account.short_enabled) ? "Enabled" : "Off"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -1247,9 +1456,18 @@ function OrderEntryPanel({
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label="Side">
             <select value={orderForm.side} onChange={(event) => onChange((current: any) => ({ ...current, side: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
-              <option value="buy">Buy</option>
-              <option value="sell">Sell</option>
+              {TRADE_ACTIONS.filter((action) => {
+                if (mode === "live" && ["short", "cover_short"].includes(action.value)) return Boolean(workspaceData.account.metadata.short_supported);
+                return true;
+              }).map((action) => (
+                <option key={action.value} value={action.value}>
+                  {action.label}
+                </option>
+              ))}
             </select>
+            <div className="mt-1 text-xs text-slate-500">
+              {TRADE_ACTIONS.find((action) => action.value === orderForm.side)?.help || "Order action."}
+            </div>
           </Field>
           <Field label="Order type">
             <select value={orderForm.order_type} onChange={(event) => onChange((current: any) => ({ ...current, order_type: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
@@ -1335,6 +1553,7 @@ function OrderEntryPanel({
             <SummaryChip label="Selected asset" value={selectedAsset ? `${selectedAsset.symbol} · ${selectedAsset.name}` : orderForm.asset_symbol || "-"} />
             <SummaryChip label="Estimated quantity" value={formatQuantity(derivedQuantity, 6)} />
             <SummaryChip label="Estimated notional" value={formatCurrency(orderNotional, currentCurrency)} />
+            <SummaryChip label="Available after reserve" value={formatCurrency(workspaceData.account.available_to_trade_cash || 0, currentCurrency)} />
           </div>
         </div>
 
@@ -1474,29 +1693,39 @@ function AutomationControlPanel({
           onChange={(next) => onChange((current) => (current ? { ...current, allowed_strategy_slugs: next } : current))}
           disabled={inheritsLive}
         />
-        <CheckList
-          title="Allowed providers"
-          description="Keep automation scoped to the provider/model profiles you trust for this lane."
-          items={providerOptions.map((provider) => ({ value: provider, label: provider }))}
-          value={automationForm.allowed_provider_types}
-          onChange={(next) => onChange((current) => (current ? { ...current, allowed_provider_types: next } : current))}
-          disabled={inheritsLive}
-        />
+        {mode === "live" ? (
+          <div className="rounded-2xl border border-border bg-black/20 p-4">
+            <div className="font-semibold text-slate-100">Live model lock</div>
+            <div className="mt-1 text-sm text-slate-400">Live automation may use exactly one configured live provider/model. Change it in Settings if needed.</div>
+            <div className="mt-4 rounded-xl border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100">
+              {String(workspaceData.controls.live_model_provider_type || automationForm.allowed_provider_types[0] || "No live model selected")}
+            </div>
+          </div>
+        ) : (
+          <CheckList
+            title="Allowed providers"
+            description="Keep automation scoped to the provider/model profiles you trust for this lane."
+            items={providerOptions.map((provider) => ({ value: provider, label: provider }))}
+            value={automationForm.allowed_provider_types}
+            onChange={(next) => onChange((current) => (current ? { ...current, allowed_provider_types: next } : current))}
+            disabled={inheritsLive}
+          />
+        )}
       </div>
 
       <div className="mt-4 grid gap-3 md:grid-cols-3">
-        <ToggleField
-          label="Allow buys"
-          checked={automationForm.tradable_actions.includes("buy")}
-          onChange={(checked) => onChange((current) => (current ? { ...current, tradable_actions: toggleListValue(current.tradable_actions, "buy", checked) } : current))}
-          disabled={inheritsLive}
-        />
-        <ToggleField
-          label="Allow sells"
-          checked={automationForm.tradable_actions.includes("sell")}
-          onChange={(checked) => onChange((current) => (current ? { ...current, tradable_actions: toggleListValue(current.tradable_actions, "sell", checked) } : current))}
-          disabled={inheritsLive}
-        />
+        {TRADE_ACTIONS.filter((action) => {
+          if (mode === "live" && ["short", "cover_short"].includes(action.value)) return Boolean(workspaceData.account.metadata.short_supported);
+          return true;
+        }).map((action) => (
+          <ToggleField
+            key={action.value}
+            label={<HelpTooltip label={`Allow ${action.label}`} help={action.help} />}
+            checked={automationForm.tradable_actions.includes(action.value)}
+            onChange={(checked) => onChange((current) => (current ? { ...current, tradable_actions: toggleListValue(current.tradable_actions, action.value, checked) } : current))}
+            disabled={inheritsLive}
+          />
+        ))}
         <ToggleField
           label="Profile enabled"
           checked={automationForm.enabled}
@@ -1839,13 +2068,6 @@ function formatInterval(seconds?: number | null) {
   if (safeSeconds < 120) return "1 minute";
   const minutes = Math.round(safeSeconds / 60);
   return `${minutes} minutes`;
-}
-
-function formatDateTime(value?: string | null) {
-  if (!value) return "Not scheduled";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Not scheduled";
-  return date.toLocaleString();
 }
 
 function toggleListValue(list: string[], value: string, enabled: boolean) {

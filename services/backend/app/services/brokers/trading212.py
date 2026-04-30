@@ -30,28 +30,39 @@ class Trading212BrokerAdapter(BaseBrokerAdapter):
         if not credentials.success:
             return credentials
         try:
-            payload = self._request_json(account, "/equity/account/summary")
+            summary_payload = self._account_summary(account)
         except Exception as exc:
             return BrokerResult(False, f"Trading212 validation failed: {exc}")
         return BrokerResult(
             True,
             "Trading212 credentials verified successfully.",
             {
-                "account_id": payload.get("id"),
-                "currency": payload.get("currencyCode"),
+                "account_id": summary_payload.get("id"),
+                "currency": summary_payload.get("currency") or summary_payload.get("currencyCode"),
+                "cash": (summary_payload.get("cash") or {}).get("availableToTrade")
+                if isinstance(summary_payload.get("cash"), dict)
+                else None,
+                "total": summary_payload.get("totalValue"),
                 "mode": account.mode,
             },
         )
 
     def get_account(self, account: BrokerAccount) -> BrokerResult:
         try:
-            payload = self._request_json(account, "/equity/account/summary")
+            payload = self._account_summary(account)
         except Exception as exc:
             return BrokerResult(False, f"Trading212 account sync failed: {exc}")
-        return BrokerResult(True, "Trading212 account summary retrieved.", payload)
+        return BrokerResult(True, "Trading212 account balance retrieved.", payload)
 
     def get_positions(self, account: BrokerAccount) -> BrokerResult:
-        return BrokerResult(False, "Trading212 positions sync TODO")
+        try:
+            payload = self._request_json(account, "/equity/positions")
+        except Exception as exc:
+            return BrokerResult(False, f"Trading212 positions sync failed: {exc}")
+        if not isinstance(payload, list):
+            return BrokerResult(False, "Trading212 positions response was not a list.", {"positions": []})
+        positions = [self._normalize_position(item) for item in payload if isinstance(item, dict)]
+        return BrokerResult(True, f"Trading212 returned {len(positions)} open position{'s' if len(positions) != 1 else ''}.", {"positions": positions})
 
     def get_orders(self, account: BrokerAccount) -> BrokerResult:
         return BrokerResult(False, "Trading212 order sync TODO")
@@ -66,10 +77,23 @@ class Trading212BrokerAdapter(BaseBrokerAdapter):
         return self.get_account(account)
 
     def sync_positions(self, account: BrokerAccount) -> BrokerResult:
-        return BrokerResult(False, "Trading212 positions sync TODO")
+        return self.get_positions(account)
 
     def sync_orders(self, account: BrokerAccount) -> BrokerResult:
         return BrokerResult(False, "Trading212 orders sync TODO")
+
+    def get_pies(self, account: BrokerAccount) -> BrokerResult:
+        try:
+            payload = self._request_json(account, "/equity/pies")
+        except Exception as exc:
+            return BrokerResult(False, f"Trading212 pies sync failed: {exc}", {"pies": []})
+        if not isinstance(payload, list):
+            return BrokerResult(False, "Trading212 pies response was not a list.", {"pies": []})
+        pies = [self._normalize_pie(item) for item in payload if isinstance(item, dict)]
+        return BrokerResult(True, f"Trading212 returned {len(pies)} pie{'s' if len(pies) != 1 else ''}.", {"pies": pies})
+
+    def sync_pies(self, account: BrokerAccount) -> BrokerResult:
+        return self.get_pies(account)
 
     def search_instruments(self, account: BrokerAccount, query: str) -> BrokerResult:
         normalized = self._normalize_query(query)
@@ -111,6 +135,74 @@ class Trading212BrokerAdapter(BaseBrokerAdapter):
 
         self._instrument_cache[cache_key] = (now, payload)
         return payload
+
+    def _account_summary(self, account: BrokerAccount) -> dict[str, Any]:
+        try:
+            payload = self._request_json(account, "/equity/account/summary")
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            # Older credentials/permissions may still allow the legacy info/cash pair.
+            pass
+        info_payload = self._request_json(account, "/equity/account/info")
+        cash_payload = self._request_json(account, "/equity/account/cash")
+        return {
+            "id": info_payload.get("id"),
+            "currency": info_payload.get("currencyCode"),
+            "currencyCode": info_payload.get("currencyCode"),
+            "cash": {
+                "availableToTrade": cash_payload.get("free") or cash_payload.get("availableToTrade"),
+                "reservedForOrders": cash_payload.get("blocked") or cash_payload.get("reservedForOrders"),
+                "inPies": cash_payload.get("pieCash") or cash_payload.get("inPies"),
+                **cash_payload,
+            },
+            "totalValue": cash_payload.get("total"),
+            "raw_info": info_payload,
+        }
+
+    def _normalize_position(self, item: dict[str, Any]) -> dict[str, Any]:
+        instrument = item.get("instrument") if isinstance(item.get("instrument"), dict) else {}
+        broker_ticker = str(item.get("ticker") or instrument.get("ticker") or "").upper()
+        parsed = self._parse_ticker(broker_ticker)
+        wallet = item.get("walletImpact") if isinstance(item.get("walletImpact"), dict) else {}
+        quantity = self._safe_float(item.get("quantity"))
+        average_price = self._safe_float(item.get("averagePricePaid") or item.get("averagePrice"))
+        current_price = self._safe_float(item.get("currentPrice"))
+        current_value = self._safe_float(wallet.get("currentValue"))
+        if current_price is None and current_value is not None and quantity:
+            current_price = current_value / quantity
+        return {
+            "broker_ticker": broker_ticker,
+            "symbol": parsed["display_symbol"] or parsed["symbol"] or broker_ticker,
+            "name": instrument.get("name") or broker_ticker,
+            "asset_type": str(instrument.get("type") or "stock").lower(),
+            "currency": instrument.get("currency") or wallet.get("currency") or "USD",
+            "exchange": parsed["exchange"],
+            "quantity": quantity or 0,
+            "quantity_available": self._safe_float(item.get("quantityAvailableForTrading")),
+            "quantity_in_pies": self._safe_float(item.get("quantityInPies")),
+            "avg_entry_price": average_price or current_price or 0,
+            "current_price": current_price or average_price or 0,
+            "current_value": current_value,
+            "total_cost": self._safe_float(wallet.get("totalCost")),
+            "unrealized_pnl": self._safe_float(wallet.get("unrealizedProfitLoss")),
+            "opened_at": item.get("createdAt"),
+            "raw": item,
+        }
+
+    def _normalize_pie(self, item: dict[str, Any]) -> dict[str, Any]:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        return {
+            "id": item.get("id"),
+            "status": item.get("status"),
+            "cash": self._safe_float(item.get("cash")),
+            "progress": self._safe_float(item.get("progress")),
+            "current_value": self._safe_float(result.get("priceAvgValue")),
+            "invested_value": self._safe_float(result.get("priceAvgInvestedValue")),
+            "result": self._safe_float(result.get("priceAvgResult")),
+            "result_pct": self._safe_float(result.get("priceAvgResultCoef")),
+            "raw": item,
+        }
 
     def _request_json(self, account: BrokerAccount, path: str) -> Any:
         credentials = self._resolve_credentials(account)
@@ -271,3 +363,11 @@ class Trading212BrokerAdapter(BaseBrokerAdapter):
 
     def _normalize_query(self, query: str) -> str:
         return query.strip().upper().replace(" ", "")
+
+    def _safe_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

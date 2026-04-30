@@ -26,6 +26,7 @@ def refresh_news(payload: NewsRefreshRequest | None = None, db: Session = Depend
         db,
         force_refresh=request_payload.force_refresh,
         backfill_hours=request_payload.backfill_hours,
+        run_type="manual",
     )
     db.commit()
     if refreshed.get("articles_added", 0):
@@ -35,4 +36,4 @@ def refresh_news(payload: NewsRefreshRequest | None = None, db: Session = Depend
 
 @router.post("/refresh-demo")
 def refresh_demo_news_alias(db: Session = Depends(get_db)) -> dict:
-    return refresh_news(db)
+    return refresh_news(NewsRefreshRequest(force_refresh=True), db)

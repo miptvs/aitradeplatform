@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models.asset import Asset
 from app.models.broker import BrokerAccount
-from app.models.portfolio import PortfolioSnapshot, Position
+from app.models.portfolio import Order, PortfolioSnapshot, Position
+from app.models.risk import RiskRule
 from app.models.signal import Signal, SignalEvaluation
 from app.models.simulation import SimulationAccount
 from app.models.strategy import Strategy
@@ -21,6 +22,7 @@ from app.services.alerts.service import alert_service
 from app.services.brokers.service import broker_service
 from app.services.market_data.service import market_data_service
 from app.services.portfolio.service import portfolio_service
+from app.services.providers.service import provider_service
 from app.services.simulation.service import simulation_service
 from app.services.strategies.service import strategy_service
 from app.utils.time import utcnow
@@ -30,7 +32,6 @@ settings = get_settings()
 
 class TradingWorkspaceService:
     _terminal_lane_outcomes = {
-        "approved",
         "sent_to_live_workflow",
         "simulated",
         "executed_live",
@@ -60,6 +61,10 @@ class TradingWorkspaceService:
             **config_updates,
             "inherit_from_live": inherit_from_live,
         }
+        if mode == "live":
+            live_model_provider = profile.config_json.get("live_model_provider_type")
+            if live_model_provider:
+                updates["allowed_provider_types"] = [str(live_model_provider)]
         for key, value in updates.items():
             setattr(profile, key, value)
         db.flush()
@@ -111,7 +116,7 @@ class TradingWorkspaceService:
             "approval_mode": effective_profile.approval_mode,
             "allowed_strategy_slugs": effective_profile.allowed_strategy_slugs,
             "tradable_actions": effective_profile.tradable_actions,
-            "allowed_provider_types": effective_profile.allowed_provider_types,
+            "allowed_provider_types": self._effective_allowed_providers(effective_profile),
             "confidence_threshold": effective_profile.confidence_threshold,
             "default_order_notional": effective_profile.default_order_notional,
             "stop_loss_pct": effective_profile.stop_loss_pct,
@@ -164,7 +169,7 @@ class TradingWorkspaceService:
             "trades": trades,
             "signals": self._workspace_signals(db, mode),
             "recommendations": self._workspace_recommendations(db, mode),
-            "alerts": alert_service.list_alerts(db, mode=mode),
+            "alerts": self._workspace_alerts(db, mode, simulation_account if mode == "simulation" else None),
             "assets": market_data_service.list_asset_views(db),
             "strategies": [self._strategy_view(item) for item in strategy_service.list_strategies(db)],
             "controls": controls,
@@ -193,11 +198,21 @@ class TradingWorkspaceService:
         active_simulation = self._resolve_simulation_account(db, simulation_account_id) if mode == "simulation" else None
 
         if mode == "live" and active_broker is None:
-            return self._finalize_profile_run(stored_profile, "blocked", "No enabled live broker account is configured for automation.", decisions)
+            return self._blocked_run_with_audit(db, stored_profile, mode, "Trading212 is not connected. Live automation cannot use a fake balance.", decisions)
         if mode == "simulation" and active_simulation is None:
             return self._finalize_profile_run(stored_profile, "blocked", "No simulation account is available for automation.", decisions)
+        if mode == "live":
+            live_model_error = self._live_model_block_reason(db, profile)
+            if live_model_error:
+                return self._blocked_run_with_audit(db, stored_profile, mode, live_model_error, decisions)
 
-        candidates = self._automation_candidates(db, mode, profile)
+        candidates = self._automation_candidates(
+            db,
+            mode,
+            profile,
+            simulation_account=active_simulation,
+            broker_account=active_broker,
+        )
         if not candidates:
             return self._finalize_profile_run(stored_profile, "noop", "No eligible candidate signals matched the current automation policy.", decisions)
 
@@ -209,8 +224,9 @@ class TradingWorkspaceService:
                 decisions.append(self._reject_signal(db, signal, mode, "Signal asset is missing from the current asset universe."))
                 rejected_signals += 1
                 continue
-            if signal.action not in {"buy", "sell"}:
-                decisions.append(self._reject_signal(db, signal, mode, "Only buy and sell signals are tradable."))
+            order_side = self._order_side_for_signal(signal.action, mode=mode, simulation_account=active_simulation)
+            if order_side is None:
+                decisions.append(self._reject_signal(db, signal, mode, f"{signal.action.upper()} is not executable in this workspace."))
                 rejected_signals += 1
                 continue
 
@@ -220,16 +236,33 @@ class TradingWorkspaceService:
                 rejected_signals += 1
                 continue
 
-            quantity = round(profile.default_order_notional / entry_price, 8)
+            sizing = self._automation_quantity(
+                db,
+                mode=mode,
+                signal=signal,
+                side=order_side,
+                entry_price=entry_price,
+                profile=profile,
+                simulation_account=active_simulation,
+                broker_account=active_broker,
+                submitted_orders=submitted_orders,
+            )
+            if not sizing["executable"]:
+                decisions.append(self._reject_signal(db, signal, mode, sizing["reason"], outcome="blocked_by_risk"))
+                rejected_signals += 1
+                continue
+            quantity = round(float(sizing["quantity"]), 8)
             if quantity <= 0:
                 decisions.append(self._reject_signal(db, signal, mode, "Configured default notional is too small for this symbol."))
                 rejected_signals += 1
                 continue
 
-            stop_loss = signal.suggested_stop_loss or self._protective_level(entry_price, profile.stop_loss_pct, signal.action, direction="down")
-            take_profit = signal.suggested_take_profit or self._protective_level(entry_price, profile.take_profit_pct, signal.action, direction="up")
+            stop_loss = signal.suggested_stop_loss or self._protective_level(entry_price, profile.stop_loss_pct, order_side, direction="down")
+            take_profit = signal.suggested_take_profit or self._protective_level(entry_price, profile.take_profit_pct, order_side, direction="up")
             trailing_stop = self._trailing_distance(entry_price, profile.trailing_stop_pct)
             decision_reason = f"{profile.approval_mode.replace('_', ' ')} automation from signal {signal.id}"
+            if sizing.get("sizing_note"):
+                decision_reason = f"{decision_reason}. {sizing['sizing_note']}"
 
             if profile.approval_mode in {"manual_only", "semi_automatic"}:
                 queued_outcome = "sent_to_live_workflow" if mode == "live" else "approved"
@@ -264,7 +297,7 @@ class TradingWorkspaceService:
                 OrderCreate(
                     asset_id=signal.asset_id,
                     mode=mode,
-                    side=signal.action,
+                    side=order_side,
                     quantity=quantity,
                     requested_price=entry_price,
                     order_type="market",
@@ -417,7 +450,7 @@ class TradingWorkspaceService:
             "execution_interval_seconds": 300,
             "approval_mode": "semi_automatic",
             "allowed_strategy_slugs": [],
-            "tradable_actions": ["buy", "sell"],
+            "tradable_actions": ["buy", "sell", "close_long", "reduce_long"],
             "allowed_provider_types": [],
             "confidence_threshold": 0.58,
             "default_order_notional": 100.0,
@@ -451,7 +484,26 @@ class TradingWorkspaceService:
             "decisions": decisions,
         }
 
-    def _reject_signal(self, db: Session, signal: Signal, mode: str, reason: str) -> dict[str, Any]:
+    def _blocked_run_with_audit(
+        self,
+        db: Session,
+        profile: TradingAutomationProfile,
+        mode: str,
+        message: str,
+        decisions: list[dict[str, Any]],
+    ) -> dict:
+        audit_service.log(
+            db,
+            actor="system",
+            action="automation.blocked",
+            target_type="trading_automation_profile",
+            target_id=profile.id,
+            mode=mode,
+            details={"reason": message},
+        )
+        return self._finalize_profile_run(profile, "blocked", message, decisions)
+
+    def _reject_signal(self, db: Session, signal: Signal, mode: str, reason: str, *, outcome: str = "rejected") -> dict[str, Any]:
         db.add(
             SignalEvaluation(
                 signal_id=signal.id,
@@ -459,7 +511,7 @@ class TradingWorkspaceService:
                 evaluator=f"{mode}-automation",
                 reason=reason,
                 expected_return=signal.estimated_risk_reward,
-                outcome="rejected",
+                outcome=outcome,
             )
         )
         asset = db.get(Asset, signal.asset_id)
@@ -470,14 +522,92 @@ class TradingWorkspaceService:
             "confidence": signal.confidence,
             "strategy_slug": signal.metadata_json.get("preferred_strategy"),
             "provider_type": signal.provider_type,
-            "outcome": "rejected",
+            "outcome": outcome,
             "reason": reason,
             "order_id": None,
+        }
+
+    def _automation_quantity(
+        self,
+        db: Session,
+        *,
+        mode: str,
+        signal: Signal,
+        side: str,
+        entry_price: float,
+        profile: TradingAutomationProfile,
+        simulation_account: SimulationAccount | None,
+        broker_account: BrokerAccount | None,
+        submitted_orders: int,
+    ) -> dict[str, Any]:
+        desired_notional = max(float(profile.default_order_notional or 0), 0.0)
+        if side in {"sell", "cover_short"}:
+            held_quantity = self._held_quantity(db, signal.asset_id, mode, simulation_account, broker_account)
+            closeable_quantity = abs(held_quantity) if side == "cover_short" and held_quantity < 0 else max(held_quantity, 0.0)
+            if closeable_quantity <= 0:
+                return {
+                    "executable": False,
+                    "reason": f"{signal.action.upper()} was not processed because this account has no matching position to close or reduce.",
+                }
+            desired_quantity = desired_notional / entry_price if desired_notional > 0 else closeable_quantity
+            quantity = min(closeable_quantity, desired_quantity)
+            return {
+                "executable": quantity > 0,
+                "quantity": quantity,
+                "sizing_note": f"Sized to {round(quantity, 6)} because the account currently holds {round(closeable_quantity, 6)} shares.",
+            }
+
+        available_to_trade = self._available_to_trade_for_mode(db, mode, simulation_account, broker_account)
+        if available_to_trade <= 0:
+            return {
+                "executable": False,
+                "reason": "Order not processed because the cash reserve rule leaves no available-to-trade cash.",
+            }
+
+        remaining_slots = max(int(profile.max_orders_per_run or 1) - submitted_orders, 1)
+        per_order_budget = max(available_to_trade / remaining_slots, 0.0)
+        order_notional = min(desired_notional or per_order_budget, per_order_budget)
+        if order_notional <= 0.01:
+            return {
+                "executable": False,
+                "reason": "Order not processed because available-to-trade cash is below the minimum fractional order budget.",
+            }
+
+        sizing_note = None
+        if desired_notional and order_notional < desired_notional:
+            sizing_note = (
+                f"Fractional sizing reduced notional from {desired_notional:.2f} to {order_notional:.2f} "
+                "to respect cash reserve and leave room for other positions."
+            )
+        return {
+            "executable": True,
+            "quantity": order_notional / entry_price,
+            "sizing_note": sizing_note,
         }
 
     def _workspace_signals(self, db: Session, mode: str) -> list[dict]:
         signals = list(db.scalars(select(Signal).order_by(desc(Signal.occurred_at)).limit(40)))
         return [self._signal_view(db, signal) for signal in signals[:12]]
+
+    def _workspace_alerts(self, db: Session, mode: str, simulation_account: SimulationAccount | None = None) -> list:
+        alerts = alert_service.list_alerts(db, mode=mode)
+        if mode != "simulation" or simulation_account is None:
+            return alerts
+
+        scoped_alerts = []
+        for alert in alerts:
+            if alert.mode in {None, "system"}:
+                scoped_alerts.append(alert)
+                continue
+            if not alert.source_ref:
+                scoped_alerts.append(alert)
+                continue
+            order = db.get(Order, alert.source_ref)
+            if order is None:
+                continue
+            if (order.audit_context or {}).get("simulation_account_id") == simulation_account.id:
+                scoped_alerts.append(alert)
+        return scoped_alerts
 
     def _workspace_recommendations(self, db: Session, mode: str) -> list[dict]:
         signals = list(
@@ -540,6 +670,16 @@ class TradingWorkspaceService:
         signal = db.get(Signal, signal_id)
         if signal is None:
             raise ValueError("Signal not found.")
+        if mode == "live":
+            _, profile, _ = self.resolve_profile_pair(db, "live")
+            live_model_error = self._live_model_block_reason(db, profile)
+            if live_model_error:
+                raise ValueError(live_model_error)
+            configured_provider = self._configured_live_provider(profile)
+            if configured_provider and signal.provider_type != configured_provider:
+                raise ValueError(
+                    f"Live trading is locked to {configured_provider}; this signal came from {signal.provider_type or 'unknown'}."
+                )
 
         latest_mode_evaluation = self._latest_mode_evaluation(db, signal.id, mode)
         if latest_mode_evaluation and latest_mode_evaluation.outcome in self._terminal_lane_outcomes:
@@ -583,32 +723,88 @@ class TradingWorkspaceService:
             "order_id": None,
         }
 
-    def _automation_candidates(self, db: Session, mode: str, profile: TradingAutomationProfile) -> list[Signal]:
+    def _automation_candidates(
+        self,
+        db: Session,
+        mode: str,
+        profile: TradingAutomationProfile,
+        *,
+        simulation_account: SimulationAccount | None = None,
+        broker_account: BrokerAccount | None = None,
+    ) -> list[Signal]:
         signals = list(
             db.scalars(
                 select(Signal)
                 .where(Signal.source_kind == "agent")
                 .order_by(desc(Signal.occurred_at))
-                .limit(60)
+                .limit(1000)
             )
         )
 
-        results: list[Signal] = []
+        approved_results: list[Signal] = []
+        fresh_results: list[Signal] = []
         for signal in signals:
             latest_mode_evaluation = self._latest_mode_evaluation(db, signal.id, mode)
             if latest_mode_evaluation and latest_mode_evaluation.outcome in self._terminal_lane_outcomes:
                 continue
-            if signal.action not in profile.tradable_actions:
+            manually_approved = bool(latest_mode_evaluation and latest_mode_evaluation.outcome == "approved")
+            if not manually_approved:
+                if signal.action not in self._effective_tradable_actions(profile, simulation_account):
+                    continue
+                if signal.confidence < profile.confidence_threshold:
+                    continue
+                if not self._signal_matches_strategy_allowlist(signal, profile.allowed_strategy_slugs):
+                    continue
+                allowed_provider_types = self._effective_allowed_providers(profile)
+                if allowed_provider_types and signal.provider_type not in allowed_provider_types:
+                    continue
+            order_side = self._order_side_for_signal(signal.action, mode=mode, simulation_account=simulation_account)
+            if order_side is None:
                 continue
-            if signal.confidence < profile.confidence_threshold:
+            if order_side in {"sell", "cover_short"}:
+                held_quantity = self._held_quantity(db, signal.asset_id, mode, simulation_account, broker_account)
+                if order_side == "cover_short" and held_quantity >= 0:
+                    continue
+                if order_side == "sell" and held_quantity <= 0:
+                    continue
+            if manually_approved:
+                approved_results.append(signal)
+            else:
+                fresh_results.append(signal)
+        return [*approved_results, *fresh_results]
+
+    def _effective_tradable_actions(self, profile: TradingAutomationProfile, simulation_account: SimulationAccount | None = None) -> set[str]:
+        actions = {str(action).lower() for action in (profile.tradable_actions or [])}
+        # If selling is enabled, exit-style signal actions should be eligible
+        # too. They still require an actual held position before execution.
+        if "sell" in actions:
+            actions.update({"close_long", "reduce_long"})
+        if simulation_account and simulation_account.short_enabled:
+            if "short" in actions:
+                actions.add("cover_short")
+        return actions
+
+    def _signal_matches_strategy_allowlist(self, signal: Signal, allowed_strategy_slugs: list[str] | None) -> bool:
+        if not allowed_strategy_slugs:
+            return True
+        metadata = signal.metadata_json or {}
+        preferred_strategy = metadata.get("preferred_strategy") or metadata.get("strategy_slug")
+        if preferred_strategy in allowed_strategy_slugs:
+            return True
+
+        # Blended signals often carry the winning component votes. Treat a blended
+        # signal as eligible when an allowed component agreed with the final action.
+        strategy_votes = (signal.indicators_json or {}).get("strategy_votes") or {}
+        normalized_action = str(signal.action).lower()
+        for slug in allowed_strategy_slugs:
+            vote = strategy_votes.get(slug)
+            if not isinstance(vote, dict):
                 continue
-            preferred_strategy = signal.metadata_json.get("preferred_strategy")
-            if profile.allowed_strategy_slugs and preferred_strategy not in profile.allowed_strategy_slugs:
-                continue
-            if profile.allowed_provider_types and signal.provider_type not in profile.allowed_provider_types:
-                continue
-            results.append(signal)
-        return results
+            vote_action = str(vote.get("action") or "").lower()
+            vote_confidence = float(vote.get("confidence") or 0)
+            if vote_action == normalized_action and vote_confidence > 0:
+                return True
+        return False
 
     def _strategy_view(self, strategy: Strategy) -> dict[str, Any]:
         return {
@@ -623,48 +819,225 @@ class TradingWorkspaceService:
 
     def _resolve_live_broker(self, db: Session, broker_account_id: str | None = None) -> BrokerAccount | None:
         if broker_account_id:
-            return db.get(BrokerAccount, broker_account_id)
+            account = db.get(BrokerAccount, broker_account_id)
+            return account if account and account.broker_type == "trading212" else None
         return db.scalar(
             select(BrokerAccount)
-            .where(BrokerAccount.mode == "live", BrokerAccount.enabled.is_(True))
-            .order_by(BrokerAccount.live_trading_enabled.desc(), BrokerAccount.updated_at.desc())
+            .where(BrokerAccount.mode == "live", BrokerAccount.enabled.is_(True), BrokerAccount.broker_type == "trading212")
+            .order_by(BrokerAccount.updated_at.desc())
             .limit(1)
         )
 
     def _resolve_simulation_account(self, db: Session, simulation_account_id: str | None = None) -> SimulationAccount | None:
+        simulation_service.ensure_model_accounts(db)
         if simulation_account_id:
             return db.get(SimulationAccount, simulation_account_id)
         return db.scalar(
             select(SimulationAccount).order_by(SimulationAccount.is_active.desc(), SimulationAccount.updated_at.desc()).limit(1)
         )
 
+    def _effective_allowed_providers(self, profile: TradingAutomationProfile) -> list[str]:
+        configured_live_provider = self._configured_live_provider(profile)
+        if profile.mode == "live" and configured_live_provider:
+            return [configured_live_provider]
+        return profile.allowed_provider_types or []
+
+    def _configured_live_provider(self, profile: TradingAutomationProfile) -> str | None:
+        value = (profile.config_json or {}).get("live_model_provider_type")
+        if value:
+            return str(value)
+        if profile.mode == "live" and len(profile.allowed_provider_types or []) == 1:
+            return profile.allowed_provider_types[0]
+        return None
+
+    def _live_model_block_reason(self, db: Session, profile: TradingAutomationProfile) -> str | None:
+        configured_provider = self._configured_live_provider(profile)
+        if not configured_provider:
+            return "Live automation requires exactly one configured Live trading model in Settings."
+        config = provider_service.get_config(db, configured_provider)
+        if config is None:
+            return f"Configured live model profile {configured_provider} does not exist."
+        try:
+            provider_profile = provider_service.get_profile(configured_provider)
+        except ValueError as exc:
+            return str(exc)
+        if provider_profile.trading_mode != "live":
+            return f"{configured_provider} is not a live/actual-trading provider profile."
+        if not config.enabled:
+            return f"Configured live model profile {configured_provider} is disabled."
+        if config.last_health_status == "error":
+            return f"Configured live model profile {configured_provider} is unhealthy: {config.last_health_message or 'provider health check failed'}."
+        return None
+
+    def _order_side_for_signal(
+        self,
+        action: str,
+        *,
+        mode: str,
+        simulation_account: SimulationAccount | None = None,
+    ) -> str | None:
+        normalized = str(action).strip().lower()
+        if normalized in {"buy", "sell"}:
+            return normalized
+        if normalized in {"close_long", "reduce_long"}:
+            return "sell"
+        if normalized == "short":
+            if mode == "simulation" and simulation_account and simulation_account.short_enabled:
+                return "short"
+            return None
+        if normalized == "cover_short":
+            if mode == "simulation" and simulation_account and simulation_account.short_enabled:
+                return "cover_short"
+            return None
+        return None
+
+    def _cash_reserve_summary(
+        self,
+        db: Session,
+        mode: str,
+        cash_balance: float,
+        total_value: float,
+        simulation_account: SimulationAccount | None = None,
+    ) -> dict[str, float]:
+        rule = db.scalar(select(RiskRule).where(RiskRule.rule_type == "cash_reserve", RiskRule.enabled.is_(True)).limit(1))
+        reserve_pct = 0.0
+        if rule is not None:
+            if mode == "simulation" and simulation_account and simulation_account.min_cash_reserve_percent is not None:
+                reserve_pct = float(simulation_account.min_cash_reserve_percent)
+            else:
+                mode_key = "simulation_override_pct" if mode == "simulation" else "live_override_pct"
+                reserve_pct = float((rule.config_json or {}).get(mode_key) or (rule.config_json or {}).get("min_cash_reserve_pct") or 0)
+        reserve_pct = max(0.0, min(1.0, reserve_pct))
+        reserve_amount = max(total_value, 0.0) * reserve_pct
+        return {
+            "cash_reserve_percent": round(reserve_pct, 4),
+            "cash_reserve_amount": round(reserve_amount, 2),
+            "available_to_trade_cash": round(max(cash_balance - reserve_amount, 0.0), 2),
+        }
+
+    def _available_to_trade_for_mode(
+        self,
+        db: Session,
+        mode: str,
+        simulation_account: SimulationAccount | None,
+        broker_account: BrokerAccount | None,
+    ) -> float:
+        if mode == "simulation" and simulation_account is not None:
+            positions = [
+                position
+                for position in portfolio_service.list_positions(db, mode="simulation", simulation_account_id=simulation_account.id)
+                if position["status"] == "open"
+            ]
+            total_value = simulation_account.cash_balance + sum(position["current_price"] * position["quantity"] for position in positions)
+            return float(self._cash_reserve_summary(db, "simulation", simulation_account.cash_balance, total_value, simulation_account)["available_to_trade_cash"])
+        if mode == "live" and broker_account is not None:
+            cash = float(broker_account.settings_json.get("available_cash") or broker_account.settings_json.get("cash_balance") or 0)
+            total_value = float(broker_account.settings_json.get("total_value") or cash)
+            return float(self._cash_reserve_summary(db, "live", cash, total_value)["available_to_trade_cash"])
+        return 0.0
+
+    def _held_quantity(
+        self,
+        db: Session,
+        asset_id: str,
+        mode: str,
+        simulation_account: SimulationAccount | None,
+        broker_account: BrokerAccount | None,
+    ) -> float:
+        stmt = select(Position).where(Position.asset_id == asset_id, Position.mode == mode, Position.status == "open")
+        if simulation_account is not None:
+            stmt = stmt.where(Position.simulation_account_id == simulation_account.id)
+        if broker_account is not None:
+            stmt = stmt.where(Position.broker_account_id == broker_account.id)
+        position = db.scalar(stmt.limit(1))
+        return float(position.quantity if position else 0)
+
+    def _simulation_account_comparison_item(self, db: Session, account: SimulationAccount) -> dict[str, Any]:
+        positions = [position for position in portfolio_service.list_positions(db, mode="simulation", simulation_account_id=account.id) if position["status"] == "open"]
+        trades = portfolio_service.list_trades(db, mode="simulation", simulation_account_id=account.id)
+        equity = sum(position["current_price"] * position["quantity"] for position in positions)
+        total_value = account.cash_balance + equity
+        reserve = self._cash_reserve_summary(db, "simulation", account.cash_balance, total_value, account)
+        wins = [trade for trade in trades if trade["realized_pnl"] > 0]
+        equity_curve = [
+            snapshot.total_value
+            for snapshot in db.scalars(
+                select(PortfolioSnapshot)
+                .where(PortfolioSnapshot.mode == "simulation", PortfolioSnapshot.simulation_account_id == account.id)
+                .order_by(PortfolioSnapshot.timestamp.asc())
+                .limit(200)
+            )
+        ]
+        peak = equity_curve[0] if equity_curve else account.starting_cash
+        max_drawdown = 0.0
+        for value in equity_curve:
+            peak = max(peak, value)
+            if peak:
+                max_drawdown = min(max_drawdown, (value - peak) / peak)
+        return {
+            "id": account.id,
+            "name": account.name,
+            "provider_type": account.provider_type,
+            "model_name": account.model_name,
+            "starting_cash": account.starting_cash,
+            "cash_balance": account.cash_balance,
+            "portfolio_value": round(total_value, 2),
+            "available_to_trade_cash": reserve["available_to_trade_cash"],
+            "cash_reserve_percent": reserve["cash_reserve_percent"],
+            "fees_bps": account.fees_bps,
+            "slippage_bps": account.slippage_bps,
+            "latency_ms": account.latency_ms,
+            "short_enabled": account.short_enabled,
+            "is_active": account.is_active,
+            "realized_pnl": round(sum(trade["realized_pnl"] for trade in trades), 2),
+            "unrealized_pnl": round(sum(position["unrealized_pnl"] for position in positions), 2),
+            "total_return": round(((total_value - account.starting_cash) / account.starting_cash) if account.starting_cash else 0, 4),
+            "win_rate": round((len(wins) / len(trades)) if trades else 0, 4),
+            "max_drawdown": round(max_drawdown, 4),
+            "trade_count": len(trades),
+            "reset_count": account.reset_count,
+        }
+
     def _live_account_summary(self, db: Session) -> tuple[dict[str, Any], dict[str, Any]]:
         broker_account = self._resolve_live_broker(db)
-        live_positions = portfolio_service.list_positions(db, mode="live")
+        live_positions = [position for position in portfolio_service.list_positions(db, mode="live") if position["status"] == "open"]
         live_orders = portfolio_service.list_orders(db, mode="live")
         live_trades = portfolio_service.list_trades(db, mode="live")
-        latest_snapshot = db.scalar(
-            select(PortfolioSnapshot).where(PortfolioSnapshot.mode == "live").order_by(desc(PortfolioSnapshot.timestamp)).limit(1)
-        )
 
-        fallback_cash = 0.0
         base_currency = "USD"
-        broker_status = "scaffolded"
+        broker_status = "disconnected"
         broker_type = None
         supports_execution = False
+        cash = 0.0
+        total_value = 0.0
+        equity = 0.0
+        realized = sum(trade["realized_pnl"] for trade in live_trades)
+        unrealized = sum(position["unrealized_pnl"] for position in live_positions)
+        last_sync_error = None
+        synced = False
         if broker_account is not None:
-            fallback_cash = float(broker_account.settings_json.get("available_cash", 0) or 0)
+            synced = broker_account.settings_json.get("available_cash") is not None or broker_account.settings_json.get("total_value") is not None
+            cash = float(broker_account.settings_json.get("available_cash") or broker_account.settings_json.get("cash_balance") or 0)
+            equity = float(broker_account.settings_json.get("invested_value") or 0)
+            total_value = float(broker_account.settings_json.get("total_value") or cash + equity)
+            realized = float(broker_account.settings_json.get("realized_pnl") or realized)
+            unrealized = float(broker_account.settings_json.get("unrealized_pnl") or unrealized)
             base_currency = str(broker_account.settings_json.get("currency", "USD"))
             broker_status = broker_account.status
             broker_type = broker_account.broker_type
             adapter = broker_service.get_adapter(broker_account.broker_type)
             supports_execution = adapter.capability.supports_execution
+            latest_sync = broker_service.latest_sync_event(db, broker_account.id)
+            if latest_sync and latest_sync.status == "error":
+                last_sync_error = (latest_sync.details_json or {}).get("account_message") or (latest_sync.details_json or {}).get("message")
 
-        equity = sum(position["current_price"] * position["quantity"] for position in live_positions)
-        cash = latest_snapshot.cash if latest_snapshot else fallback_cash
-        total_value = latest_snapshot.total_value if latest_snapshot else cash + equity
-        realized = latest_snapshot.realized_pnl if latest_snapshot else sum(trade["realized_pnl"] for trade in live_trades)
-        unrealized = latest_snapshot.unrealized_pnl if latest_snapshot else sum(position["unrealized_pnl"] for position in live_positions)
+        reserve = self._cash_reserve_summary(db, "live", cash, total_value)
+        if broker_account is None:
+            safety_message = "Trading212 not connected. Live balances are hidden until a real broker sync succeeds."
+        elif not synced:
+            safety_message = "Trading212 is configured but no live cash balance has been synced yet. Use Sync now."
+        else:
+            safety_message = "Trading212 live cash was synced. Live execution remains backend-guarded and risk-validated."
 
         account = {
             "mode": "live",
@@ -674,19 +1047,29 @@ class TradingWorkspaceService:
             "status": broker_status,
             "base_currency": base_currency,
             "total_value": round(total_value, 2),
+            "total_cash": round(cash, 2),
             "cash_available": round(cash, 2),
+            "available_to_trade_cash": reserve["available_to_trade_cash"],
+            "cash_reserve_percent": reserve["cash_reserve_percent"],
+            "cash_reserve_amount": reserve["cash_reserve_amount"],
             "equity": round(equity, 2),
             "realized_pnl": round(realized, 2),
             "unrealized_pnl": round(unrealized, 2),
             "open_positions_count": len(live_positions),
             "active_orders_count": len([order for order in live_orders if order["status"] in {"pending", "accepted"}]),
             "total_trades_count": len(live_trades),
-            "safety_message": "Live execution remains backend-guarded and passes through the risk engine before any broker call.",
+            "safety_message": safety_message,
             "live_execution_enabled": settings.enable_live_trading and bool(broker_account and broker_account.live_trading_enabled),
             "manual_position_supported": True,
             "metadata": {
                 "supports_execution": supports_execution,
                 "backend_live_trading_enabled": settings.enable_live_trading,
+                "broker_synced": synced,
+                "last_sync_error": last_sync_error,
+                "synced_positions": broker_account.settings_json.get("synced_positions", []) if broker_account else [],
+                "synced_pies": broker_account.settings_json.get("synced_pies", []) if broker_account else [],
+                "short_supported": False,
+                "live_model_provider_type": self._configured_live_provider(self.get_or_create_profile(db, "live")),
             },
         }
         controls = {
@@ -694,6 +1077,8 @@ class TradingWorkspaceService:
             "broker_execution_supported": supports_execution,
             "active_broker_account_id": broker_account.id if broker_account else None,
             "broker_accounts": [broker_service.serialize_runtime_account(db, account) for account in broker_service.list_accounts(db)],
+            "synced_pies": broker_account.settings_json.get("synced_pies", []) if broker_account else [],
+            "live_model_provider_type": self._configured_live_provider(self.get_or_create_profile(db, "live")),
         }
         return account, controls
 
@@ -708,7 +1093,11 @@ class TradingWorkspaceService:
                     "status": "warning",
                     "base_currency": "USD",
                     "total_value": 0,
+                    "total_cash": 0,
                     "cash_available": 0,
+                    "available_to_trade_cash": 0,
+                    "cash_reserve_percent": 0,
+                    "cash_reserve_amount": 0,
                     "equity": 0,
                     "realized_pnl": 0,
                     "unrealized_pnl": 0,
@@ -724,8 +1113,12 @@ class TradingWorkspaceService:
             )
 
         simulation_summary = simulation_service.summary(db, account.id)
-        positions = portfolio_service.list_positions(db, mode="simulation", simulation_account_id=account.id)
+        all_positions = portfolio_service.list_positions(db, mode="simulation", simulation_account_id=account.id)
+        positions = [position for position in all_positions if position["status"] == "open"]
         orders = portfolio_service.list_orders(db, mode="simulation", simulation_account_id=account.id)
+        signed_equity = sum(position["current_price"] * position["quantity"] for position in positions)
+        total_value = account.cash_balance + signed_equity
+        reserve = self._cash_reserve_summary(db, "simulation", account.cash_balance, total_value, account)
         account_summary = {
             "mode": "simulation",
             "account_id": account.id,
@@ -733,9 +1126,13 @@ class TradingWorkspaceService:
             "broker_type": "simulation",
             "status": "ok",
             "base_currency": "USD",
-            "total_value": round(account.cash_balance + sum(position["current_price"] * position["quantity"] for position in positions), 2),
+            "total_value": round(total_value, 2),
+            "total_cash": round(account.cash_balance, 2),
             "cash_available": round(account.cash_balance, 2),
-            "equity": round(sum(position["current_price"] * position["quantity"] for position in positions), 2),
+            "available_to_trade_cash": reserve["available_to_trade_cash"],
+            "cash_reserve_percent": reserve["cash_reserve_percent"],
+            "cash_reserve_amount": reserve["cash_reserve_amount"],
+            "equity": round(signed_equity, 2),
             "realized_pnl": round(sum(position["realized_pnl"] for position in positions), 2),
             "unrealized_pnl": round(sum(position["unrealized_pnl"] for position in positions), 2),
             "open_positions_count": len(positions),
@@ -749,23 +1146,14 @@ class TradingWorkspaceService:
                 "slippage_bps": account.slippage_bps,
                 "latency_ms": account.latency_ms,
                 "reset_count": account.reset_count,
+                "provider_type": account.provider_type,
+                "model_name": account.model_name,
+                "short_enabled": account.short_enabled,
             },
         }
         controls = {
             "active_simulation_account_id": account.id,
-            "simulation_accounts": [
-                {
-                    "id": item.id,
-                    "name": item.name,
-                    "starting_cash": item.starting_cash,
-                    "cash_balance": item.cash_balance,
-                    "fees_bps": item.fees_bps,
-                    "slippage_bps": item.slippage_bps,
-                    "latency_ms": item.latency_ms,
-                    "is_active": item.is_active,
-                }
-                for item in simulation_service.list_accounts(db)
-            ],
+            "simulation_accounts": [self._simulation_account_comparison_item(db, item) for item in simulation_service.list_accounts(db)],
         }
         return account_summary, controls
 

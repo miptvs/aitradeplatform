@@ -83,6 +83,13 @@ def positions(account_id: str | None = Query(default=None), db: Session = Depend
     return portfolio_service.list_positions(db, mode="simulation", simulation_account_id=account_id)
 
 
+@router.delete("/positions/closed")
+def clean_closed_positions(account_id: str | None = Query(default=None), db: Session = Depends(get_db)) -> dict:
+    result = portfolio_service.archive_closed_positions(db, mode="simulation", simulation_account_id=account_id)
+    db.commit()
+    return result
+
+
 @router.get("/orders")
 def orders(account_id: str | None = Query(default=None), db: Session = Depends(get_db)) -> list[dict]:
     return portfolio_service.list_orders(db, mode="simulation", simulation_account_id=account_id)

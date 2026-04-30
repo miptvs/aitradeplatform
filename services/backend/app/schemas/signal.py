@@ -10,7 +10,11 @@ from app.schemas.portfolio import OrderRead, PositionRead, TradeRead
 class SignalRead(ORMModel):
     id: str
     asset_id: str
+    symbol: str
+    asset_name: str
     strategy_id: str | None = None
+    strategy_slug: str | None = None
+    strategy_name: str | None = None
     action: str
     confidence: float
     status: str
@@ -47,10 +51,6 @@ class SignalEvaluationRead(ORMModel):
 
 
 class SignalDetailRead(SignalRead):
-    symbol: str
-    asset_name: str
-    strategy_slug: str | None = None
-    strategy_name: str | None = None
     related_news: list[NewsArticleRead] = Field(default_factory=list)
     related_events: list[ExtractedEventRead] = Field(default_factory=list)
 
@@ -71,6 +71,8 @@ class SignalTraceRead(BaseModel):
 class SignalGenerationResponse(BaseModel):
     provider_type: str
     status: str = "success"
+    run_type: str = "manual"
+    observed_at: str | None = None
     created_signal_ids: list[str] = Field(default_factory=list)
     created_count: int = 0
     message: str

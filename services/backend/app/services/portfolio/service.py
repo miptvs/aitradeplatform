@@ -25,8 +25,11 @@ class PortfolioService:
         mode: str | None = None,
         simulation_account_id: str | None = None,
         broker_account_id: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict]:
         stmt = select(Position).order_by(desc(Position.updated_at)).limit(200)
+        if not include_archived:
+            stmt = stmt.where(Position.status != "archived")
         if mode:
             stmt = stmt.where(Position.mode == mode)
         if simulation_account_id:
@@ -106,26 +109,44 @@ class PortfolioService:
             raise ValueError("Position not found")
         if quantity is not None and close_percent is not None:
             raise ValueError("Provide either quantity or close_percent, not both")
+        if position.status == "archived":
+            raise ValueError("Archived positions cannot be closed.")
+        if position.status == "closed" or abs(position.quantity) <= 1e-8:
+            position.status = "closed"
+            position.quantity = 0
+            position.closed_at = position.closed_at or utcnow()
+            db.flush()
+            return position
 
+        position_size = abs(position.quantity)
         if close_percent is not None:
             if close_percent <= 0 or close_percent > 100:
                 raise ValueError("close_percent must be between 0 and 100")
-            close_quantity = position.quantity * (close_percent / 100)
+            close_quantity = position_size * (close_percent / 100)
         else:
-            close_quantity = quantity or position.quantity
+            close_quantity = quantity or position_size
 
         close_quantity = round(close_quantity, 8)
         if close_quantity <= 0:
             raise ValueError("Close quantity must be positive")
-        if close_quantity > position.quantity:
+        close_quantity = min(close_quantity, position_size)
+        if close_quantity <= 0:
             raise ValueError("Close quantity exceeds current position size")
-        price = exit_price or market_data_service.get_latest_price(db, position.asset_id)
-        realized_pnl = (price - position.avg_entry_price) * close_quantity
+        if exit_price is not None:
+            price = exit_price
+        else:
+            try:
+                price = market_data_service.get_latest_price(db, position.asset_id)
+            except ValueError:
+                price = position.current_price or position.avg_entry_price
+        is_short = position.quantity < 0
+        realized_pnl = ((position.avg_entry_price - price) if is_short else (price - position.avg_entry_price)) * close_quantity
+        side = "cover_short" if is_short else "sell"
         trade = Trade(
             asset_id=position.asset_id,
             position_id=position.id,
             mode=position.mode,
-            side="sell",
+            side=side,
             quantity=close_quantity,
             price=price,
             fees=0,
@@ -137,17 +158,65 @@ class PortfolioService:
             executed_at=utcnow(),
         )
         db.add(trade)
-        position.quantity = round(position.quantity - close_quantity, 8)
+        if position.mode == "simulation" and position.simulation_account_id:
+            from app.models.simulation import SimulationAccount
+
+            account = db.get(SimulationAccount, position.simulation_account_id)
+            if account:
+                if is_short:
+                    account.cash_balance -= price * close_quantity
+                else:
+                    account.cash_balance += price * close_quantity
+        position.quantity = round(position.quantity + close_quantity if is_short else position.quantity - close_quantity, 8)
         position.realized_pnl += realized_pnl
         position.current_price = price
-        position.unrealized_pnl = (position.current_price - position.avg_entry_price) * position.quantity
-        if position.quantity <= 1e-8:
+        if position.quantity < 0:
+            position.unrealized_pnl = (position.avg_entry_price - position.current_price) * abs(position.quantity)
+        else:
+            position.unrealized_pnl = (position.current_price - position.avg_entry_price) * position.quantity
+        if abs(position.quantity) <= 1e-8:
             position.quantity = 0
             position.status = "closed"
             position.closed_at = utcnow()
         db.flush()
         publish_event("position.closed", {"position_id": position.id, "quantity": close_quantity})
         return position
+
+    def archive_closed_positions(
+        self,
+        db: Session,
+        *,
+        mode: str | None = None,
+        simulation_account_id: str | None = None,
+        broker_account_id: str | None = None,
+    ) -> dict:
+        stmt = select(Position).where(Position.status == "closed")
+        if mode:
+            stmt = stmt.where(Position.mode == mode)
+        if simulation_account_id:
+            stmt = stmt.where(Position.simulation_account_id == simulation_account_id)
+        if broker_account_id:
+            stmt = stmt.where(Position.broker_account_id == broker_account_id)
+        positions = list(db.scalars(stmt))
+        for position in positions:
+            position.status = "archived"
+            position.notes = self._append_note(position.notes, "Archived from closed-position cleanup.")
+        db.flush()
+        if positions:
+            audit_service.log(
+                db,
+                actor="system",
+                action="position.archive_closed",
+                target_type="position",
+                target_id=None,
+                mode=mode,
+                details={
+                    "count": len(positions),
+                    "simulation_account_id": simulation_account_id,
+                    "broker_account_id": broker_account_id,
+                },
+            )
+        return {"archived": len(positions)}
 
     def list_orders(
         self,
@@ -209,14 +278,21 @@ class PortfolioService:
             raise ValueError("Order quantity must be positive after resolving amount/price inputs.")
         simulation_account_id = payload.simulation_account_id
         if payload.mode == "simulation" and not simulation_account_id:
+            account = None
+            if payload.provider_type:
+                from app.models.simulation import SimulationAccount
+
+                account = db.scalar(select(SimulationAccount).where(SimulationAccount.provider_type == payload.provider_type).limit(1))
             accounts = simulation_service.list_accounts(db)
-            if accounts:
-                simulation_account_id = accounts[0].id
+            if account is None and accounts:
+                account = accounts[0]
+            if account:
+                simulation_account_id = account.id
         broker_account_id = payload.broker_account_id
         if payload.mode == "live" and not broker_account_id:
             broker = db.scalar(
                 select(BrokerAccount)
-                .where(BrokerAccount.mode == "live", BrokerAccount.enabled.is_(True))
+                .where(BrokerAccount.mode == "live", BrokerAccount.enabled.is_(True), BrokerAccount.broker_type == "trading212")
                 .order_by(BrokerAccount.live_trading_enabled.desc(), BrokerAccount.updated_at.desc())
                 .limit(1)
             )
@@ -470,6 +546,13 @@ class PortfolioService:
             currency=payload.currency,
             exchange=payload.exchange,
         )
+
+    def _append_note(self, existing: str | None, note: str) -> str:
+        if not existing:
+            return note
+        if note in existing:
+            return existing
+        return f"{existing}\n{note}"
 
 
 portfolio_service = PortfolioService()

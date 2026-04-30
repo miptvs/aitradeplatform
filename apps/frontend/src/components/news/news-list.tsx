@@ -1,5 +1,6 @@
 import type { ExtractedEvent, NewsArticle } from "@/types";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { formatDateTime } from "@/lib/utils";
 
 export function NewsList({ news, events }: { news: NewsArticle[]; events: ExtractedEvent[] }) {
   return (
@@ -16,7 +17,7 @@ export function NewsList({ news, events }: { news: NewsArticle[]; events: Extrac
                       {item.title}
                     </a>
                     <div className="mt-1 text-xs text-slate-400">
-                      {item.source} • {item.published_at.slice(0, 16).replace("T", " ")} • {item.affected_symbols.join(", ") || "Unmapped"}
+                      {item.source} • {formatDateTime(item.published_at)} • {item.affected_symbols.join(", ") || "Unmapped"}
                     </div>
                   </div>
                   <StatusBadge status={item.sentiment || "neutral"} />

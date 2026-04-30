@@ -10,11 +10,15 @@ class SimulationAccount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "simulation_accounts"
 
     name: Mapped[str] = mapped_column(String(120), unique=True)
+    provider_type: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    model_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     starting_cash: Mapped[float] = mapped_column(Float)
     cash_balance: Mapped[float] = mapped_column(Float)
     fees_bps: Mapped[float] = mapped_column(Float, default=5)
     slippage_bps: Mapped[float] = mapped_column(Float, default=2)
     latency_ms: Mapped[int] = mapped_column(Integer, default=50)
+    min_cash_reserve_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    short_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     reset_count: Mapped[int] = mapped_column(Integer, default=0)
 
@@ -52,4 +56,6 @@ class SimulationTrade(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     fees: Mapped[float] = mapped_column(Float, default=0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0)
     rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

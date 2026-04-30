@@ -46,7 +46,7 @@ def refresh_market_data() -> dict:
 @celery_app.task(name="app.tasks.periodic.refresh_news")
 def refresh_news() -> dict:
     with SessionLocal() as db:
-        refreshed = news_service.refresh_latest_news(db)
+        refreshed = news_service.refresh_latest_news(db, run_type="automatic")
         _health_event(db, "news", "ok" if refreshed.get("feeds_failed", 0) == 0 else "warn", refreshed["message"], refreshed)
         db.commit()
         if refreshed.get("articles_added", 0):
@@ -57,12 +57,74 @@ def refresh_news() -> dict:
 @celery_app.task(name="app.tasks.periodic.generate_signals")
 def generate_signals() -> dict:
     with SessionLocal() as db:
-        signals = signal_service.generate_signals(db)
-        _health_event(db, "signals", "ok" if signals else "warn", f"Generated {len(signals)} provider-backed signals")
+        run_type = "automatic"
+        market_report = market_data_service.refresh_market_data(db)
+        news_report = news_service.refresh_latest_news(db, run_type=run_type)
+        signals = []
+        provider_summaries = []
+        for config in provider_service.list_configs(db):
+            profile = provider_service.get_profile(config.provider_type)
+            if not config.enabled or profile.trading_mode != "simulation":
+                continue
+            try:
+                provider_signals = signal_service.generate_signals(db, provider_type=config.provider_type)
+                provider_status = "success" if provider_signals else "noop"
+                provider_message = (
+                    f"Automatic signal run generated {len(provider_signals)} signal"
+                    f"{'s' if len(provider_signals) != 1 else ''} for {config.provider_type}."
+                )
+                provider_detail = None
+            except Exception as exc:
+                provider_signals = []
+                provider_status = "error"
+                provider_message = f"Automatic signal run failed for {config.provider_type}: {exc}"
+                provider_detail = str(exc)
+
+            signals.extend(provider_signals)
+            signal_service.record_generation_diagnostics(
+                db,
+                provider_type=config.provider_type,
+                status=provider_status,
+                run_type=run_type,
+                message=provider_message,
+                created_signal_ids=[signal.id for signal in provider_signals],
+                created_count=len(provider_signals),
+                detail=provider_detail,
+                market_report=market_report,
+                news_report=news_report,
+            )
+            provider_summaries.append(
+                {
+                    "provider_type": config.provider_type,
+                    "status": provider_status,
+                    "created_count": len(provider_signals),
+                    "detail": provider_detail,
+                }
+            )
+
+        message = (
+            f"Automatic signal run generated {len(signals)} provider-backed signal{'s' if len(signals) != 1 else ''}. "
+            f"Market data: +{market_report['snapshots_created']} new / {market_report['snapshots_updated']} updated. "
+            f"News: +{news_report['articles_added']} RSS articles."
+        )
+        status = "success" if signals else ("error" if any(item["status"] == "error" for item in provider_summaries) else "noop")
+        signal_service.record_generation_diagnostics(
+            db,
+            provider_type=None,
+            status=status,
+            run_type=run_type,
+            message=message,
+            created_signal_ids=[signal.id for signal in signals],
+            created_count=len(signals),
+            market_report=market_report,
+            news_report=news_report,
+            detail=None if status != "error" else "One or more provider runs failed. See provider_summaries.",
+        )
+        _health_event(db, "signals", "ok" if signals else "warn", message, {"provider_summaries": provider_summaries})
         db.commit()
         if signals:
             publish_event("signals.generated", {"count": len(signals)})
-        return {"count": len(signals)}
+        return {"count": len(signals), "market_report": market_report, "news_report": news_report, "provider_summaries": provider_summaries}
 
 
 @celery_app.task(name="app.tasks.periodic.run_scheduled_simulation_automation")

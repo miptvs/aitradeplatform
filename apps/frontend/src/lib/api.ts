@@ -84,6 +84,14 @@ export const api = {
     const suffix = params.toString() ? `?${params.toString()}` : "";
     return request<Position>(`/positions/${id}/close${suffix}`, { method: "POST" });
   },
+  cleanClosedPositions: (params?: { mode?: string; simulationAccountId?: string; brokerAccountId?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.mode) search.set("mode", params.mode);
+    if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
+    if (params?.brokerAccountId) search.set("broker_account_id", params.brokerAccountId);
+    const suffix = search.toString() ? `?${search.toString()}` : "";
+    return request<{ archived: number }>(`/positions/closed${suffix}`, { method: "DELETE" });
+  },
   getOrders: (params?: { mode?: string; simulationAccountId?: string; brokerAccountId?: string }) => {
     const search = new URLSearchParams();
     if (params?.mode) search.set("mode", params.mode);
@@ -101,7 +109,9 @@ export const api = {
     const suffix = search.toString() ? `?${search.toString()}` : "";
     return request<Trade[]>(`/trades${suffix}`);
   },
-  getSignals: (providerType?: string) => request<Signal[]>(`/signals${providerType ? `?provider_type=${encodeURIComponent(providerType)}` : ""}`),
+  getSignals: (providerType?: string) => request<Signal[]>(`/signals/${providerType ? `?provider_type=${encodeURIComponent(providerType)}` : ""}`),
+  getSignalDiagnostics: (providerType?: string) =>
+    request<SignalRefreshResult>(`/signals/diagnostics${providerType ? `?provider_type=${encodeURIComponent(providerType)}` : ""}`),
   getSignalDetail: (signalId: string) => request<SignalDetail>(`/signals/${encodeURIComponent(signalId)}`),
   getSignalTrace: (signalId: string) => request<SignalTrace>(`/signals/${encodeURIComponent(signalId)}/trace`),
   getOrderTrace: (orderId: string) => request<SignalTrace>(`/orders/${encodeURIComponent(orderId)}/trace`),
@@ -112,15 +122,15 @@ export const api = {
     if (options?.forceRefresh) search.set("force_refresh", "true");
     return request<SignalRefreshResult>(`/signals/refresh?${search.toString()}`, { method: "POST" });
   },
-  getNews: () => request<NewsArticle[]>("/news"),
+  getNews: () => request<NewsArticle[]>("/news/"),
   getNewsDiagnostics: () => request<NewsRefreshDiagnostics>("/news/diagnostics"),
   refreshNews: (payload?: { force_refresh?: boolean; backfill_hours?: number | null }) =>
     request<NewsRefreshDiagnostics>(
       "/news/refresh",
       { method: "POST", body: JSON.stringify(payload || {}) }
     ),
-  getEvents: () => request<ExtractedEvent[]>("/events"),
-  getStrategies: () => request<StrategyOption[]>("/strategies"),
+  getEvents: () => request<ExtractedEvent[]>("/events/"),
+  getStrategies: () => request<StrategyOption[]>("/strategies/"),
   getSettingsOverview: () => request<SettingsOverview>("/settings/overview"),
   saveRiskRule: (payload: Record<string, unknown>) => request<{ id: string; name: string; scope: string; rule_type: string; enabled: boolean; auto_close: boolean; description?: string | null; config_json: Record<string, unknown> }>("/risk-rules", { method: "POST", body: JSON.stringify(payload) }),
   saveProviderConfig: (providerType: string, payload: Record<string, unknown>) =>
@@ -154,6 +164,8 @@ export const api = {
     const suffix = params.toString() ? `?${params.toString()}` : "";
     return request<Position>(`/simulation/positions/${id}/close${suffix}`, { method: "POST" });
   },
+  cleanSimulationClosedPositions: (accountId?: string) =>
+    request<{ archived: number }>(`/simulation/positions/closed${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ""}`, { method: "DELETE" }),
   closeLivePosition: (id: string, options?: { quantity?: number; closePercent?: number; exitPrice?: number }) => {
     const params = new URLSearchParams();
     if (options?.quantity !== undefined) params.set("quantity", String(options.quantity));
@@ -162,6 +174,7 @@ export const api = {
     const suffix = params.toString() ? `?${params.toString()}` : "";
     return request<Position>(`/live/positions/${id}/close${suffix}`, { method: "POST" });
   },
+  cleanLiveClosedPositions: () => request<{ archived: number }>("/live/positions/closed", { method: "DELETE" }),
   getSimulationAutomation: () => request<TradingAutomationProfile>("/simulation/automation"),
   saveSimulationAutomation: (payload: Record<string, unknown>) =>
     request<TradingAutomationProfile>("/simulation/automation", { method: "PUT", body: JSON.stringify(payload) }),
@@ -190,8 +203,15 @@ export const api = {
     return request<{ timestamp: string; value: number }[]>(`/analytics/equity-curve${suffix}`);
   },
   getSimulationVsLive: () => request<SimulationVsLive>("/analytics/simulation-vs-live"),
-  getAlerts: () => request<Alert[]>("/alerts"),
-  getAssets: () => request<Asset[]>("/assets"),
+  getAlerts: () => request<Alert[]>("/alerts/"),
+  clearAlerts: (params?: { mode?: string; category?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.mode) search.set("mode", params.mode);
+    if (params?.category) search.set("category", params.category);
+    const suffix = search.toString() ? `?${search.toString()}` : "";
+    return request<{ resolved: number }>(`/alerts/${suffix}`, { method: "DELETE" });
+  },
+  getAssets: () => request<Asset[]>("/assets/"),
   searchAssets: (query: string) => request<AssetSearchResponse>(`/assets/search?q=${encodeURIComponent(query)}`),
   getBrokerAccounts: () => request<BrokerAccount[]>("/brokers/accounts"),
   getBrokerAdapters: () => request<BrokerAdapterStatus[]>("/brokers/adapters"),

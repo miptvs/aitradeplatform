@@ -37,6 +37,13 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
     return portfolio_service.list_positions(db, mode="live")
 
 
+@router.delete("/positions/closed")
+def clean_closed_positions(db: Session = Depends(get_db)) -> dict:
+    result = portfolio_service.archive_closed_positions(db, mode="live")
+    db.commit()
+    return result
+
+
 @router.get("/orders")
 def orders(db: Session = Depends(get_db)) -> list[dict]:
     return portfolio_service.list_orders(db, mode="live")

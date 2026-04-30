@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models.audit import AuditLog
 from app.models.asset import Asset
+from app.models.health import SystemHealthEvent
 from app.models.news import ExtractedEvent, NewsArticle
 from app.models.portfolio import Order, Position, Trade
 from app.models.signal import Signal, SignalEvaluation
@@ -87,6 +88,98 @@ class SignalService:
             except Exception:
                 continue
         return created
+
+    def latest_generation_diagnostics(self, db: Session, provider_type: str | None = None) -> dict:
+        events = list(
+            db.scalars(
+                select(SystemHealthEvent)
+                .where(SystemHealthEvent.component == "signals.refresh")
+                .order_by(desc(SystemHealthEvent.observed_at))
+                .limit(50)
+            )
+        )
+        event = None
+        if provider_type:
+            for candidate in events:
+                metadata = candidate.metadata_json or {}
+                if metadata.get("provider_type") == provider_type:
+                    event = candidate
+                    break
+            if event is None:
+                for candidate in events:
+                    metadata = candidate.metadata_json or {}
+                    if metadata.get("provider_type") == "all":
+                        event = candidate
+                        break
+        elif events:
+            event = events[0]
+        if event is None:
+            return {
+                "provider_type": provider_type or "all",
+                "status": "none",
+                "run_type": "none",
+                "observed_at": None,
+                "created_signal_ids": [],
+                "created_count": 0,
+                "message": "No signal refresh has been recorded yet.",
+                "detail": None,
+                "market_report": {},
+                "news_report": {},
+            }
+        metadata = event.metadata_json or {}
+        return {
+            "provider_type": metadata.get("provider_type", provider_type or "all"),
+            "status": metadata.get("status", event.status),
+            "run_type": metadata.get("run_type", "manual"),
+            "observed_at": event.observed_at.isoformat(),
+            "created_signal_ids": metadata.get("created_signal_ids", []),
+            "created_count": metadata.get("created_count", 0),
+            "message": event.message,
+            "detail": metadata.get("detail"),
+            "market_report": metadata.get("market_report", {}),
+            "news_report": metadata.get("news_report", {}),
+        }
+
+    def record_generation_diagnostics(
+        self,
+        db: Session,
+        *,
+        provider_type: str | None,
+        status: str,
+        run_type: str,
+        message: str,
+        created_signal_ids: list[str] | None = None,
+        created_count: int = 0,
+        detail: str | None = None,
+        market_report: dict | None = None,
+        news_report: dict | None = None,
+        observed_at=None,
+    ) -> dict:
+        observed = observed_at or utcnow()
+        metadata = {
+            "provider_type": provider_type or "all",
+            "status": status,
+            "run_type": run_type,
+            "created_signal_ids": created_signal_ids or [],
+            "created_count": created_count,
+            "detail": detail,
+            "market_report": market_report or {},
+            "news_report": news_report or {},
+        }
+        db.add(
+            SystemHealthEvent(
+                component="signals.refresh",
+                status=status,
+                message=message,
+                metadata_json=metadata,
+                observed_at=observed,
+            )
+        )
+        return {
+            **metadata,
+            "observed_at": observed.isoformat(),
+            "message": message,
+        }
 
     def _generate_for_provider(self, db: Session, provider_type: str, *, force_refresh: bool = False) -> list[Signal]:
         config = provider_service.get_config(db, provider_type)
@@ -220,13 +313,12 @@ class SignalService:
             strategy = strategies.get(strategy_slug, strategy)
 
             suggested_entry = self._safe_float(parsed.get("suggested_entry")) or indicator_payload["close"]
-            suggested_stop_loss = self._safe_float(parsed.get("suggested_stop_loss")) or round(suggested_entry * 0.97, 2)
-            suggested_take_profit = self._safe_float(parsed.get("suggested_take_profit")) or round(suggested_entry * 1.06, 2)
-            estimated_risk_reward = self._safe_float(parsed.get("estimated_risk_reward")) or self._risk_reward(
-                suggested_entry,
-                suggested_stop_loss,
-                suggested_take_profit,
-            )
+            default_stop, default_target = self._default_protective_levels(suggested_entry, action)
+            suggested_stop_loss = self._safe_float(parsed.get("suggested_stop_loss")) or default_stop
+            suggested_take_profit = self._safe_float(parsed.get("suggested_take_profit")) or default_target
+            estimated_risk_reward = self._safe_float(parsed.get("estimated_risk_reward"))
+            if estimated_risk_reward is None and suggested_stop_loss is not None and suggested_take_profit is not None:
+                estimated_risk_reward = self._risk_reward(suggested_entry, suggested_stop_loss, suggested_take_profit, action)
 
             signal = Signal(
                 asset_id=asset.id,
@@ -262,7 +354,7 @@ class SignalService:
                     "provider_vendor": profile.vendor_key,
                     "preferred_strategy": preferred_slug,
                     "generation_profile_mode": profile.trading_mode,
-                    "trade_intent": "close_long" if is_held and action == "sell" else ("open_long" if action == "buy" else "observe"),
+                    "trade_intent": self._trade_intent(action, is_held),
                     "is_held_asset": is_held,
                     "news_title": latest_news.title if latest_news else None,
                     "event_type": latest_event.event_type if latest_event else None,
@@ -341,7 +433,7 @@ class SignalService:
             signal = Signal(
                 asset_id=asset.id,
                 strategy_id=strategy.id if strategy else None,
-                action="sell",
+                action="close_long",
                 confidence=exit_decision["confidence"],
                 status="candidate",
                 occurred_at=utcnow(),
@@ -408,7 +500,7 @@ class SignalService:
                     Signal.asset_id == asset_id,
                     Signal.provider_type == provider_type,
                     Signal.source_kind == "agent",
-                    Signal.action == "sell",
+                    Signal.action.in_(["sell", "close_long", "reduce_long"]),
                 )
                 .order_by(desc(Signal.occurred_at))
                 .limit(5)
@@ -906,6 +998,10 @@ class SignalService:
             f"You are generating a real trading signal for {asset.symbol} ({asset.name}) using the {profile_title} workspace.\n"
             "Use the technical inputs, real RSS news context, extracted event context, and MCP tool context below. "
             "Return only JSON with keys: action, confidence, strategy, rationale, suggested_entry, suggested_stop_loss, suggested_take_profit, estimated_risk_reward.\n"
+            "Action must be one of BUY, SELL, HOLD, CLOSE_LONG, REDUCE_LONG, SHORT, COVER_SHORT. "
+            "Use CLOSE_LONG or REDUCE_LONG for existing long holdings that should be exited or trimmed. "
+            "Use SELL for bearish/exit pressure when a long exists or when shorting is not assumed. "
+            "Use SHORT only for a clear bearish opportunity that should be simulated as a short; live brokers may not support it. "
             "Confidence must be between 0 and 1. Strategy must be one of: trend-following, mean-reversion, breakout, news-momentum, event-driven, blended.\n"
             "Use hold if the setup is weak or conflicted.\n\n"
             f"Technical indicators:\n{json.dumps(indicators, indent=2)}\n\n"
@@ -946,8 +1042,45 @@ class SignalService:
         return round(max(0.0, min(1.0, parsed)), 2)
 
     def _normalize_action(self, value: Any, fallback: str) -> str:
-        candidate = str(value or fallback).strip().lower()
-        return candidate if candidate in {"buy", "sell", "hold"} else fallback
+        candidate = str(value or fallback).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "long": "buy",
+            "open_long": "buy",
+            "exit": "close_long",
+            "close": "close_long",
+            "close_position": "close_long",
+            "reduce": "reduce_long",
+            "trim": "reduce_long",
+            "bearish": "sell",
+            "buy_to_cover": "cover_short",
+            "cover": "cover_short",
+        }
+        normalized = aliases.get(candidate, candidate)
+        allowed = {"buy", "sell", "hold", "close_long", "reduce_long", "short", "cover_short"}
+        fallback_normalized = aliases.get(str(fallback).strip().lower().replace("-", "_").replace(" ", "_"), str(fallback).strip().lower())
+        return normalized if normalized in allowed else (fallback_normalized if fallback_normalized in allowed else "hold")
+
+    def _default_protective_levels(self, entry: float, action: str) -> tuple[float | None, float | None]:
+        if action in {"short", "sell"}:
+            return round(entry * 1.03, 2), round(entry * 0.94, 2)
+        if action in {"buy"}:
+            return round(entry * 0.97, 2), round(entry * 1.06, 2)
+        return None, None
+
+    def _trade_intent(self, action: str, is_held: bool) -> str:
+        if action == "buy":
+            return "open_long"
+        if action == "short":
+            return "open_short"
+        if action == "cover_short":
+            return "cover_short"
+        if action in {"close_long", "reduce_long"}:
+            return action
+        if action == "sell" and is_held:
+            return "close_long"
+        if action == "sell":
+            return "bearish_watch"
+        return "observe"
 
     def _normalize_strategy(self, value: Any, fallback: str) -> str:
         candidate = str(value or fallback).strip().lower()
@@ -967,7 +1100,11 @@ class SignalService:
         except Exception:
             return None
 
-    def _risk_reward(self, entry: float, stop_loss: float, take_profit: float) -> float:
+    def _risk_reward(self, entry: float, stop_loss: float, take_profit: float, action: str = "buy") -> float:
+        if action in {"short", "sell"}:
+            risk = max(stop_loss - entry, 0.01)
+            reward = max(entry - take_profit, 0.0)
+            return round(reward / risk, 2)
         risk = max(entry - stop_loss, 0.01)
         reward = max(take_profit - entry, 0.0)
         return round(reward / risk, 2)

@@ -2,11 +2,13 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
+import { usePathname } from "next/navigation";
 
 import { ProvenanceDialog } from "@/components/provenance/provenance-dialog";
 import { PositionManagementTable } from "@/components/trading/position-management-table";
 import { Dialog } from "@/components/ui/dialog";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
+import { useWorkspace } from "@/components/layout/workspace-provider";
 import { useApi } from "@/hooks/use-api";
 import { useProvenanceTrace } from "@/hooks/use-provenance-trace";
 import { api } from "@/lib/api";
@@ -16,21 +18,25 @@ import type { Asset, AssetSearchResult, Position } from "@/types";
 type SizingMode = "amount" | "quantity";
 
 export default function PositionsPage() {
+  const pathname = usePathname();
+  const workspace = useWorkspace();
+  const viewMode = pathname.endsWith("/live") ? "live" : pathname.endsWith("/simulation") ? "simulation" : "both";
   const state = useApi(async () => {
-    const [positions, assets, strategies, simulationAccounts, brokerAccounts] = await Promise.all([
-      api.getPositions(),
+    const [livePositions, simulationPositions, assets, strategies, simulationAccounts, brokerAccounts] = await Promise.all([
+      api.getPositions({ mode: "live" }),
+      api.getPositions({ mode: "simulation" }),
       api.getAssets(),
       api.getStrategies(),
       api.getSimulationAccounts(),
       api.getBrokerAccounts(),
     ]);
-    return { positions, assets, strategies, simulationAccounts, brokerAccounts };
+    return { livePositions, simulationPositions, assets, strategies, simulationAccounts, brokerAccounts };
   });
   const provenance = useProvenanceTrace();
 
-  const [filterMode, setFilterMode] = useState<"all" | "live" | "simulation">("all");
   const [message, setMessage] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [syncingLive, setSyncingLive] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<AssetSearchResult[]>([]);
   const [searchMessage, setSearchMessage] = useState("");
@@ -63,10 +69,12 @@ export default function PositionsPage() {
   });
 
   const localDefaults = useMemo(() => (state.data?.assets || []).slice(0, 8).map(toLocalSearchResult), [state.data?.assets]);
-  const filteredPositions = useMemo(
-    () => (state.data?.positions || []).filter((position) => filterMode === "all" || position.mode === filterMode),
-    [filterMode, state.data?.positions]
-  );
+  const liveActivePositions = (state.data?.livePositions || []).filter((position) => position.status === "open");
+  const liveClosedPositions = (state.data?.livePositions || []).filter((position) => position.status === "closed");
+  const simulationActivePositions = (state.data?.simulationPositions || []).filter((position) => position.status === "open");
+  const simulationClosedPositions = (state.data?.simulationPositions || []).filter((position) => position.status === "closed");
+  const showLiveBook = viewMode === "live" || viewMode === "both";
+  const showSimulationBook = viewMode === "simulation" || viewMode === "both";
   const selectedAsset = useMemo(() => {
     if (!state.data) return null;
     return state.data.assets.find((asset) => asset.id === form.asset_id || asset.symbol === form.asset_symbol) || null;
@@ -76,6 +84,11 @@ export default function PositionsPage() {
     if (!state.data?.simulationAccounts.length || form.simulation_account_id) return;
     setForm((current) => ({ ...current, simulation_account_id: state.data?.simulationAccounts[0].id || "" }));
   }, [form.simulation_account_id, state.data?.simulationAccounts]);
+
+  useEffect(() => {
+    if (viewMode === "both") return;
+    setForm((current) => ({ ...current, mode: viewMode }));
+  }, [viewMode]);
 
   useEffect(() => {
     const normalized = searchQuery.trim().toUpperCase();
@@ -132,14 +145,40 @@ export default function PositionsPage() {
   const derivedQuantity = form.sizing_mode === "amount" ? deriveQuantity(form.amount, entryPrice) : Number(form.quantity || 0);
   const estimatedNotional = entryPrice > 0 ? entryPrice * derivedQuantity : 0;
   const closePreviewPct = closePercent ? Number(closePercent) : 100;
-  const closePreviewQty = closePosition ? (closePosition.quantity * closePreviewPct) / 100 : 0;
+  const closePreviewQty = closePosition ? (Math.abs(closePosition.quantity) * closePreviewPct) / 100 : 0;
+  const liveBrokerAccount = state.data.brokerAccounts.find((account) => account.mode === "live" && account.broker_type === "trading212") || state.data.brokerAccounts.find((account) => account.mode === "live");
+  const workspaceSimulationAccount =
+    state.data.simulationAccounts.find((account) => account.provider_type === workspace.simulationProviderType) ||
+    state.data.simulationAccounts.find((account) => !account.provider_type) ||
+    state.data.simulationAccounts[0];
+
+  function openStopEditor(position: Position) {
+    setStopPosition(position);
+    setStopForm({
+      stop_loss: position.stop_loss ? String(position.stop_loss) : "",
+      take_profit: position.take_profit ? String(position.take_profit) : "",
+      trailing_stop: position.trailing_stop ? String(position.trailing_stop) : "",
+      notes: position.notes || "",
+    });
+  }
+
+  function openCloseDialog(position: Position) {
+    setClosePosition(position);
+    setClosePercent("");
+  }
+
+  async function markManualOverride(position: Position) {
+    await api.updatePosition(position.id, { manual_override: true });
+    setMessage(`${position.symbol} marked as manual override.`);
+    state.reload();
+  }
 
   return (
     <div className="space-y-6">
       <div>
         <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Positions</div>
-        <h1 className="mt-1 text-2xl font-semibold text-slate-100">Positions ledger and stop management</h1>
-        <div className="mt-2 text-sm text-slate-400">Use the compact action menu on each row to manage stops, manual overrides, and partial closes without cluttering the whole table.</div>
+        <h1 className="mt-1 text-2xl font-semibold text-slate-100">{positionsTitle(viewMode)}</h1>
+        <div className="mt-2 text-sm text-slate-400">{positionsDescription(viewMode)}</div>
       </div>
 
       {message ? <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-200 shadow-panel">{message}</div> : null}
@@ -351,47 +390,89 @@ export default function PositionsPage() {
           )}
         </section>
 
-        <section className="order-1 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Current positions</div>
-              <div className="mt-1 text-sm text-slate-400">Filter the cross-book ledger, then use the row action menu for the next step.</div>
-            </div>
-            <div className="flex gap-2">
-              {(["all", "simulation", "live"] as const).map((value) => (
-                <button key={value} type="button" onClick={() => setFilterMode(value)} className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.14em] ${filterMode === value ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-100" : "border-border text-slate-300 hover:bg-white/5"}`}>
-                  {value}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="mt-4">
-            <PositionManagementTable
-              positions={filteredPositions}
-              emptyMessage="No positions match the current filter."
-              onViewDetails={setDetailPosition}
-              onEditStops={(position) => {
-                setStopPosition(position);
-                setStopForm({
-                  stop_loss: position.stop_loss ? String(position.stop_loss) : "",
-                  take_profit: position.take_profit ? String(position.take_profit) : "",
-                  trailing_stop: position.trailing_stop ? String(position.trailing_stop) : "",
-                  notes: position.notes || "",
-                });
-              }}
-              onClose={(position) => {
-                setClosePosition(position);
-                setClosePercent("");
-              }}
-              onMarkOverride={async (position) => {
-                await api.updatePosition(position.id, { manual_override: true });
-                setMessage(`${position.symbol} marked as manual override.`);
-                state.reload();
-              }}
-              onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
-            />
-          </div>
-        </section>
+        {showLiveBook ? (
+          <PositionBookSection
+            title="Live Trading positions"
+            description="Actual live book mirrored from Trading212 sync. Simulation rows are never mixed into this table."
+            activePositions={liveActivePositions}
+            closedPositions={liveClosedPositions}
+            activeEmptyMessage="No live Trading212 positions are synced yet. Use Sync Trading212 to pull the broker book."
+            closedEmptyMessage="No closed live positions to review."
+            cleanLabel="Clean closed live"
+            extraAction={
+              <button
+                type="button"
+                disabled={!liveBrokerAccount?.supports_sync || syncingLive}
+                onClick={async () => {
+                  if (!liveBrokerAccount) return;
+                  try {
+                    setSyncingLive(true);
+                    const result = await api.syncLiveBroker(liveBrokerAccount.id);
+                    setMessage(`${result.message} Positions: ${result.positions_message}.`);
+                    state.reload();
+                  } catch (error) {
+                    setMessage(error instanceof Error ? error.message : "Trading212 sync failed.");
+                  } finally {
+                    setSyncingLive(false);
+                  }
+                }}
+                className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-100 hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Fetch the latest Trading212 account positions and pies before reviewing the live book."
+              >
+                {syncingLive ? "Syncing..." : "Sync Trading212"}
+              </button>
+            }
+            onCleanClosed={async () => {
+              const result = await api.cleanClosedPositions({ mode: "live" });
+              setMessage(`${result.archived} closed live position${result.archived === 1 ? "" : "s"} cleaned.`);
+              state.reload();
+            }}
+            onViewDetails={setDetailPosition}
+            onEditStops={openStopEditor}
+            onClose={openCloseDialog}
+            onMarkOverride={markManualOverride}
+            onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
+          />
+        ) : null}
+
+        {showSimulationBook ? (
+          <PositionBookSection
+            title="Simulation positions"
+            description="Virtual positions from simulation accounts only. These are isolated from Trading212 and safe for training."
+            activePositions={simulationActivePositions}
+            closedPositions={simulationClosedPositions}
+            activeEmptyMessage="No simulation positions yet. Use a simulation workspace, automation run, or manual seed to create one."
+            closedEmptyMessage="No closed simulation positions to review."
+            cleanLabel="Clean closed simulation"
+            extraAction={
+              <button
+                type="button"
+                disabled={!workspaceSimulationAccount}
+                onClick={async () => {
+                  if (!workspaceSimulationAccount) return;
+                  if (!window.confirm(`Reset ${workspaceSimulationAccount.name} and remove its simulation positions?`)) return;
+                  await api.resetSimulationAccount(workspaceSimulationAccount.id);
+                  setMessage(`${workspaceSimulationAccount.name} reset. Simulation positions, orders, trades, and snapshots were cleaned.`);
+                  state.reload();
+                }}
+                className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Reset the simulation account for this workspace and remove its positions."
+              >
+                Reset simulation account
+              </button>
+            }
+            onCleanClosed={async () => {
+              const result = await api.cleanClosedPositions({ mode: "simulation" });
+              setMessage(`${result.archived} closed simulation position${result.archived === 1 ? "" : "s"} cleaned.`);
+              state.reload();
+            }}
+            onViewDetails={setDetailPosition}
+            onEditStops={openStopEditor}
+            onClose={openCloseDialog}
+            onMarkOverride={markManualOverride}
+            onViewTrace={(position) => provenance.openTrace({ type: "position", id: position.id })}
+          />
+        ) : null}
       </div>
 
       <Dialog
@@ -446,8 +527,8 @@ export default function PositionsPage() {
             {closePosition ? (
               <>
                 <div className="font-semibold text-slate-100">{closePosition.symbol}</div>
-                <div className="mt-2">Current quantity: {formatQuantity(closePosition.quantity, 6)}</div>
-                <div className="mt-1">Preview close size: {formatQuantity(closePreviewQty || closePosition.quantity, 6)}</div>
+                <div className="mt-2">Current quantity: {formatQuantity(Math.abs(closePosition.quantity), 6)}</div>
+                <div className="mt-1">Preview close size: {formatQuantity(closePreviewQty || Math.abs(closePosition.quantity), 6)}</div>
               </>
             ) : null}
           </div>
@@ -465,10 +546,14 @@ export default function PositionsPage() {
             type="button"
             onClick={async () => {
               if (!closePosition) return;
-              await api.closePosition(closePosition.id, { closePercent: closePercent ? Number(closePercent) : undefined });
-              setMessage(`${closePosition.symbol} close request applied.`);
-              setClosePosition(null);
-              state.reload();
+              try {
+                await api.closePosition(closePosition.id, { closePercent: closePercent ? Number(closePercent) : undefined });
+                setMessage(`${closePosition.symbol} close request applied.`);
+                setClosePosition(null);
+                state.reload();
+              } catch (error) {
+                setMessage(error instanceof Error ? error.message : "Position close failed.");
+              }
             }}
             className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 hover:bg-rose-500/20"
           >
@@ -524,6 +609,107 @@ function Detail({ label, value }: { label: string; value: string }) {
       <div className="text-xs uppercase tracking-[0.16em] text-slate-500">{label}</div>
       <div className="mt-1 text-sm font-semibold text-slate-100">{value}</div>
     </div>
+  );
+}
+
+function positionsTitle(viewMode: "live" | "simulation" | "both") {
+  if (viewMode === "live") return "Live positions from Trading212";
+  if (viewMode === "simulation") return "Simulation positions";
+  return "Positions ledger and stop management";
+}
+
+function positionsDescription(viewMode: "live" | "simulation" | "both") {
+  if (viewMode === "live") {
+    return "This view shows only actual live holdings mirrored from Trading212 sync. Simulation positions are hidden here.";
+  }
+  if (viewMode === "simulation") {
+    return "This view shows only virtual simulation positions. Live Trading212 holdings are hidden here.";
+  }
+  return "Use the compact action menu on each row to manage stops, manual overrides, and partial closes without cluttering the whole table.";
+}
+
+function PositionBookSection({
+  title,
+  description,
+  activePositions,
+  closedPositions,
+  activeEmptyMessage,
+  closedEmptyMessage,
+  cleanLabel,
+  extraAction,
+  onCleanClosed,
+  onViewDetails,
+  onEditStops,
+  onClose,
+  onMarkOverride,
+  onViewTrace,
+}: {
+  title: string;
+  description: string;
+  activePositions: Position[];
+  closedPositions: Position[];
+  activeEmptyMessage: string;
+  closedEmptyMessage: string;
+  cleanLabel: string;
+  extraAction?: ReactNode;
+  onCleanClosed: () => Promise<void>;
+  onViewDetails: (position: Position) => void;
+  onEditStops: (position: Position) => void;
+  onClose: (position: Position) => void;
+  onMarkOverride: (position: Position) => void;
+  onViewTrace: (position: Position) => void;
+}) {
+  return (
+    <section className="order-1 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">{title}</div>
+          <div className="mt-1 text-sm text-slate-400">{description}</div>
+          <div className="mt-2 text-xs text-slate-500">
+            Active {activePositions.length} · closed {closedPositions.length}. Click any column header to sort this book.
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">{extraAction}</div>
+      </div>
+      <div className="mt-4">
+        <PositionManagementTable
+          positions={activePositions}
+          emptyMessage={activeEmptyMessage}
+          onViewDetails={onViewDetails}
+          onEditStops={onEditStops}
+          onClose={onClose}
+          onMarkOverride={onMarkOverride}
+          onViewTrace={onViewTrace}
+        />
+      </div>
+      <div className="mt-6 rounded-2xl border border-border bg-black/20 p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Closed {title.toLowerCase()}</div>
+            <div className="mt-1 text-sm text-slate-400">Closed rows stay separate from active positions. Clean them when you no longer need them in this workspace.</div>
+          </div>
+          <button
+            type="button"
+            disabled={!closedPositions.length}
+            onClick={onCleanClosed}
+            className="rounded-xl border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {cleanLabel}
+          </button>
+        </div>
+        <div className="mt-4">
+          <PositionManagementTable
+            positions={closedPositions}
+            emptyMessage={closedEmptyMessage}
+            onViewDetails={onViewDetails}
+            onEditStops={onEditStops}
+            onClose={onClose}
+            onMarkOverride={onMarkOverride}
+            onViewTrace={onViewTrace}
+          />
+        </div>
+      </div>
+    </section>
   );
 }
 

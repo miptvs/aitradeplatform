@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import type { Signal } from "@/types";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatDateTime } from "@/lib/utils";
 import { StatusBadge } from "@/components/ui/status-badge";
 
 export function SignalsTable({
@@ -35,14 +35,14 @@ export function SignalsTable({
           <tbody>
             {signals.map((signal) => (
               <tr key={signal.id}>
-                <td>{signal.occurred_at.slice(0, 16).replace("T", " ")}</td>
+                <td>{formatDateTime(signal.occurred_at)}</td>
                 <td>
                   <div className="font-semibold text-slate-100">{signal.symbol}</div>
                   <div className="text-xs text-slate-400">{signal.asset_name}</div>
                 </td>
                 <td className="text-slate-200">
                   <div className="font-semibold uppercase">{signalActionLabel(signal)}</div>
-                  {signal.action === "sell" ? (
+                  {["sell", "close_long", "reduce_long", "short", "cover_short"].includes(signal.action) ? (
                     <div className="mt-1 text-[11px] uppercase tracking-[0.14em] text-slate-500">
                       {signalIntentLabel(signal)}
                     </div>
@@ -98,6 +98,10 @@ function truncateText(value: string, maxLength: number) {
 }
 
 function signalActionLabel(signal: Signal) {
+  if (signal.action === "close_long") return "Close long";
+  if (signal.action === "reduce_long") return "Reduce long";
+  if (signal.action === "short") return "Short";
+  if (signal.action === "cover_short") return "Cover short";
   if (signal.action === "sell") {
     return signal.metadata_json?.trade_intent === "close_long" ? "Close / Sell" : "Sell";
   }
@@ -109,5 +113,9 @@ function signalActionLabel(signal: Signal) {
 
 function signalIntentLabel(signal: Signal) {
   if (signal.metadata_json?.trade_intent === "close_long") return "Exit held position";
+  if (signal.metadata_json?.trade_intent === "reduce_long") return "Trim held position";
+  if (signal.metadata_json?.trade_intent === "open_short") return "Bearish short setup";
+  if (signal.metadata_json?.trade_intent === "cover_short") return "Cover short exposure";
+  if (signal.metadata_json?.trade_intent === "bearish_watch") return "Bearish watch";
   return "Directional sell signal";
 }

@@ -116,6 +116,8 @@ class NewsFeedDiagnostic(BaseModel):
 
 class NewsRefreshResponse(BaseModel):
     message: str
+    run_type: str = "manual"
+    observed_at: str | None = None
     articles_added: int
     feeds_checked: int
     feeds_failed: int

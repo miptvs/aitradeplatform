@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { Dialog } from "@/components/ui/dialog";
 import { ModeBadge } from "@/components/ui/mode-badge";
 import { StatusBadge } from "@/components/ui/status-badge";
-import { formatCurrency, formatPct, formatQuantity } from "@/lib/utils";
+import { formatCurrency, formatDateTime, formatPct, formatQuantity } from "@/lib/utils";
 import type { Signal, SignalTrace } from "@/types";
 
 export function SignalTraceDialog({
@@ -97,7 +97,7 @@ export function ProvenanceDialog({
                   <div className="text-xs uppercase tracking-[0.18em] text-emerald-200">Latest review decision</div>
                   <div className="mt-2 text-sm leading-6 text-slate-200">
                     {latestEvaluation.evaluator} recorded {latestEvaluation.outcome || (latestEvaluation.approved ? "approved" : "rejected")} at{" "}
-                    {latestEvaluation.created_at.slice(0, 16).replace("T", " ")}.
+                    {formatDateTime(latestEvaluation.created_at)}.
                   </div>
                   <div className="mt-1 text-sm text-slate-300">{latestEvaluation.reason || "No review note was stored."}</div>
                 </div>
@@ -163,7 +163,7 @@ export function ProvenanceDialog({
                     {article.title}
                   </a>
                   <div className="mt-1 text-xs text-slate-400">
-                    {article.source} · {article.published_at.slice(0, 16).replace("T", " ")} · {article.sentiment || "unclassified"}
+                    {article.source} · {formatDateTime(article.published_at)} · {article.sentiment || "unclassified"}
                   </div>
                 </div>
               ))}
@@ -212,7 +212,7 @@ export function ProvenanceDialog({
                     <div>TP {moneyish(item.take_profit)}</div>
                     <div>TR {moneyish(item.trailing_stop)}</div>
                   </div>
-                  {item.observed_at ? <div className="mt-2 text-xs text-slate-500">{String(item.observed_at).slice(0, 16).replace("T", " ")}</div> : null}
+                  {item.observed_at ? <div className="mt-2 text-xs text-slate-500">{formatDateTime(String(item.observed_at))}</div> : null}
                 </div>
               ))}
             />
@@ -230,7 +230,7 @@ export function ProvenanceDialog({
                       <StatusBadge status={evaluation.outcome || (evaluation.approved ? "approved" : "rejected")} />
                     </div>
                   </div>
-                  <div className="mt-2 text-xs text-slate-400">{evaluation.created_at.slice(0, 16).replace("T", " ")}</div>
+                  <div className="mt-2 text-xs text-slate-400">{formatDateTime(evaluation.created_at)}</div>
                   <div className="mt-2 text-sm text-slate-300">{evaluation.reason || "No evaluation note was stored."}</div>
                 </div>
               ))}
@@ -284,7 +284,7 @@ export function ProvenanceDialog({
                     <ModeBadge mode={trade.mode} />
                   </div>
                   <div className="mt-2 text-xs text-slate-400">
-                    {trade.executed_at.slice(0, 16).replace("T", " ")} · {trade.side} · {formatQuantity(trade.quantity, 6)}
+                    {formatDateTime(trade.executed_at)} · {trade.side} · {formatQuantity(trade.quantity, 6)}
                   </div>
                   <div className="mt-2 text-sm text-slate-300">
                     Price {formatCurrency(trade.price)} · Realized {formatCurrency(trade.realized_pnl)}
@@ -306,7 +306,7 @@ export function ProvenanceDialog({
                   </div>
                 </div>
                 <div className="mt-2 text-xs text-slate-400">
-                  {item.occurred_at.slice(0, 16).replace("T", " ")} · {item.mode || "system"} · {item.target_type}
+                  {formatDateTime(item.occurred_at)} · {item.mode || "system"} · {item.target_type}
                 </div>
               </div>
             ))}

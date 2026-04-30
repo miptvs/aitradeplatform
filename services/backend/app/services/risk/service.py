@@ -14,6 +14,12 @@ from app.utils.time import utcnow
 settings = get_settings()
 
 
+BUY_LIKE_ACTIONS = {"buy", "short"}
+SELL_LIKE_ACTIONS = {"sell", "close_long", "reduce_long", "cover_short"}
+LONG_EXIT_ACTIONS = {"sell", "close_long", "reduce_long"}
+SHORT_ACTIONS = {"short", "cover_short"}
+
+
 class RiskService:
     def list_rules(self, db: Session) -> list[RiskRule]:
         return list(db.scalars(select(RiskRule).order_by(RiskRule.name)))
@@ -35,6 +41,7 @@ class RiskService:
     def validate_order(self, db: Session, payload: RiskValidationRequest) -> RiskValidationResponse:
         checks: list[RiskCheck] = []
         price = payload.requested_price or market_data_service.get_latest_price(db, payload.asset_id)
+        side = self._normalize_side(payload.side)
         notional = payload.quantity * price
         rules = [rule for rule in self.list_rules(db) if rule.enabled]
 
@@ -47,20 +54,22 @@ class RiskService:
         for rule in rules:
             if rule.rule_type == "kill_switch":
                 checks.append(self._kill_switch_check(rule))
+            elif rule.rule_type == "cash_reserve":
+                checks.append(self._cash_reserve_check(db, rule, payload, price))
             elif rule.rule_type == "max_position_size":
-                checks.append(self._max_position_size_check(rule, notional, payload.quantity))
+                checks.append(self._max_position_size_check(rule, abs(notional), payload.quantity))
             elif rule.rule_type == "max_capital_per_asset":
                 checks.append(self._max_capital_per_asset_check(db, rule, payload, notional))
             elif rule.rule_type == "max_open_positions":
-                checks.append(self._max_open_positions_check(db, rule, payload.mode))
+                checks.append(self._max_open_positions_check(db, rule, payload))
             elif rule.rule_type == "max_sector_exposure":
                 checks.append(self._max_sector_exposure_check(db, rule, payload, notional))
             elif rule.rule_type == "daily_max_loss":
-                checks.append(self._daily_max_loss_check(db, rule, payload.mode, payload.simulation_account_id))
+                checks.append(self._daily_max_loss_check(db, rule, payload))
             elif rule.rule_type == "max_drawdown_halt":
-                checks.append(self._max_drawdown_check(db, rule, payload.mode))
+                checks.append(self._max_drawdown_check(db, rule, payload))
             elif rule.rule_type == "loss_streak_cooldown":
-                checks.append(self._loss_streak_check(db, rule, payload.mode))
+                checks.append(self._loss_streak_check(db, rule, payload))
             elif rule.rule_type == "per_trade_risk":
                 checks.append(self._per_trade_risk_check(rule, payload, price))
             elif rule.rule_type == "market_hours":
@@ -83,8 +92,9 @@ class RiskService:
         return RiskCheck(rule="mode_consistency", passed=True, reason="Mode consistency check passed.")
 
     def _cash_check(self, db: Session, payload: RiskValidationRequest, price: float) -> RiskCheck:
-        if payload.side == "sell":
-            return RiskCheck(rule="cash_availability", passed=True, reason="Sell orders do not consume cash.")
+        side = self._normalize_side(payload.side)
+        if side in SELL_LIKE_ACTIONS:
+            return RiskCheck(rule="cash_availability", passed=True, reason="This action does not require new cash.")
         notional = payload.quantity * price
         if payload.mode == "simulation":
             from app.models.simulation import SimulationAccount
@@ -92,6 +102,13 @@ class RiskService:
             account = db.get(SimulationAccount, payload.simulation_account_id)
             if account is None:
                 return RiskCheck(rule="cash_availability", passed=False, reason="Simulation account not found.")
+            if side == "short" and not account.short_enabled:
+                return RiskCheck(
+                    rule="cash_availability",
+                    passed=False,
+                    reason="Short simulation is disabled for this simulation account.",
+                    details={"short_enabled": account.short_enabled},
+                )
             passed = account.cash_balance >= notional
             return RiskCheck(
                 rule="cash_availability",
@@ -99,16 +116,13 @@ class RiskService:
                 reason="Sufficient simulation cash." if passed else "Insufficient simulation cash balance.",
                 details={"cash_balance": account.cash_balance, "required": notional},
             )
-        latest_snapshot = db.scalar(
-            select(PortfolioSnapshot).where(PortfolioSnapshot.mode == "live").order_by(desc(PortfolioSnapshot.timestamp)).limit(1)
-        )
-        available_cash = latest_snapshot.cash if latest_snapshot else 0
-        if available_cash <= 0 and payload.broker_account_id:
-            from app.models.broker import BrokerAccount
-
-            broker_account = db.get(BrokerAccount, payload.broker_account_id)
-            if broker_account is not None:
-                available_cash = float(broker_account.settings_json.get("available_cash", 0) or 0)
+        if side == "short":
+            return RiskCheck(
+                rule="cash_availability",
+                passed=False,
+                reason="Live short execution is not supported by the configured broker adapter.",
+            )
+        available_cash = self._cash_balance(db, payload.mode, payload.simulation_account_id, payload.broker_account_id)
         passed = available_cash >= notional
         return RiskCheck(
             rule="cash_availability",
@@ -128,6 +142,19 @@ class RiskService:
                 )
             )
         )
+        if payload.simulation_account_id:
+            existing = [
+                order
+                for order in existing
+                if (order.audit_context or {}).get("simulation_account_id") == payload.simulation_account_id
+                or (
+                    order.position_id
+                    and (position := db.get(Position, order.position_id))
+                    and position.simulation_account_id == payload.simulation_account_id
+                )
+            ]
+        if payload.broker_account_id:
+            existing = [order for order in existing if order.broker_account_id == payload.broker_account_id]
         passed = len(existing) == 0
         return RiskCheck(
             rule="duplicate_order",
@@ -136,27 +163,34 @@ class RiskService:
         )
 
     def _holding_check(self, db: Session, payload: RiskValidationRequest) -> RiskCheck:
-        if payload.side != "sell":
-            return RiskCheck(rule="position_holding", passed=True, reason="Buy orders do not require an existing position.")
-        position = db.scalar(
-            select(Position).where(
-                Position.asset_id == payload.asset_id,
-                Position.mode == payload.mode,
-                Position.status == "open",
-            )
-        )
+        side = self._normalize_side(payload.side)
+        if side not in SELL_LIKE_ACTIONS:
+            return RiskCheck(rule="position_holding", passed=True, reason="Opening actions do not require an existing position.")
+        position = self._current_position(db, payload)
         held = position.quantity if position else 0
+        if side == "cover_short":
+            coverable = abs(held) if held < 0 else 0
+            passed = coverable >= payload.quantity
+            return RiskCheck(
+                rule="position_holding",
+                passed=passed,
+                reason="Cover quantity is within current short exposure." if passed else "Cover quantity exceeds current short exposure.",
+                details={"held_short_quantity": coverable, "requested": payload.quantity},
+            )
         passed = held >= payload.quantity
         return RiskCheck(
             rule="position_holding",
             passed=passed,
-            reason="Sell quantity is covered by current position." if passed else "Sell quantity exceeds current holdings.",
+            reason="Sell/reduce quantity is covered by current long position." if passed else "Sell/reduce quantity exceeds current long holdings.",
             details={"held": held, "requested": payload.quantity},
         )
 
     def _protective_levels_check(self, payload: RiskValidationRequest, price: float) -> RiskCheck:
-        if payload.side == "buy" and payload.stop_loss is not None and payload.stop_loss >= price:
+        side = self._normalize_side(payload.side)
+        if side == "buy" and payload.stop_loss is not None and payload.stop_loss >= price:
             return RiskCheck(rule="protective_levels", passed=False, reason="Stop loss must be below entry price for long buy orders.")
+        if side == "short" and payload.stop_loss is not None and payload.stop_loss <= price:
+            return RiskCheck(rule="protective_levels", passed=False, reason="Stop loss must be above entry price for simulated short orders.")
         return RiskCheck(rule="protective_levels", passed=True, reason="Protective levels check passed.")
 
     def _kill_switch_check(self, rule: RiskRule) -> RiskCheck:
@@ -180,14 +214,56 @@ class RiskService:
             reason = "Requested notional exceeds the configured max position size."
         return RiskCheck(rule=rule.rule_type, passed=passed, reason=reason, details={"notional": notional, "quantity": quantity})
 
-    def _max_capital_per_asset_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest, notional: float) -> RiskCheck:
-        portfolio_value = self._portfolio_value(db, payload.mode, payload.simulation_account_id)
-        asset_exposure = sum(
-            p.current_price * p.quantity
-            for p in db.scalars(
-                select(Position).where(Position.asset_id == payload.asset_id, Position.mode == payload.mode, Position.status == "open")
+    def _cash_reserve_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest, price: float) -> RiskCheck:
+        side = self._normalize_side(payload.side)
+        if side not in BUY_LIKE_ACTIONS:
+            return RiskCheck(rule=rule.rule_type, passed=True, reason="Cash reserve does not apply to reductions or closes.")
+        if payload.mode == "live" and side == "short":
+            return RiskCheck(rule=rule.rule_type, passed=False, reason="Live shorts are unsupported; cash reserve cannot approve this action.")
+
+        reserve_pct = self._cash_reserve_percent(db, rule, payload.mode, payload.simulation_account_id)
+        if reserve_pct <= 0:
+            return RiskCheck(rule=rule.rule_type, passed=True, reason="Cash reserve rule is configured at 0%.")
+
+        cash_balance = self._cash_balance(db, payload.mode, payload.simulation_account_id, payload.broker_account_id)
+        portfolio_value = max(self._portfolio_value(db, payload.mode, payload.simulation_account_id, payload.broker_account_id), cash_balance)
+        reserve_amount = portfolio_value * reserve_pct
+        available_to_trade = max(cash_balance - reserve_amount, 0.0)
+        required = payload.quantity * price
+        passed = required <= available_to_trade
+        if passed:
+            reason = f"Order keeps at least {reserve_pct:.0%} of account value in cash."
+        elif available_to_trade <= 0:
+            reason = (
+                f"Order not processed because the {reserve_pct:.0%} cash reserve leaves no available-to-trade cash."
             )
+        else:
+            reason = (
+                f"Order not processed because it would breach the {reserve_pct:.0%} cash reserve. "
+                f"Available to trade is {available_to_trade:.2f}."
+            )
+        return RiskCheck(
+            rule=rule.rule_type,
+            passed=passed,
+            reason=reason,
+            details={
+                "cash_balance": round(cash_balance, 2),
+                "portfolio_value": round(portfolio_value, 2),
+                "reserve_pct": reserve_pct,
+                "reserve_amount": round(reserve_amount, 2),
+                "available_to_trade": round(available_to_trade, 2),
+                "required": round(required, 2),
+            },
         )
+
+    def _max_capital_per_asset_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest, notional: float) -> RiskCheck:
+        portfolio_value = self._portfolio_value(db, payload.mode, payload.simulation_account_id, payload.broker_account_id)
+        positions_stmt = select(Position).where(Position.asset_id == payload.asset_id, Position.mode == payload.mode, Position.status == "open")
+        if payload.simulation_account_id:
+            positions_stmt = positions_stmt.where(Position.simulation_account_id == payload.simulation_account_id)
+        if payload.broker_account_id:
+            positions_stmt = positions_stmt.where(Position.broker_account_id == payload.broker_account_id)
+        asset_exposure = sum(p.current_price * p.quantity for p in db.scalars(positions_stmt))
         limit_pct = float(rule.config_json.get("max_pct", 0.25))
         passed = portfolio_value == 0 or ((asset_exposure + notional) / portfolio_value) <= limit_pct
         return RiskCheck(
@@ -197,9 +273,14 @@ class RiskService:
             details={"portfolio_value": portfolio_value, "asset_exposure": asset_exposure, "limit_pct": limit_pct},
         )
 
-    def _max_open_positions_check(self, db: Session, rule: RiskRule, mode: str) -> RiskCheck:
+    def _max_open_positions_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest) -> RiskCheck:
         max_positions = int(rule.config_json.get("max_open_positions", 10))
-        open_positions = len(list(db.scalars(select(Position).where(Position.mode == mode, Position.status == "open"))))
+        stmt = select(Position).where(Position.mode == payload.mode, Position.status == "open")
+        if payload.simulation_account_id:
+            stmt = stmt.where(Position.simulation_account_id == payload.simulation_account_id)
+        if payload.broker_account_id:
+            stmt = stmt.where(Position.broker_account_id == payload.broker_account_id)
+        open_positions = len(list(db.scalars(stmt)))
         passed = open_positions < max_positions
         return RiskCheck(
             rule=rule.rule_type,
@@ -213,9 +294,14 @@ class RiskService:
         sector = asset.sector if asset else None
         if not sector:
             return RiskCheck(rule=rule.rule_type, passed=True, reason="Sector unknown; sector exposure check skipped.")
-        portfolio_value = self._portfolio_value(db, payload.mode, payload.simulation_account_id)
+        portfolio_value = self._portfolio_value(db, payload.mode, payload.simulation_account_id, payload.broker_account_id)
         sector_exposure = 0.0
-        positions = list(db.scalars(select(Position).where(Position.mode == payload.mode, Position.status == "open")))
+        positions_stmt = select(Position).where(Position.mode == payload.mode, Position.status == "open")
+        if payload.simulation_account_id:
+            positions_stmt = positions_stmt.where(Position.simulation_account_id == payload.simulation_account_id)
+        if payload.broker_account_id:
+            positions_stmt = positions_stmt.where(Position.broker_account_id == payload.broker_account_id)
+        positions = list(db.scalars(positions_stmt))
         for position in positions:
             position_asset = db.get(Asset, position.asset_id)
             if position_asset and position_asset.sector == sector:
@@ -229,14 +315,36 @@ class RiskService:
             details={"sector": sector, "sector_exposure": sector_exposure, "portfolio_value": portfolio_value},
         )
 
-    def _daily_max_loss_check(self, db: Session, rule: RiskRule, mode: str, simulation_account_id: str | None) -> RiskCheck:
+    def _daily_max_loss_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest) -> RiskCheck:
         today = utcnow().date()
+        trades_stmt = select(Trade).where(Trade.mode == payload.mode)
+        trades = list(db.scalars(trades_stmt))
+        if payload.simulation_account_id:
+            trades = [
+                trade
+                for trade in trades
+                if not trade.position_id
+                or (
+                    (position := db.get(Position, trade.position_id))
+                    and position.simulation_account_id == payload.simulation_account_id
+                )
+            ]
+        if payload.broker_account_id:
+            trades = [
+                trade
+                for trade in trades
+                if not trade.position_id
+                or (
+                    (position := db.get(Position, trade.position_id))
+                    and position.broker_account_id == payload.broker_account_id
+                )
+            ]
         losses = sum(
             min(trade.realized_pnl, 0)
-            for trade in db.scalars(select(Trade).where(Trade.mode == mode))
+            for trade in trades
             if trade.executed_at.date() == today
         )
-        account_value = max(self._portfolio_value(db, mode, simulation_account_id), 0.0)
+        account_value = max(self._portfolio_value(db, payload.mode, payload.simulation_account_id, payload.broker_account_id), 0.0)
         limit_pct = abs(float(rule.config_json.get("max_daily_loss_pct", 0)))
         if limit_pct <= 0:
             legacy_limit_abs = abs(float(rule.config_json.get("max_daily_loss", 1500)))
@@ -252,12 +360,13 @@ class RiskService:
             details={"daily_loss": losses, "account_value": account_value, "limit_pct": limit_pct, "limit_amount": -limit_abs},
         )
 
-    def _max_drawdown_check(self, db: Session, rule: RiskRule, mode: str) -> RiskCheck:
-        snapshots = list(
-            db.scalars(
-                select(PortfolioSnapshot).where(PortfolioSnapshot.mode == mode).order_by(PortfolioSnapshot.timestamp.asc()).limit(200)
-            )
-        )
+    def _max_drawdown_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest) -> RiskCheck:
+        stmt = select(PortfolioSnapshot).where(PortfolioSnapshot.mode == payload.mode)
+        if payload.simulation_account_id:
+            stmt = stmt.where(PortfolioSnapshot.simulation_account_id == payload.simulation_account_id)
+        if payload.broker_account_id:
+            stmt = stmt.where(PortfolioSnapshot.broker_account_id == payload.broker_account_id)
+        snapshots = list(db.scalars(stmt.order_by(PortfolioSnapshot.timestamp.asc()).limit(200)))
         if len(snapshots) < 2:
             return RiskCheck(rule=rule.rule_type, passed=True, reason="Not enough data for drawdown check.")
         peak = snapshots[0].total_value
@@ -275,10 +384,31 @@ class RiskService:
             details={"max_drawdown": max_drawdown, "limit_pct": limit_pct},
         )
 
-    def _loss_streak_check(self, db: Session, rule: RiskRule, mode: str) -> RiskCheck:
+    def _loss_streak_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest) -> RiskCheck:
         streak_limit = int(rule.config_json.get("loss_streak", 3))
         cooldown_minutes = int(rule.config_json.get("cooldown_minutes", 60))
-        trades = list(db.scalars(select(Trade).where(Trade.mode == mode).order_by(desc(Trade.executed_at)).limit(streak_limit)))
+        trades = list(db.scalars(select(Trade).where(Trade.mode == payload.mode).order_by(desc(Trade.executed_at)).limit(50)))
+        if payload.simulation_account_id:
+            trades = [
+                trade
+                for trade in trades
+                if not trade.position_id
+                or (
+                    (position := db.get(Position, trade.position_id))
+                    and position.simulation_account_id == payload.simulation_account_id
+                )
+            ]
+        if payload.broker_account_id:
+            trades = [
+                trade
+                for trade in trades
+                if not trade.position_id
+                or (
+                    (position := db.get(Position, trade.position_id))
+                    and position.broker_account_id == payload.broker_account_id
+                )
+            ]
+        trades = trades[:streak_limit]
         consecutive_losses = 0
         last_loss_time = None
         for trade in trades:
@@ -330,7 +460,7 @@ class RiskService:
             reason="Within configured market hours." if passed else "Order blocked outside configured market hours.",
         )
 
-    def _portfolio_value(self, db: Session, mode: str, simulation_account_id: str | None) -> float:
+    def _portfolio_value(self, db: Session, mode: str, simulation_account_id: str | None, broker_account_id: str | None = None) -> float:
         if mode == "simulation" and simulation_account_id:
             snapshot = db.scalar(
                 select(PortfolioSnapshot)
@@ -338,12 +468,83 @@ class RiskService:
                 .order_by(desc(PortfolioSnapshot.timestamp))
                 .limit(1)
             )
+        elif mode == "live" and broker_account_id:
+            snapshot = db.scalar(
+                select(PortfolioSnapshot)
+                .where(PortfolioSnapshot.mode == mode, PortfolioSnapshot.broker_account_id == broker_account_id)
+                .order_by(desc(PortfolioSnapshot.timestamp))
+                .limit(1)
+            )
         else:
             snapshot = db.scalar(select(PortfolioSnapshot).where(PortfolioSnapshot.mode == mode).order_by(desc(PortfolioSnapshot.timestamp)).limit(1))
         if snapshot:
             return snapshot.total_value
-        positions = list(db.scalars(select(Position).where(Position.mode == mode, Position.status == "open")))
-        return sum(position.current_price * position.quantity for position in positions)
+        cash = self._cash_balance(db, mode, simulation_account_id, broker_account_id)
+        stmt = select(Position).where(Position.mode == mode, Position.status == "open")
+        if simulation_account_id:
+            stmt = stmt.where(Position.simulation_account_id == simulation_account_id)
+        if broker_account_id:
+            stmt = stmt.where(Position.broker_account_id == broker_account_id)
+        positions = list(db.scalars(stmt))
+        return cash + sum(position.current_price * position.quantity for position in positions)
+
+    def _cash_balance(
+        self,
+        db: Session,
+        mode: str,
+        simulation_account_id: str | None,
+        broker_account_id: str | None,
+    ) -> float:
+        if mode == "simulation" and simulation_account_id:
+            from app.models.simulation import SimulationAccount
+
+            account = db.get(SimulationAccount, simulation_account_id)
+            return float(account.cash_balance if account else 0)
+        if mode == "live" and broker_account_id:
+            from app.models.broker import BrokerAccount
+
+            broker_account = db.get(BrokerAccount, broker_account_id)
+            if broker_account is not None:
+                return float(
+                    broker_account.settings_json.get("available_cash")
+                    or broker_account.settings_json.get("cash_balance")
+                    or 0
+                )
+        snapshot = db.scalar(select(PortfolioSnapshot).where(PortfolioSnapshot.mode == mode).order_by(desc(PortfolioSnapshot.timestamp)).limit(1))
+        return float(snapshot.cash if snapshot else 0)
+
+    def _cash_reserve_percent(self, db: Session, rule: RiskRule, mode: str, simulation_account_id: str | None) -> float:
+        if mode == "simulation" and simulation_account_id:
+            from app.models.simulation import SimulationAccount
+
+            account = db.get(SimulationAccount, simulation_account_id)
+            if account and account.min_cash_reserve_percent is not None:
+                return max(0.0, min(1.0, float(account.min_cash_reserve_percent)))
+        mode_key = "simulation_override_pct" if mode == "simulation" else "live_override_pct"
+        configured = rule.config_json.get(mode_key)
+        if configured is None:
+            configured = rule.config_json.get("min_cash_reserve_pct", rule.config_json.get("min_cash_reserve_percent", 0))
+        return max(0.0, min(1.0, float(configured or 0)))
+
+    def _current_position(self, db: Session, payload: RiskValidationRequest) -> Position | None:
+        stmt = select(Position).where(
+            Position.asset_id == payload.asset_id,
+            Position.mode == payload.mode,
+            Position.status == "open",
+        )
+        if payload.simulation_account_id:
+            stmt = stmt.where(Position.simulation_account_id == payload.simulation_account_id)
+        if payload.broker_account_id:
+            stmt = stmt.where(Position.broker_account_id == payload.broker_account_id)
+        return db.scalar(stmt)
+
+    def _normalize_side(self, side: str) -> str:
+        normalized = str(side).strip().lower()
+        aliases = {
+            "cover": "cover_short",
+            "buy_to_cover": "cover_short",
+        }
+        return aliases.get(normalized, normalized)
 
 
 risk_service = RiskService()

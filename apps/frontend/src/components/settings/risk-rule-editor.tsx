@@ -80,6 +80,16 @@ const FIELD_SPECS: Record<string, FieldSpec[]> = {
       help: "Maximum share of total account value that can be concentrated in one sector.",
     },
   ],
+  cash_reserve: [
+    {
+      key: "min_cash_reserve_pct",
+      label: "Always keep cash (%)",
+      kind: "percent",
+      min: 0,
+      step: 0.5,
+      help: "Keeps this percentage of portfolio value uninvested as cash. Orders that would use this reserve are blocked or must be reduced.",
+    },
+  ],
   daily_max_loss: [
     {
       key: "max_daily_loss_pct",
@@ -199,6 +209,8 @@ function buildRuleDescription(ruleType: string, config: Record<string, unknown>,
       return `Limit open book size to ${formatQuantity(Number(config.max_open_positions ?? 0), 0)} positions.`;
     case "max_sector_exposure":
       return `Limit total sector exposure to ${formatPct(Number(config.max_sector_pct ?? 0))} of total account value.`;
+    case "cash_reserve":
+      return `Keep at least ${formatPct(Number(config.min_cash_reserve_pct ?? 0))} of account value in cash before allowing new buys or simulated shorts.`;
     case "daily_max_loss":
       return `Pause new orders after daily losses reach ${formatPct(Number(config.max_daily_loss_pct ?? 0))} of total account value.`;
     case "max_drawdown_halt":

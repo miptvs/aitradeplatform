@@ -19,7 +19,7 @@ class TradingAutomationProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     execution_interval_seconds: Mapped[int] = mapped_column(Integer, default=300)
     approval_mode: Mapped[str] = mapped_column(String(30), default="semi_automatic")
     allowed_strategy_slugs: Mapped[list[str]] = mapped_column(default=list)
-    tradable_actions: Mapped[list[str]] = mapped_column(default=lambda: ["buy"])
+    tradable_actions: Mapped[list[str]] = mapped_column(default=lambda: ["buy", "sell", "close_long", "reduce_long"])
     allowed_provider_types: Mapped[list[str]] = mapped_column(default=list)
     confidence_threshold: Mapped[float] = mapped_column(Float, default=0.58)
     default_order_notional: Mapped[float] = mapped_column(Float, default=100.0)

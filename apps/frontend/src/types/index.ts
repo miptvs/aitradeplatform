@@ -257,6 +257,8 @@ export interface NewsFeedDiagnostic {
 
 export interface NewsRefreshDiagnostics {
   message: string;
+  run_type: string;
+  observed_at?: string | null;
   articles_added: number;
   feeds_checked: number;
   feeds_failed: number;
@@ -284,11 +286,15 @@ export interface ExtractedEvent {
 export interface SimulationAccount {
   id: string;
   name: string;
+  provider_type?: string | null;
+  model_name?: string | null;
   starting_cash: number;
   cash_balance: number;
   fees_bps: number;
   slippage_bps: number;
   latency_ms: number;
+  min_cash_reserve_percent?: number | null;
+  short_enabled: boolean;
   is_active: boolean;
   reset_count: number;
 }
@@ -296,6 +302,8 @@ export interface SimulationAccount {
 export interface SignalRefreshResult {
   provider_type: string;
   status: "success" | "noop" | "blocked" | "error" | string;
+  run_type: string;
+  observed_at?: string | null;
   created_signal_ids: string[];
   created_count: number;
   message: string;
@@ -431,7 +439,11 @@ export interface TradingAccountSummary {
   status: string;
   base_currency: string;
   total_value: number;
+  total_cash: number;
   cash_available: number;
+  available_to_trade_cash: number;
+  cash_reserve_percent: number;
+  cash_reserve_amount: number;
   equity: number;
   realized_pnl: number;
   unrealized_pnl: number;
@@ -529,6 +541,14 @@ export interface BrokerAccount {
   last_sync_started_at?: string | null;
   last_sync_completed_at?: string | null;
   last_sync_message?: string | null;
+  cash_balance?: number | null;
+  available_cash?: number | null;
+  invested_value?: number | null;
+  total_value?: number | null;
+  currency?: string | null;
+  short_supported?: boolean | null;
+  synced_positions?: Array<Record<string, unknown>>;
+  synced_pies?: Array<Record<string, unknown>>;
 }
 
 export interface BrokerValidationResult {
@@ -553,6 +573,9 @@ export interface BrokerSyncResult {
   account_message: string;
   positions_message: string;
   orders_message: string;
+  pies_message?: string | null;
+  positions_count: number;
+  pies_count: number;
   supports_execution: boolean;
   supports_sync: boolean;
   started_at?: string | null;
@@ -586,6 +609,7 @@ export interface Alert {
   status: string;
   mode?: string | null;
   source_ref?: string | null;
+  metadata_json?: Record<string, unknown>;
   created_at: string;
 }
 
