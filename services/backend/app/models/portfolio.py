@@ -35,6 +35,24 @@ class Position(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PositionStopEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "position_stop_events"
+
+    position_id: Mapped[str | None] = mapped_column(ForeignKey("positions.id"), nullable=True, index=True)
+    order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    signal_id: Mapped[str | None] = mapped_column(ForeignKey("signals.id"), nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(30), index=True)
+    source: Mapped[str] = mapped_column(String(60))
+    event_type: Mapped[str] = mapped_column(String(60))
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trailing_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
+    triggered_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "orders"
 

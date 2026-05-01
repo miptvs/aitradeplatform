@@ -24,6 +24,7 @@ import type {
   AssetSearchResult,
   Order,
   Position,
+  ReplayRun,
   Signal,
   SignalTrace,
   Trade,
@@ -61,11 +62,16 @@ export function TradingWorkspace({
 }) {
   const workspace = useWorkspace();
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [replayOpen, setReplayOpen] = useState(mode === "simulation");
   const [manualTradingOpen, setManualTradingOpen] = useState(false);
   const [selectedSimulationAccountId, setSelectedSimulationAccountId] = useState("");
   const workspaceState = useApi<TradingWorkspaceData>(
     () => (mode === "live" ? api.getLiveWorkspace() : api.getSimulationWorkspace(selectedSimulationAccountId || undefined)),
     [mode, selectedSimulationAccountId]
+  );
+  const replayRunsState = useApi<ReplayRun[]>(
+    () => (mode === "simulation" ? api.getReplayRuns() : Promise.resolve([])),
+    [mode]
   );
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -127,12 +133,26 @@ export function TradingWorkspace({
   const [stopForm, setStopForm] = useState({ stop_loss: "", take_profit: "", trailing_stop: "", notes: "" });
   const [closePercent, setClosePercent] = useState("");
   const [automationForm, setAutomationForm] = useState<TradingAutomationProfile | null>(null);
+  const [replayForm, setReplayForm] = useState({
+    date_start: "",
+    date_end: "",
+    starting_cash: "10000",
+    selected_models: [] as string[],
+    symbols: [] as string[],
+    fees_bps: "5",
+    slippage_bps: "2",
+    cash_reserve_percent: "20",
+    short_enabled: false,
+    enforce_market_hours: false,
+  });
   const [recommendationBusyId, setRecommendationBusyId] = useState<string | null>(null);
   const [brokerSyncingId, setBrokerSyncingId] = useState<string | null>(null);
   const [clearRiskBusy, setClearRiskBusy] = useState(false);
   const provenance = useProvenanceTrace();
 
   const workspaceData = workspaceState.data;
+  const simulationAccounts = ((workspaceData?.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || []);
+  const brokerAccounts = ((workspaceData?.controls.broker_accounts as Array<Record<string, unknown>> | undefined) || []);
   const localAssetDefaults = useMemo(() => (workspaceData?.assets || []).slice(0, 8).map(toLocalSearchResult), [workspaceData?.assets]);
   const providerOptions = useMemo(
     () => {
@@ -163,6 +183,15 @@ export function TradingWorkspace({
     if (preferredAccountId && !selectedSimulationAccountId) {
       setSelectedSimulationAccountId(preferredAccountId);
     }
+    const modelDefaults = simulationAccounts.map((account) => String(account.provider_type || "")).filter(Boolean).slice(0, 4);
+    const symbolDefaults = (workspaceData.assets || []).map((asset) => asset.symbol).slice(0, 5);
+    setReplayForm((current) => ({
+      ...current,
+      selected_models: current.selected_models.length ? current.selected_models : modelDefaults,
+      symbols: current.symbols.length ? current.symbols : symbolDefaults,
+      date_start: current.date_start || defaultReplayStart(),
+      date_end: current.date_end || defaultReplayEnd(),
+    }));
   }, [mode, selectedSimulationAccountId, workspace.simulationProviderType, workspaceData]);
 
   useEffect(() => {
@@ -261,8 +290,6 @@ export function TradingWorkspace({
   const requestedPrice = Number(orderForm.requested_price || selectedAsset?.latest_price || 0);
   const derivedQuantity = orderForm.sizing_mode === "amount" ? deriveQuantity(orderForm.amount, requestedPrice) : Number(orderForm.quantity || 0);
   const orderNotional = requestedPrice > 0 ? derivedQuantity * requestedPrice : 0;
-  const simulationAccounts = (workspaceData.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || [];
-  const brokerAccounts = (workspaceData.controls.broker_accounts as Array<Record<string, unknown>> | undefined) || [];
   const openPositions = workspaceData.positions.filter((position) => position.status === "open");
   const closedPositions = workspaceData.positions.filter((position) => position.status === "closed");
   const closePreviewPct = closePercent ? Number(closePercent) : 100;
@@ -390,12 +417,12 @@ export function TradingWorkspace({
   async function handleClearRiskNotices() {
     try {
       setClearRiskBusy(true);
-      const result = await api.clearAlerts({ mode, category: "risk" });
+      const result = await api.clearAlerts({ mode, includeSystem: true, warningOnly: true });
       setBanner({
         tone: "success",
         message: result.resolved
-          ? `Cleaned up ${result.resolved} ${mode} risk notice${result.resolved === 1 ? "" : "s"}.`
-          : "No open risk notices needed cleanup.",
+          ? `Cleaned up ${result.resolved} ${mode} warning notice${result.resolved === 1 ? "" : "s"}.`
+          : "No open warning notices needed cleanup.",
       });
       workspaceState.reload();
     } catch (error) {
@@ -465,6 +492,39 @@ export function TradingWorkspace({
           }}
           onSyncLiveBroker={handleSyncLiveBroker}
         />
+
+        {mode === "simulation" ? (
+          <ReplayBacktestPanel
+            open={replayOpen}
+            onToggle={() => setReplayOpen((current) => !current)}
+            workspaceData={workspaceData}
+            simulationAccounts={simulationAccounts}
+            replayRuns={replayRunsState.data || []}
+            loading={replayRunsState.loading}
+            form={replayForm}
+            onChange={setReplayForm}
+            onCreate={async () => {
+              try {
+                const run = await api.createReplayRun({
+                  date_start: new Date(replayForm.date_start).toISOString(),
+                  date_end: new Date(replayForm.date_end).toISOString(),
+                  starting_cash: Number(replayForm.starting_cash || 0),
+                  selected_models: replayForm.selected_models,
+                  symbols: replayForm.symbols,
+                  fees_bps: Number(replayForm.fees_bps || 0),
+                  slippage_bps: Number(replayForm.slippage_bps || 0),
+                  cash_reserve_percent: Math.max(0, Number(replayForm.cash_reserve_percent || 0)) / 100,
+                  short_enabled: replayForm.short_enabled,
+                  config_json: { enforce_market_hours: replayForm.enforce_market_hours },
+                });
+                setBanner({ tone: "success", message: `${run.name} completed for ${run.results.length} model result${run.results.length === 1 ? "" : "s"}.` });
+                replayRunsState.reload();
+              } catch (error) {
+                setBanner({ tone: "error", message: error instanceof Error ? error.message : "Replay run failed." });
+              }
+            }}
+          />
+        ) : null}
 
         <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -1142,7 +1202,18 @@ function AccountSummaryPanel({
   onSaveSimulationSettings: (payload: Record<string, unknown>) => Promise<void>;
   onSyncLiveBroker: (brokerAccountId?: string) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState({ starting_cash: 1000, fees_bps: 5, slippage_bps: 2, latency_ms: 50, min_cash_reserve_percent: "", short_enabled: false });
+  const [draft, setDraft] = useState({
+    starting_cash: 1000,
+    fees_bps: 5,
+    slippage_bps: 2,
+    latency_ms: 50,
+    min_cash_reserve_percent: "",
+    short_enabled: false,
+    short_borrow_fee_bps: 0,
+    short_margin_requirement: 1.5,
+    partial_fill_ratio: 1,
+    enforce_market_hours: false,
+  });
 
   useEffect(() => {
     if (mode !== "simulation") return;
@@ -1158,6 +1229,10 @@ function AccountSummaryPanel({
           ? ""
           : String(Number(current.min_cash_reserve_percent) * 100),
       short_enabled: Boolean(current.short_enabled),
+      short_borrow_fee_bps: Number(current.short_borrow_fee_bps || 0),
+      short_margin_requirement: Number(current.short_margin_requirement || 1.5),
+      partial_fill_ratio: Number(current.partial_fill_ratio || 1),
+      enforce_market_hours: Boolean(current.enforce_market_hours),
     });
   }, [mode, selectedSimulationAccountId, simulationAccounts]);
 
@@ -1211,6 +1286,20 @@ function AccountSummaryPanel({
               label={<HelpTooltip label="Short simulation" help="Allows this simulation account to open short trades that profit if price falls. Live availability depends on broker support and is disabled for Trading212 here." />}
               checked={draft.short_enabled}
               onChange={(checked) => setDraft((current) => ({ ...current, short_enabled: checked }))}
+            />
+            <Field label={<HelpTooltip label="Short borrow fee" help="One-period borrow fee scaffold applied when covering simulated short exposure." />}>
+              <input type="number" value={draft.short_borrow_fee_bps} onChange={(event) => setDraft((current) => ({ ...current, short_borrow_fee_bps: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label={<HelpTooltip label="Short margin requirement" help="Multiplier of short notional required as available cash before opening a simulated short." />}>
+              <input type="number" step="0.1" min="1" value={draft.short_margin_requirement} onChange={(event) => setDraft((current) => ({ ...current, short_margin_requirement: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label={<HelpTooltip label="Partial fill ratio" help="Scaffold for partial fills. 1 means full fills; 0.5 fills half the requested quantity." />}>
+              <input type="number" step="0.05" min="0" max="1" value={draft.partial_fill_ratio} onChange={(event) => setDraft((current) => ({ ...current, partial_fill_ratio: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <ToggleField
+              label={<HelpTooltip label="Market-hours guard" help="Simulation setting scaffold for restricting orders to market-hours windows." />}
+              checked={draft.enforce_market_hours}
+              onChange={(checked) => setDraft((current) => ({ ...current, enforce_market_hours: checked }))}
             />
           </div>
           <div className="flex flex-wrap gap-3">
@@ -1327,11 +1416,16 @@ function SimulationModelComparison({
             <tr>
               <th>Model account</th>
               <th>Cash</th>
+              <th>Reserved</th>
+              <th>Available</th>
               <th>Value</th>
               <th>Return</th>
               <th>Win rate</th>
+              <th>Profit factor</th>
               <th>Drawdown</th>
               <th>Trades</th>
+              <th>Rejected</th>
+              <th>Invalid</th>
               <th>Shorts</th>
             </tr>
           </thead>
@@ -1345,11 +1439,16 @@ function SimulationModelComparison({
                   </button>
                 </td>
                 <td>{formatCurrency(Number(account.cash_balance || 0))}</td>
+                <td>{formatCurrency(Number(account.reserved_cash || account.cash_reserve_amount || 0))}</td>
+                <td>{formatCurrency(Number(account.available_to_trade_cash || 0))}</td>
                 <td>{formatCurrency(Number(account.portfolio_value ?? account.cash_balance ?? 0))}</td>
                 <td>{formatPct(Number(account.total_return || 0))}</td>
                 <td>{formatPct(Number(account.win_rate || 0))}</td>
+                <td>{Number(account.profit_factor || 0).toFixed(2)}</td>
                 <td>{formatPct(Number(account.max_drawdown || 0))}</td>
                 <td>{String(account.trade_count ?? 0)}</td>
+                <td>{String(account.rejected_trade_count ?? 0)}</td>
+                <td>{formatPct(Number(account.invalid_signal_rate || 0))}</td>
                 <td>{Boolean(account.short_enabled) ? "Enabled" : "Off"}</td>
               </tr>
             ))}
@@ -1357,6 +1456,160 @@ function SimulationModelComparison({
         </table>
       </div>
     </div>
+  );
+}
+
+function ReplayBacktestPanel({
+  open,
+  onToggle,
+  workspaceData,
+  simulationAccounts,
+  replayRuns,
+  loading,
+  form,
+  onChange,
+  onCreate,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  workspaceData: TradingWorkspaceData;
+  simulationAccounts: Array<Record<string, unknown>>;
+  replayRuns: ReplayRun[];
+  loading: boolean;
+  form: {
+    date_start: string;
+    date_end: string;
+    starting_cash: string;
+    selected_models: string[];
+    symbols: string[];
+    fees_bps: string;
+    slippage_bps: string;
+    cash_reserve_percent: string;
+    short_enabled: boolean;
+    enforce_market_hours: boolean;
+  };
+  onChange: Dispatch<SetStateAction<any>>;
+  onCreate: () => Promise<void>;
+}) {
+  const modelOptions = Array.from(new Set(simulationAccounts.map((account) => String(account.provider_type || "")).filter(Boolean)));
+  const symbolOptions = workspaceData.assets.map((asset) => asset.symbol).slice(0, 12);
+  const latestRun = replayRuns[0];
+  return (
+    <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+      <button type="button" onClick={onToggle} className="flex w-full flex-col gap-3 text-left md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Replay / Backtest scaffold</div>
+          <div className="mt-1 text-sm text-slate-400">
+            Runs selected models over the same historical window using stored signals and market snapshots. Results are isolated from normal simulation balances.
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge status="scaffold" />
+          <span className="rounded-full border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200">
+            {open ? "Close" : "Open"}
+          </span>
+        </div>
+      </button>
+      {open ? (
+        <div className="mt-4 space-y-4">
+          <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            Scaffold / limited historical data: fills use stored prices at or before each replay timestamp and do not write normal simulation orders, trades, positions, or cash.
+          </div>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <Field label="Start">
+              <input type="datetime-local" value={form.date_start} onChange={(event) => onChange((current: any) => ({ ...current, date_start: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="End">
+              <input type="datetime-local" value={form.date_end} onChange={(event) => onChange((current: any) => ({ ...current, date_end: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Starting cash">
+              <input type="number" value={form.starting_cash} onChange={(event) => onChange((current: any) => ({ ...current, starting_cash: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Cash reserve %">
+              <input type="number" value={form.cash_reserve_percent} onChange={(event) => onChange((current: any) => ({ ...current, cash_reserve_percent: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Fees (bps)">
+              <input type="number" value={form.fees_bps} onChange={(event) => onChange((current: any) => ({ ...current, fees_bps: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Slippage (bps)">
+              <input type="number" value={form.slippage_bps} onChange={(event) => onChange((current: any) => ({ ...current, slippage_bps: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <ToggleField label="Short simulation" checked={form.short_enabled} onChange={(checked) => onChange((current: any) => ({ ...current, short_enabled: checked }))} />
+            <ToggleField label="Market-hours guard" checked={form.enforce_market_hours} onChange={(checked) => onChange((current: any) => ({ ...current, enforce_market_hours: checked }))} />
+          </div>
+          <div className="grid gap-4 xl:grid-cols-2">
+            <CheckList
+              title="Replay models"
+              description="All selected models consume the same chronological market/news window."
+              items={modelOptions.map((provider) => ({ value: provider, label: provider }))}
+              value={form.selected_models}
+              onChange={(next) => onChange((current: any) => ({ ...current, selected_models: next }))}
+            />
+            <CheckList
+              title="Replay symbols"
+              description="Historical snapshots and stored signals are filtered to this symbol set."
+              items={symbolOptions.map((symbol) => ({ value: symbol, label: symbol }))}
+              value={form.symbols}
+              onChange={(next) => onChange((current: any) => ({ ...current, symbols: next }))}
+            />
+          </div>
+          <button type="button" onClick={onCreate} className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">
+            Create replay run
+          </button>
+
+          <div className="rounded-2xl border border-border bg-black/20 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold text-slate-100">Replay results</div>
+              <SummaryChip label="Runs" value={loading ? "Loading" : String(replayRuns.length)} />
+            </div>
+            {!latestRun ? (
+              <div className="mt-4 text-sm text-slate-500">No replay runs yet.</div>
+            ) : (
+              <div className="mt-4 overflow-x-auto">
+                <div className="mb-3 text-xs text-slate-400">
+                  Latest: {latestRun.name} · {formatDateTime(latestRun.created_at)} · {latestRun.status}
+                </div>
+                <table className="min-w-full text-xs">
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      <th>Return</th>
+                      <th>Drawdown</th>
+                      <th>Sharpe</th>
+                      <th>Sortino</th>
+                      <th>Win rate</th>
+                      <th>Profit factor</th>
+                      <th>Trades</th>
+                      <th>Rejected</th>
+                      <th>Invalid</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {latestRun.results.map((result) => (
+                      <tr key={result.id}>
+                        <td>
+                          <div className="font-semibold text-slate-100">{result.provider_type}</div>
+                          <div className="text-[11px] text-slate-400">{result.model_name || "model unset"}</div>
+                        </td>
+                        <td>{formatPct(result.total_return)}</td>
+                        <td>{formatPct(result.max_drawdown)}</td>
+                        <td>{result.sharpe.toFixed(2)}</td>
+                        <td>{result.sortino.toFixed(2)}</td>
+                        <td>{formatPct(result.win_rate)}</td>
+                        <td>{result.profit_factor.toFixed(2)}</td>
+                        <td>{result.trades}</td>
+                        <td>{result.rejected_trades}</td>
+                        <td>{result.invalid_signals}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -1553,6 +1806,7 @@ function OrderEntryPanel({
             <SummaryChip label="Selected asset" value={selectedAsset ? `${selectedAsset.symbol} · ${selectedAsset.name}` : orderForm.asset_symbol || "-"} />
             <SummaryChip label="Estimated quantity" value={formatQuantity(derivedQuantity, 6)} />
             <SummaryChip label="Estimated notional" value={formatCurrency(orderNotional, currentCurrency)} />
+            <SummaryChip label="Reserved cash" value={formatCurrency(workspaceData.account.cash_reserve_amount || 0, currentCurrency)} />
             <SummaryChip label="Available after reserve" value={formatCurrency(workspaceData.account.available_to_trade_cash || 0, currentCurrency)} />
           </div>
         </div>
@@ -2073,4 +2327,19 @@ function formatInterval(seconds?: number | null) {
 function toggleListValue(list: string[], value: string, enabled: boolean) {
   if (enabled) return Array.from(new Set([...list, value]));
   return list.filter((item) => item !== value);
+}
+
+function defaultReplayStart() {
+  const date = new Date();
+  date.setDate(date.getDate() - 30);
+  return toDatetimeLocal(date);
+}
+
+function defaultReplayEnd() {
+  return toDatetimeLocal(new Date());
+}
+
+function toDatetimeLocal(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }

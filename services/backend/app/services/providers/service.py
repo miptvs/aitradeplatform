@@ -303,6 +303,7 @@ class ProviderService:
                     timeout_seconds=timeout_seconds,
                 )
                 result.provider_type = config.provider_type
+                usage_metrics = self._usage_metrics(result.usage, config.settings_json)
                 self._log_run(
                     db,
                     task_name=task_name,
@@ -311,6 +312,10 @@ class ProviderService:
                     status="success",
                     latency_ms=result.latency_ms,
                     output_summary=result.text[:500],
+                    prompt_tokens=usage_metrics["prompt_tokens"],
+                    completion_tokens=usage_metrics["completion_tokens"],
+                    total_tokens=usage_metrics["total_tokens"],
+                    estimated_cost=usage_metrics["estimated_cost"],
                     metadata={"usage": result.usage, **(metadata or {})},
                 )
                 return result
@@ -381,6 +386,10 @@ class ProviderService:
         latency_ms: int | None,
         output_summary: str | None = None,
         error_message: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        estimated_cost: float | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         run = ModelRun(
@@ -389,12 +398,82 @@ class ProviderService:
             model_name=model_name,
             status=status,
             latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated_cost=estimated_cost,
             output_summary=output_summary,
             error_message=error_message,
             metadata_json=metadata or {},
         )
         db.add(run)
         db.flush()
+
+    def _usage_metrics(self, usage: dict[str, Any] | None, settings_json: dict[str, Any] | None = None) -> dict[str, int | float | None]:
+        usage = usage or {}
+        settings_json = settings_json or {}
+        prompt_tokens = self._first_int(
+            usage,
+            "prompt_tokens",
+            "input_tokens",
+            "promptTokenCount",
+            "inputTokenCount",
+            "cache_read_input_tokens",
+        )
+        completion_tokens = self._first_int(
+            usage,
+            "completion_tokens",
+            "output_tokens",
+            "candidatesTokenCount",
+            "outputTokenCount",
+        )
+        total_tokens = self._first_int(usage, "total_tokens", "totalTokenCount")
+        if total_tokens is None and (prompt_tokens is not None or completion_tokens is not None):
+            total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+        estimated_cost = self._estimate_cost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            settings_json=settings_json,
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost": estimated_cost,
+        }
+
+    def _estimate_cost(
+        self,
+        *,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        settings_json: dict[str, Any],
+    ) -> float | None:
+        input_per_million = settings_json.get("input_cost_per_million")
+        output_per_million = settings_json.get("output_cost_per_million")
+        if input_per_million is None:
+            input_per_million = settings_json.get("input_cost_per_1m")
+        if output_per_million is None:
+            output_per_million = settings_json.get("output_cost_per_1m")
+        if input_per_million is None and settings_json.get("input_cost_per_1k") is not None:
+            input_per_million = float(settings_json["input_cost_per_1k"]) * 1000
+        if output_per_million is None and settings_json.get("output_cost_per_1k") is not None:
+            output_per_million = float(settings_json["output_cost_per_1k"]) * 1000
+        if input_per_million is None and output_per_million is None:
+            return None
+        input_cost = (float(prompt_tokens or 0) / 1_000_000) * float(input_per_million or 0)
+        output_cost = (float(completion_tokens or 0) / 1_000_000) * float(output_per_million or input_per_million or 0)
+        return round(input_cost + output_cost, 6)
+
+    def _first_int(self, payload: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     def recent_runs(self, db: Session) -> list[ModelRun]:
         return list(db.scalars(select(ModelRun).order_by(desc(ModelRun.created_at)).limit(50)))

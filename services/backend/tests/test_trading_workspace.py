@@ -118,6 +118,7 @@ def test_simulation_automation_can_submit_order_from_candidate_signal() -> None:
     assert trade.id in {item["id"] for item in position_trace["trades"]}
     assert order_trace["risk_checks"] is not None
     assert position_trace["stop_history"]
+    assert "simulation_fill" in {item["source"] for item in position_trace["stop_history"]}
 
 
 def test_automation_skips_buy_when_cash_reserve_leaves_no_trade_budget() -> None:
@@ -562,3 +563,77 @@ def test_live_signal_approval_rejects_wrong_model_profile() -> None:
         assert "locked to openai_live" in str(exc)
     else:
         raise AssertionError("Expected live approval to reject the wrong provider profile.")
+
+
+def test_live_automation_allows_configured_healthy_model_for_review_queue() -> None:
+    db = build_session()
+    asset = Asset(symbol="OKLIVE", name="Healthy Live Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.add(
+        ProviderConfig(
+            provider_type="openai_live",
+            name="ChatGPT / OpenAI / Actual Trading",
+            enabled=True,
+            base_url="https://api.openai.com/v1",
+            default_model="gpt-5.2",
+            temperature=0.2,
+            max_tokens=512,
+            context_window=400000,
+            tool_calling_enabled=True,
+            reasoning_mode="minimal",
+            task_defaults={},
+            settings_json={},
+            last_health_status="ok",
+            last_health_message="healthy",
+        )
+    )
+    db.add(
+        BrokerAccount(
+            name="Trading212 Live",
+            broker_type="trading212",
+            mode="live",
+            enabled=True,
+            live_trading_enabled=False,
+            status="connected",
+            settings_json={"available_cash": 1000, "total_value": 1000, "currency": "USD", "last_synced_at": utcnow().isoformat()},
+        )
+    )
+    db.flush()
+    db.add(
+        Signal(
+            asset_id=asset.id,
+            action="buy",
+            confidence=0.9,
+            status="candidate",
+            occurred_at=utcnow(),
+            indicators_json={},
+            related_news_ids=[],
+            related_event_ids=[],
+            ai_rationale="Healthy live candidate.",
+            suggested_entry=100,
+            provider_type="openai_live",
+            model_name="gpt-5.2",
+            mode="both",
+            source_kind="agent",
+            metadata_json={"preferred_strategy": "trend-following"},
+        )
+    )
+    trading_workspace_service.upsert_profile(
+        db,
+        "live",
+        TradingAutomationProfileUpsert(
+            automation_enabled=True,
+            approval_mode="semi_automatic",
+            confidence_threshold=0.5,
+            default_order_notional=100,
+            allowed_provider_types=["openai_live"],
+            config_json={"live_model_provider_type": "openai_live"},
+        ),
+    )
+    db.commit()
+
+    result = trading_workspace_service.run_automation(db, "live")
+
+    assert result["status"] == "success"
+    assert result["approved_recommendations"] == 1
+    assert result["submitted_orders"] == 0

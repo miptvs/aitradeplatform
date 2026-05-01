@@ -96,55 +96,63 @@ services:
 
   frontend:
     <<: *frontend-base
-    container_name: ai-trader-frontend-openai
+    container_name: ai-trader-frontend
     ports:
       - "3000:3000"
 
   frontend-anthropic:
     <<: *frontend-base
     container_name: ai-trader-frontend-anthropic
+    profiles: ["multi-provider"]
     ports:
       - "3001:3000"
 
   frontend-gemini:
     <<: *frontend-base
     container_name: ai-trader-frontend-gemini
+    profiles: ["multi-provider"]
     ports:
       - "3002:3000"
 
   frontend-deepseek:
     <<: *frontend-base
     container_name: ai-trader-frontend-deepseek
+    profiles: ["multi-provider"]
     ports:
       - "3003:3000"
 
   frontend-local-gpt-oss:
     <<: *frontend-base
     container_name: ai-trader-frontend-local-gpt-oss
+    profiles: ["multi-provider"]
     ports:
       - "4000:3000"
 
   frontend-local-qwen25:
     <<: *frontend-base
     container_name: ai-trader-frontend-local-qwen25
+    profiles: ["multi-provider"]
     ports:
       - "4001:3000"
 
   frontend-local-qwen3:
     <<: *frontend-base
     container_name: ai-trader-frontend-local-qwen3
+    profiles: ["multi-provider"]
     ports:
       - "4002:3000"
 
   frontend-local-llama3:
     <<: *frontend-base
     container_name: ai-trader-frontend-local-llama3
+    profiles: ["multi-provider"]
     ports:
       - "4003:3000"
 
   frontend-local-deepseek-r1:
     <<: *frontend-base
     container_name: ai-trader-frontend-local-deepseek-r1
+    profiles: ["multi-provider"]
     ports:
       - "4004:3000"
 

@@ -111,6 +111,146 @@ def test_short_simulation_can_profit_when_price_falls() -> None:
     assert position.status == "closed"
 
 
+def test_slippage_affects_simulated_fill_price() -> None:
+    db = build_session()
+    asset = Asset(symbol="SLIP", name="Slippage Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    account = SimulationAccount(name="Slip Sim", starting_cash=1000, cash_balance=1000, fees_bps=0, slippage_bps=100, latency_ms=0)
+    db.add(account)
+    db.flush()
+    order = Order(asset_id=asset.id, mode="simulation", side="buy", order_type="market", quantity=1, requested_price=100, status="accepted", manual=False)
+    db.add(order)
+    db.flush()
+
+    sim_order, _, _ = simulation_service.execute_order_from_order(db, order=order, simulation_account_id=account.id)
+
+    assert sim_order.executed_price == 101
+
+
+def test_short_borrow_fee_affects_cover_short_pnl() -> None:
+    db = build_session()
+    asset = Asset(symbol="BRRW", name="Borrow Fee Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    account = SimulationAccount(
+        name="Borrow Sim",
+        starting_cash=1000,
+        cash_balance=1000,
+        fees_bps=0,
+        slippage_bps=0,
+        latency_ms=0,
+        short_enabled=True,
+        short_borrow_fee_bps=100,
+    )
+    db.add(account)
+    db.flush()
+    short_order = Order(asset_id=asset.id, mode="simulation", side="short", order_type="market", quantity=1, requested_price=100, status="accepted", manual=False)
+    db.add(short_order)
+    db.flush()
+    simulation_service.execute_order_from_order(db, order=short_order, simulation_account_id=account.id)
+    cover_order = Order(asset_id=asset.id, mode="simulation", side="cover_short", order_type="market", quantity=1, requested_price=90, status="accepted", manual=False)
+    db.add(cover_order)
+    db.flush()
+
+    _, sim_trade, _ = simulation_service.execute_order_from_order(db, order=cover_order, simulation_account_id=account.id)
+
+    assert sim_trade.realized_pnl == 9
+
+
+def test_short_margin_rule_blocks_excessive_short_exposure() -> None:
+    from app.schemas.risk import RiskValidationRequest
+    from app.services.risk.service import risk_service
+
+    db = build_session()
+    asset = Asset(symbol="MARG", name="Margin Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    account = SimulationAccount(
+        name="Margin Sim",
+        starting_cash=100,
+        cash_balance=100,
+        fees_bps=0,
+        slippage_bps=0,
+        latency_ms=0,
+        short_enabled=True,
+        short_margin_requirement=1.5,
+    )
+    db.add(account)
+    db.commit()
+
+    result = risk_service.validate_order(
+        db,
+        RiskValidationRequest(
+            asset_id=asset.id,
+            mode="simulation",
+            side="short",
+            quantity=1,
+            requested_price=100,
+            simulation_account_id=account.id,
+        ),
+    )
+
+    assert result.approved is False
+    assert any("margin requirement" in reason for reason in result.rejection_reasons)
+
+
+def test_margin_call_forces_simulated_short_close_when_equity_breaches_requirement() -> None:
+    db = build_session()
+    asset = Asset(symbol="MCALL", name="Margin Call Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow() - timedelta(minutes=2),
+            open_price=100,
+            high_price=100,
+            low_price=100,
+            close_price=100,
+            volume=1000,
+            source="test",
+        )
+    )
+    account = SimulationAccount(
+        name="Margin Call Sim",
+        starting_cash=1000,
+        cash_balance=1000,
+        fees_bps=0,
+        slippage_bps=0,
+        latency_ms=0,
+        short_enabled=True,
+        short_margin_requirement=1.5,
+    )
+    db.add(account)
+    db.flush()
+    short_order = Order(asset_id=asset.id, mode="simulation", side="short", order_type="market", quantity=1, requested_price=100, status="accepted", manual=False)
+    db.add(short_order)
+    db.flush()
+    _, _, position = simulation_service.execute_order_from_order(db, order=short_order, simulation_account_id=account.id)
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow(),
+            open_price=1000,
+            high_price=1000,
+            low_price=1000,
+            close_price=1000,
+            volume=1000,
+            source="test",
+        )
+    )
+    db.flush()
+
+    result = simulation_service.enforce_margin_requirements(db, account.id)
+
+    assert result["status"] == "forced_closed"
+    assert result["forced_closes"][0]["position_id"] == position.id
+    assert position.status == "closed"
+    assert position.quantity == 0
+    assert account.cash_balance == 100
+
+
 def test_per_model_simulation_accounts_are_isolated() -> None:
     db = build_session()
     asset = Asset(symbol="ISO", name="Isolation Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")

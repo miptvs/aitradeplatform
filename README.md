@@ -18,6 +18,10 @@ This iteration upgrades the original MVP in place rather than replacing it:
 - added the configurable “Always keep X% in cash” reserve rule with available-to-trade cash shown in Live and Simulation
 - expanded signal/trading actions beyond buy/sell to include close/reduce long and simulated short/cover-short workflows
 - added separate simulation accounts per provider/model so models can compete side by side
+- added an isolated replay/backtest scaffold for fair same-window model comparison without mutating live-forward simulation ledgers
+- added a model tournament metrics endpoint/table with CSV export for simulation and replay results
+- added operational health output for news freshness, market-data freshness, broker sync, scheduler state, selected live model health, and automation blockers
+- added short realism knobs for simulation: borrow fee, short margin requirement, margin-call forced-close scaffold, partial-fill ratio, and a simplified exchange-hours guard
 - locked live automation to exactly one configured live model profile
 - fixed the RSS refresh path so checkpoint overlap, backfill, duplicates, and per-feed diagnostics are visible
 - preserved the existing provider, risk, audit, broker, and signal foundations instead of resetting the repo
@@ -29,13 +33,15 @@ See [iteration-progress.md](./docs/iteration-progress.md) for a concise analysis
 - `Next.js` frontend with dashboard, positions, orders, signals, simulation, analytics, news, settings, and API docs link
 - `FastAPI` backend with versioned REST routes, SSE stream, SQLAlchemy models, Alembic migration, Celery worker/beat, Redis, and Postgres
 - Provider abstraction with separate simulation/live model profiles for local and remote vendors
-- Dedicated provider entry URLs on `3000-3003` for remote vendors and `4000-4004` for local-model families
+- One default frontend on `3000`; optional provider-specific frontends can be started with the `multi-provider` Compose profile
 - Ollama sidecar image that preloads the configured local model catalog on startup
 - Remote paid-provider scaffolds for `ChatGPT / OpenAI`, `Claude / Anthropic`, `Gemini / Google`, and `DeepSeek API`
 - Central risk engine that validates orders before any simulated or live workflow
 - Cash reserve rule that blocks buy-like orders which would spend the configured cash reserve
 - First-class simulation engine with separate accounts, cash, slippage, fees, latency, and audit history
 - Per-model simulation ledgers for comparing provider/model performance independently
+- Replay/backtest scaffold that stores replay runs/results separately from normal simulation orders, trades, positions, and cash
+- Model comparison metrics and CSV export across simulation accounts and replay runs
 - Broker adapter layer with `paper` and `Trading212` scaffold implementations
 - Real MCP server mounted at `/mcp/` plus backend MCP client integration for standardized tool-based trading context
 - Trading212-backed ticker validation for manual position search when backend API credentials are configured
@@ -59,18 +65,16 @@ docker compose up --build
 
 3. Open the apps:
 
-- Remote provider workspaces:
-  - [http://localhost:3000](http://localhost:3000) for `ChatGPT / OpenAI`
-  - [http://localhost:3001](http://localhost:3001) for `Claude / Anthropic`
-  - [http://localhost:3002](http://localhost:3002) for `Gemini / Google`
-  - [http://localhost:3003](http://localhost:3003) for `DeepSeek API`
-- Local model workspaces:
-  - [http://localhost:4000](http://localhost:4000) for `GPT OSS`
-  - [http://localhost:4001](http://localhost:4001) for `Qwen 2.5`
-  - [http://localhost:4002](http://localhost:4002) for `Qwen 3`
-  - [http://localhost:4003](http://localhost:4003) for `Llama 3.1 / 3.2`
-  - [http://localhost:4004](http://localhost:4004) for `DeepSeek-R1`
+- Frontend: [http://localhost:3000](http://localhost:3000)
 - Backend API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+Optional multi-provider frontend ports:
+
+```bash
+docker compose --profile multi-provider up --build
+```
+
+That additionally starts the provider-specific frontend containers on `3001-3003` and `4000-4004`.
 
 Demo login credentials:
 
@@ -84,6 +88,14 @@ Demo login credentials:
 ./scripts/dev-down.sh
 ./scripts/seed-demo.sh
 docker compose exec -T backend pytest tests -q
+docker compose build backend frontend
+```
+
+Local checks without Docker:
+
+```bash
+cd services/backend && python -m compileall app tests && pytest tests -q
+cd apps/frontend && npm run typecheck && npm run build && npm run test:smoke
 ```
 
 ## Architecture
@@ -112,6 +124,8 @@ The backend uses the official MCP Python SDK on both sides:
 - Trading212 sync also mirrors accessible live holdings and pies into the Live Trading workspace; these are local ledger mirrors, not fake execution.
 - Live automation is locked to exactly one configured live model. Simulation can still use many model accounts independently.
 - Live short execution is not exposed for Trading212 because the adapter does not confirm support. Shorting is simulation-only when enabled per simulation account.
+- Cash reserve is enforced for buy-like actions and simulated shorts; close/reduce/cover actions are not blocked by cash reserve.
+- Replay/backtest results are stored under replay tables and do not alter live balances or normal simulation accounts.
 - Signals are generated once, stored canonically, and can then be reviewed into either simulation or live workflows
 - Market data and signals refresh every 5 minutes by default, news refreshes every 10 minutes, and scheduled simulation automation scans every minute to run only when the configured interval is due
 - Orders, trades, and positions can resolve back into the same provenance chain, including manual-only records that have no origin signal
@@ -141,5 +155,10 @@ The backend uses the official MCP Python SDK on both sides:
 - Local-model signal generation depends on Ollama health and model speed; when a model is too slow or unhealthy the app now reports that clearly instead of showing fake signals
 - Trading212 account cash, holdings, and pies sync is implemented for live display when API permissions allow it. Trading212 execution is intentionally not implemented; account sync/manual mirroring is the intended extension path
 - Trading212 ticker validation uses the authenticated instrument metadata API, so you must set `TRADING212_API_KEY` and `TRADING212_API_SECRET` in the backend env for non-seeded ticker verification
-- Simulation shorts are simplified for MVP comparison and do not model borrow fees, locate availability, or margin calls yet
+- Simulation shorts are simplified for MVP comparison. Borrow fee, margin requirement, margin-call forced-close scaffolding, and simplified exchange-session checks now exist, but locate availability and full order-book/partial-fill market microstructure remain simplified.
+- Replay/backtest uses stored market snapshots and stored model signals in chronological order. It avoids using prices after each replay timestamp, but it is still a scaffold and only as complete as the stored historical data.
 - Authentication is simple local JWT auth suitable for a local deployment, not a hardened multi-user SaaS auth layer
+
+## CI
+
+GitHub Actions runs backend compile/tests, frontend type/build, Playwright smoke tests, and Docker build validation. The smoke tests mock backend API responses for critical money-facing screens: Simulation model comparison/replay/trace, and Live Trading disconnected Trading212 state.

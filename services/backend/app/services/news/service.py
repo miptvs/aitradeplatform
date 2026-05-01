@@ -1,6 +1,7 @@
 import hashlib
 import html
 import re
+import time
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus, urlparse
@@ -14,10 +15,17 @@ from app.core.config import get_settings
 from app.models.asset import Asset
 from app.models.health import SystemHealthEvent
 from app.models.news import ExtractedEvent, NewsArticle
+from app.services.alerts.service import alert_service
 from app.services.events.extraction import event_extraction_service
 from app.utils.time import utcnow
 
 settings = get_settings()
+
+RSS_HEADERS = {
+    "User-Agent": "AITraderPlatform/1.0 (+https://github.com/miptvs/aitradeplatform; RSS refresh)",
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class NewsService:
@@ -180,7 +188,12 @@ class NewsService:
 
                 url = self._prepare_url(entry["url"], entry["guid"])
                 dedupe_key = self._build_dedupe_key(entry)
-                if not url or url in existing_urls or dedupe_key in existing_dedupe_keys:
+                if (
+                    not url
+                    or url in existing_urls
+                    or dedupe_key in existing_dedupe_keys
+                    or self._article_exists(db, url=url, dedupe_key=dedupe_key)
+                ):
                     duplicates_skipped += 1
                     feed_report["duplicate_count"] += 1
                     continue
@@ -291,6 +304,8 @@ class NewsService:
                 observed_at=refresh_started_at,
             )
         )
+        if status != "error":
+            alert_service.resolve_alerts(db, title="news.rss_refresh reported an error")
 
         return {
             "message": message,
@@ -365,9 +380,33 @@ class NewsService:
         return list(dict.fromkeys(urls))
 
     def _fetch_feed(self, feed_url: str) -> str:
-        response = httpx.get(feed_url, timeout=10.0, follow_redirects=True)
-        response.raise_for_status()
-        return response.text
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = httpx.get(feed_url, timeout=12.0, follow_redirects=True, headers=RSS_HEADERS)
+                response.raise_for_status()
+                if not response.text.strip():
+                    raise ValueError("RSS feed returned an empty response.")
+                return response.text
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                break
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("RSS feed fetch failed without a captured error.")
+
+    def _article_exists(self, db: Session, *, url: str, dedupe_key: str | None) -> bool:
+        if not url and not dedupe_key:
+            return False
+        stmt = select(NewsArticle.id).where(NewsArticle.url == url)
+        if dedupe_key:
+            from sqlalchemy import or_
+
+            stmt = select(NewsArticle.id).where(or_(NewsArticle.url == url, NewsArticle.dedupe_key == dedupe_key))
+        return db.scalar(stmt.limit(1)) is not None
 
     def _feed_label(self, feed_url: str) -> str:
         parsed = urlparse(feed_url)

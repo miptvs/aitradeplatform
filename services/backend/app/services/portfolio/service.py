@@ -1,9 +1,11 @@
+from uuid import uuid4
+
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.models.asset import Asset
 from app.models.broker import BrokerAccount
-from app.models.portfolio import Order, PortfolioSnapshot, Position, Trade
+from app.models.portfolio import Order, PortfolioSnapshot, Position, PositionStopEvent, Trade
 from app.schemas.portfolio import OrderCreate, PositionCreate, PositionUpdate
 from app.schemas.risk import RiskValidationRequest
 from app.services.alerts.service import alert_service
@@ -64,6 +66,18 @@ class PortfolioService:
         position.unrealized_pnl = (payload.current_price - payload.avg_entry_price) * payload.quantity
         db.add(position)
         db.flush()
+        self._record_position_stop_event(
+            db,
+            position=position,
+            source="manual_position",
+            event_type="initial_levels",
+            levels={
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+                "trailing_stop": position.trailing_stop,
+            },
+            notes="Initial protective levels from manual position entry.",
+        )
         audit_service.log(
             db,
             actor="system",
@@ -81,9 +95,28 @@ class PortfolioService:
         if position is None:
             raise ValueError("Position not found")
         updates = payload.model_dump(exclude_unset=True)
+        previous_levels = {
+            "stop_loss": position.stop_loss,
+            "take_profit": position.take_profit,
+            "trailing_stop": position.trailing_stop,
+        }
         for key, value in updates.items():
             setattr(position, key, value)
         db.flush()
+        if any(key in updates for key in ("stop_loss", "take_profit", "trailing_stop")):
+            self._record_position_stop_event(
+                db,
+                position=position,
+                source="manual_edit",
+                event_type="levels_updated",
+                levels={
+                    "stop_loss": position.stop_loss,
+                    "take_profit": position.take_profit,
+                    "trailing_stop": position.trailing_stop,
+                },
+                notes="Protective levels updated on position.",
+                metadata={"previous_levels": previous_levels},
+            )
         audit_service.log(
             db,
             actor="system",
@@ -95,6 +128,33 @@ class PortfolioService:
         )
         publish_event("position.updated", {"position_id": position.id})
         return position
+
+    def record_stop_event(
+        self,
+        db: Session,
+        *,
+        position: Position,
+        source: str,
+        event_type: str,
+        levels: dict,
+        order_id: str | None = None,
+        signal_id: str | None = None,
+        triggered_price: float | None = None,
+        notes: str | None = None,
+        metadata: dict | None = None,
+    ) -> PositionStopEvent | None:
+        return self._record_position_stop_event(
+            db,
+            position=position,
+            source=source,
+            event_type=event_type,
+            levels=levels,
+            order_id=order_id,
+            signal_id=signal_id,
+            triggered_price=triggered_price,
+            notes=notes,
+            metadata=metadata,
+        )
 
     def close_position(
         self,
@@ -272,6 +332,7 @@ class PortfolioService:
         return [self._trade_view(db, trade) for trade in trades]
 
     def create_order(self, db: Session, payload: OrderCreate) -> Order:
+        correlation_id = str(uuid4())
         price = payload.requested_price or market_data_service.get_latest_price(db, payload.asset_id)
         quantity = payload.quantity if payload.quantity is not None else ((payload.amount or 0) / price if price else 0)
         if quantity <= 0:
@@ -337,6 +398,7 @@ class PortfolioService:
             entry_reason=payload.entry_reason,
             exit_reason=payload.exit_reason,
             audit_context={
+                "correlation_id": correlation_id,
                 "risk_checks": [check.model_dump() for check in risk_result.checks],
                 "simulation_account_id": simulation_account_id,
                 "protective_levels": protective_levels,
@@ -372,7 +434,7 @@ class PortfolioService:
                 mode=payload.mode,
                 details={"reasons": risk_result.rejection_reasons},
             )
-            publish_event("order.rejected", {"order_id": order.id, "mode": order.mode})
+            publish_event("order.rejected", {"order_id": order.id, "mode": order.mode, "correlation_id": correlation_id})
             return order
 
         if payload.mode == "simulation":
@@ -428,7 +490,7 @@ class PortfolioService:
             mode=payload.mode,
             details={"manual": payload.manual, "quantity": quantity, "amount": payload.amount, "protective_levels": protective_levels},
         )
-        publish_event("order.updated", {"order_id": order.id, "status": order.status})
+        publish_event("order.updated", {"order_id": order.id, "status": order.status, "correlation_id": correlation_id})
         return order
 
     def get_portfolio_summary(self, db: Session, mode: str | None = None) -> dict:
@@ -546,6 +608,41 @@ class PortfolioService:
             currency=payload.currency,
             exchange=payload.exchange,
         )
+
+    def _record_position_stop_event(
+        self,
+        db: Session,
+        *,
+        position: Position,
+        source: str,
+        event_type: str,
+        levels: dict,
+        order_id: str | None = None,
+        signal_id: str | None = None,
+        triggered_price: float | None = None,
+        notes: str | None = None,
+        metadata: dict | None = None,
+    ) -> PositionStopEvent | None:
+        if not any(levels.get(key) is not None for key in ("stop_loss", "take_profit", "trailing_stop")) and triggered_price is None:
+            return None
+        event = PositionStopEvent(
+            position_id=position.id,
+            order_id=order_id,
+            signal_id=signal_id,
+            mode=position.mode,
+            source=source,
+            event_type=event_type,
+            stop_loss=levels.get("stop_loss"),
+            take_profit=levels.get("take_profit"),
+            trailing_stop=levels.get("trailing_stop"),
+            triggered_price=triggered_price,
+            notes=notes,
+            metadata_json=metadata or {},
+            observed_at=utcnow(),
+        )
+        db.add(event)
+        db.flush()
+        return event
 
     def _append_note(self, existing: str | None, note: str) -> str:
         if not existing:
