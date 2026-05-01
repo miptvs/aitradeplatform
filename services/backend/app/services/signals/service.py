@@ -1,14 +1,14 @@
 import json
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.audit import AuditLog
 from app.models.asset import Asset
 from app.models.health import SystemHealthEvent
 from app.models.news import ExtractedEvent, NewsArticle
-from app.models.portfolio import Order, Position, Trade
+from app.models.portfolio import Order, Position, PositionStopEvent, Trade
 from app.models.signal import Signal, SignalEvaluation
 from app.models.strategy import Strategy
 from app.services.portfolio.service import portfolio_service
@@ -777,12 +777,14 @@ class SignalService:
             else []
         )
 
+        stop_events = self._stop_events(db, signal=signal, orders=orders, positions=positions)
+
         return {
             "signal": self._signal_detail_view(db, signal) if signal is not None else None,
             "entrypoint": self._entrypoint_view(db, entrypoint_type, entrypoint_id),
             "summary": self._trace_summary(signal, orders, positions, trades),
             "risk_checks": self._risk_checks_from_orders(orders),
-            "stop_history": self._stop_history(signal, orders, positions, audit_logs),
+            "stop_history": self._stop_history(signal, orders, positions, audit_logs, stop_events),
             "evaluations": [to_plain_dict(item) for item in evaluations],
             "orders": [portfolio_service._order_view(db, order) for order in orders],
             "positions": [portfolio_service._position_view(db, position) for position in positions],
@@ -884,8 +886,26 @@ class SignalService:
         orders: list[Order],
         positions: list[Position],
         audit_logs: list[AuditLog],
+        stop_events: list[PositionStopEvent] | None = None,
     ) -> list[dict[str, Any]]:
         history: list[dict[str, Any]] = []
+        for event in stop_events or []:
+            history.append(
+                {
+                    "source": event.source,
+                    "label": event.event_type.replace("_", " ").title(),
+                    "position_id": event.position_id,
+                    "order_id": event.order_id,
+                    "signal_id": event.signal_id,
+                    "stop_loss": event.stop_loss,
+                    "take_profit": event.take_profit,
+                    "trailing_stop": event.trailing_stop,
+                    "triggered_price": event.triggered_price,
+                    "notes": event.notes,
+                    "metadata": event.metadata_json,
+                    "observed_at": event.observed_at.isoformat(),
+                }
+            )
         if signal is not None and any([signal.suggested_stop_loss, signal.suggested_take_profit]):
             history.append(
                 {
@@ -941,7 +961,35 @@ class SignalService:
                         "observed_at": audit.occurred_at.isoformat(),
                     }
                 )
-        return history
+        return sorted(history, key=lambda item: str(item.get("observed_at") or ""))
+
+    def _stop_events(
+        self,
+        db: Session,
+        *,
+        signal: Signal | None,
+        orders: list[Order],
+        positions: list[Position],
+    ) -> list[PositionStopEvent]:
+        clauses = []
+        order_ids = [order.id for order in orders]
+        position_ids = [position.id for position in positions]
+        if signal is not None:
+            clauses.append(PositionStopEvent.signal_id == signal.id)
+        if order_ids:
+            clauses.append(PositionStopEvent.order_id.in_(order_ids))
+        if position_ids:
+            clauses.append(PositionStopEvent.position_id.in_(position_ids))
+        if not clauses:
+            return []
+        return list(
+            db.scalars(
+                select(PositionStopEvent)
+                .where(or_(*clauses))
+                .order_by(PositionStopEvent.observed_at.asc())
+                .limit(100)
+            )
+        )
 
     def _merge_by_id(self, items: list[Any]) -> list[Any]:
         merged: dict[str, Any] = {}

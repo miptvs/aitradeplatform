@@ -1,4 +1,4 @@
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.audit import Alert
@@ -33,6 +33,8 @@ class AlertService:
         title: str | None = None,
         mode: str | None = None,
         category: str | None = None,
+        include_system: bool = False,
+        warning_only: bool = False,
     ) -> int:
         stmt = select(Alert).where(Alert.status == "open")
         if source_ref is not None:
@@ -40,9 +42,14 @@ class AlertService:
         if title is not None:
             stmt = stmt.where(Alert.title == title)
         if mode is not None:
-            stmt = stmt.where(Alert.mode == mode)
+            if include_system:
+                stmt = stmt.where(or_(Alert.mode == mode, Alert.mode.is_(None), Alert.mode == "system"))
+            else:
+                stmt = stmt.where(Alert.mode == mode)
         if category is not None:
             stmt = stmt.where(Alert.category == category)
+        if warning_only:
+            stmt = stmt.where(or_(Alert.category == "risk", Alert.severity == "warning"))
 
         updated = 0
         for alert in db.scalars(stmt):

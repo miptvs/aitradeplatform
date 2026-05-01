@@ -8,7 +8,9 @@ from app.models.asset import Asset
 from app.models.portfolio import Order, PortfolioSnapshot, Position, Trade
 from app.models.risk import RiskRule
 from app.schemas.risk import RiskCheck, RiskValidationRequest, RiskValidationResponse
+from app.services.audit.service import audit_service
 from app.services.market_data.service import market_data_service
+from app.services.market_hours.service import market_hours_service
 from app.utils.time import utcnow
 
 settings = get_settings()
@@ -36,6 +38,17 @@ class RiskService:
         rule.description = payload.description
         rule.config_json = payload.config_json
         db.flush()
+        if rule.rule_type in {"cash_reserve", "kill_switch"}:
+            audit_service.log(
+                db,
+                actor="system",
+                action=f"risk.{rule.rule_type}.update",
+                target_type="risk_rule",
+                target_id=rule.id,
+                status="enabled" if rule.enabled else "disabled",
+                mode=rule.scope,
+                details={"config_json": rule.config_json, "enabled": rule.enabled},
+            )
         return rule
 
     def validate_order(self, db: Session, payload: RiskValidationRequest) -> RiskValidationResponse:
@@ -50,6 +63,9 @@ class RiskService:
         checks.append(self._duplicate_order_check(db, payload))
         checks.append(self._holding_check(db, payload))
         checks.append(self._protective_levels_check(payload, price))
+        account_hours_check = self._simulation_account_market_hours_check(db, payload)
+        if account_hours_check is not None:
+            checks.append(account_hours_check)
 
         for rule in rules:
             if rule.rule_type == "kill_switch":
@@ -73,7 +89,7 @@ class RiskService:
             elif rule.rule_type == "per_trade_risk":
                 checks.append(self._per_trade_risk_check(rule, payload, price))
             elif rule.rule_type == "market_hours":
-                checks.append(self._market_hours_check(rule))
+                checks.append(self._market_hours_check(db, rule, payload))
 
         rejection_reasons = [check.reason for check in checks if not check.passed]
         return RiskValidationResponse(
@@ -108,6 +124,20 @@ class RiskService:
                     passed=False,
                     reason="Short simulation is disabled for this simulation account.",
                     details={"short_enabled": account.short_enabled},
+                )
+            if side == "short":
+                margin_requirement = max(float(account.short_margin_requirement or 1.0), 1.0)
+                required_margin = notional * margin_requirement
+                passed = account.cash_balance >= required_margin
+                return RiskCheck(
+                    rule="cash_availability",
+                    passed=passed,
+                    reason="Sufficient simulated short margin." if passed else "Short order exceeds simulated margin requirement.",
+                    details={
+                        "cash_balance": account.cash_balance,
+                        "required_margin": required_margin,
+                        "short_margin_requirement": margin_requirement,
+                    },
                 )
             passed = account.cash_balance >= notional
             return RiskCheck(
@@ -449,15 +479,41 @@ class RiskService:
             details={"risk_amount": risk_amount, "max_risk_amount": max_risk_amount},
         )
 
-    def _market_hours_check(self, rule: RiskRule) -> RiskCheck:
+    def _simulation_account_market_hours_check(self, db: Session, payload: RiskValidationRequest) -> RiskCheck | None:
+        if payload.mode != "simulation" or not payload.simulation_account_id:
+            return None
+        from app.models.simulation import SimulationAccount
+
+        account = db.get(SimulationAccount, payload.simulation_account_id)
+        if account is None or not account.enforce_market_hours:
+            return None
+        return self._market_hours_guard(
+            db,
+            payload,
+            config={"enforce_market_hours": True, "source": "simulation_account"},
+            rule_name="market_hours",
+        )
+
+    def _market_hours_check(self, db: Session, rule: RiskRule, payload: RiskValidationRequest) -> RiskCheck:
         if not rule.config_json.get("enforce_market_hours", False):
             return RiskCheck(rule=rule.rule_type, passed=True, reason="Market-hours rule disabled.")
-        hour = utcnow().hour
-        passed = 13 <= hour <= 20
+        return self._market_hours_guard(db, payload, config=rule.config_json, rule_name=rule.rule_type)
+
+    def _market_hours_guard(
+        self,
+        db: Session,
+        payload: RiskValidationRequest,
+        *,
+        config: dict,
+        rule_name: str,
+    ) -> RiskCheck:
+        asset = db.get(Asset, payload.asset_id)
+        result = market_hours_service.check_asset(asset, at=payload.observed_at, config=config)
         return RiskCheck(
-            rule=rule.rule_type,
-            passed=passed,
-            reason="Within configured market hours." if passed else "Order blocked outside configured market hours.",
+            rule=rule_name,
+            passed=result.is_open,
+            reason=result.reason if result.is_open else f"Order blocked by market-hours guard: {result.reason}",
+            details=result.details,
         )
 
     def _portfolio_value(self, db: Session, mode: str, simulation_account_id: str | None, broker_account_id: str | None = None) -> float:

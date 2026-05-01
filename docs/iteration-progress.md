@@ -153,3 +153,59 @@
 - Trading212 order execution and live shorting remain intentionally unsupported.
 - Trading212 pies are displayed as synced broker metadata; pie-level rebalancing/editing is not implemented.
 - Broker-synced live positions are local mirrors. Closing them in the app updates the local ledger only unless a future verified execution adapter is added.
+
+## 2026-04-30 Reliability Hardening Pass
+
+### Existing State
+
+- Cash reserve, expanded signal actions, per-model simulation accounts, Trading212 account sync, and live one-model locking were already partially implemented.
+- The UI already had shared Live Trading and Simulation workspaces, model comparison cards, manual sync, signal trace dialogs, and RSS diagnostics.
+- Tests existed for several backend risk, simulation, signal, and workspace flows.
+
+### Changes Made In This Pass
+
+- Added isolated replay/backtest persistence with `replay_runs` and `replay_model_results`.
+- Added a replay service and Simulation API routes for creating/listing replay runs over a date range, starting cash, selected models, symbols, fees, slippage, cash reserve, and short settings.
+- Added replay UI under Simulation with clear scaffold/limited-data labeling and model result tables.
+- Added model tournament metrics and CSV export across simulation accounts and replay runs.
+- Extended simulation comparison metrics with reserved cash, available cash, profit factor, rejected trades, invalid signal rate, and useful-signal rate.
+- Added simulation realism settings for short borrow fee, short margin requirement, partial-fill ratio, and market-hours guard placeholder.
+- Enforced short margin in the risk engine and applied short borrow fee to cover-short PnL.
+- Enriched health status with news freshness, market-data freshness, broker sync, model health, scheduler status, latest signal time, and warnings.
+- Added backend tests for replay isolation/results, Trading212 sync mapping/failure, reserve edge cases, live short rejection, healthy live model allowance, slippage, borrow fee, and margin blocking.
+- Added Playwright smoke-test scaffolding for Simulation and Live Trading critical screens.
+- Added GitHub Actions CI for backend tests, frontend type/build/smoke tests, and Docker build validation.
+- Simplified Docker default runtime to one frontend; provider-specific frontends now require the `multi-provider` profile.
+- Updated README plus replay/testing docs.
+
+### Known Limitations
+
+- Trading212 execution remains intentionally unavailable; the app syncs/mirrors account data but does not fake broker order placement.
+- Replay/backtest is a scaffold using stored signals and stored historical snapshots. It avoids future price leakage for fills, but it does not yet regenerate each model over every historical timestep.
+- Simulation short borrow fee and margin logic are simplified. Locate availability, forced margin calls, and full market-hours/partial-fill market microstructure are still future work.
+- Frontend smoke tests mock backend responses; they verify page behavior and critical states, not a full browser-to-database integration run.
+
+### Remaining TODOs
+
+- Add real historical data ingestion jobs for deeper replay windows.
+- Replace the deterministic market-hours scaffold with full exchange calendars if/when production-grade backtesting is required.
+- Replace simplified margin-call liquidation with broker-specific maintenance-margin tiers before using it for live-like margin analysis.
+
+## 2026-05-01 Remaining TODO Closeout
+
+### Changes Made
+
+- Added normalized `position_stop_events` persistence and included those events in signal/order/trade/position traces.
+- Added a simplified exchange-hours service covering common US, London, and Xetra sessions, with holiday/unknown-exchange configuration hooks.
+- Enforced simulation account market-hours settings in risk validation and direct simulation execution.
+- Added optional replay market-hours enforcement through replay `config_json`.
+- Added a simulated margin-call forced-close helper for short positions that breach configured margin requirements.
+- Added provider usage parsing and model-cost estimation from configured per-token rates, plus model-cost aggregation in simulation/replay comparison metrics.
+- Hardened RSS refresh after a live duplicate-URL failure: refresh now checks existing articles across the full database before insert, retries transient feed fetch failures with RSS-friendly headers, resolves stale RSS error alerts after a clean run, and lets the workspace clear system warning notices.
+- Added tests for market-hours blocking/allowance, margin-call forced close, normalized stop provenance, and model-cost accounting.
+
+### Known Limitations
+
+- Trading212 execution and live shorting remain intentionally unavailable because the current adapter does not verify broker execution support.
+- Market-hours logic is deterministic and lightweight; it is not a complete holiday/half-day exchange calendar.
+- Margin-call forced close is simulation-only and simplified; real brokers may apply product-specific margin tiers and liquidation ordering.

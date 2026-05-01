@@ -17,6 +17,16 @@ def list_alerts(db: Session = Depends(get_db)) -> list[AlertRead]:
 def clear_alerts(
     mode: str | None = Query(default=None),
     category: str | None = Query(default=None),
+    include_system: bool = Query(default=False),
+    warning_only: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> dict:
-    return {"resolved": alert_service.resolve_alerts(db, mode=mode, category=category)}
+    resolved = alert_service.resolve_alerts(
+        db,
+        mode=mode,
+        category=category,
+        include_system=include_system,
+        warning_only=warning_only,
+    )
+    db.commit()
+    return {"resolved": resolved}

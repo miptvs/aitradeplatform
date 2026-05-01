@@ -12,7 +12,7 @@ from app.models.broker import BrokerAccount
 from app.models.portfolio import Order, PortfolioSnapshot, Position
 from app.models.risk import RiskRule
 from app.models.signal import Signal, SignalEvaluation
-from app.models.simulation import SimulationAccount
+from app.models.simulation import SimulationAccount, SimulationOrder
 from app.models.strategy import Strategy
 from app.models.trading import TradingAutomationProfile
 from app.schemas.portfolio import OrderCreate
@@ -53,6 +53,7 @@ class TradingWorkspaceService:
 
     def upsert_profile(self, db: Session, mode: str, payload: TradingAutomationProfileUpsert) -> TradingAutomationProfile:
         profile = self.get_or_create_profile(db, mode)
+        previous_live_model_provider = (profile.config_json or {}).get("live_model_provider_type") if mode == "live" else None
         updates = payload.model_dump()
         inherit_from_live = bool(updates.pop("inherit_from_live", False))
         config_updates = updates.pop("config_json", {})
@@ -84,6 +85,21 @@ class TradingWorkspaceService:
                 "confidence_threshold": profile.confidence_threshold,
             },
         )
+        if mode == "live":
+            next_live_model_provider = (profile.config_json or {}).get("live_model_provider_type")
+            if previous_live_model_provider != next_live_model_provider:
+                audit_service.log(
+                    db,
+                    actor="system",
+                    action="live_model.change",
+                    target_type="trading_automation_profile",
+                    target_id=profile.id,
+                    mode="live",
+                    details={
+                        "previous_provider_type": previous_live_model_provider,
+                        "next_provider_type": next_live_model_provider,
+                    },
+                )
         return profile
 
     def resolve_profile_pair(
@@ -955,10 +971,25 @@ class TradingWorkspaceService:
     def _simulation_account_comparison_item(self, db: Session, account: SimulationAccount) -> dict[str, Any]:
         positions = [position for position in portfolio_service.list_positions(db, mode="simulation", simulation_account_id=account.id) if position["status"] == "open"]
         trades = portfolio_service.list_trades(db, mode="simulation", simulation_account_id=account.id)
+        rejected_orders = list(
+            db.scalars(
+                select(SimulationOrder).where(
+                    SimulationOrder.simulation_account_id == account.id,
+                    SimulationOrder.status == "rejected",
+                )
+            )
+        )
+        signals = list(db.scalars(select(Signal).where(Signal.provider_type == account.provider_type))) if account.provider_type else []
+        invalid_signals = [
+            signal
+            for signal in signals
+            if str(signal.action).lower() not in {"buy", "sell", "hold", "close_long", "reduce_long", "short", "cover_short"}
+        ]
         equity = sum(position["current_price"] * position["quantity"] for position in positions)
         total_value = account.cash_balance + equity
         reserve = self._cash_reserve_summary(db, "simulation", account.cash_balance, total_value, account)
         wins = [trade for trade in trades if trade["realized_pnl"] > 0]
+        losses = [abs(trade["realized_pnl"]) for trade in trades if trade["realized_pnl"] < 0]
         equity_curve = [
             snapshot.total_value
             for snapshot in db.scalars(
@@ -981,20 +1012,31 @@ class TradingWorkspaceService:
             "model_name": account.model_name,
             "starting_cash": account.starting_cash,
             "cash_balance": account.cash_balance,
+            "reserved_cash": reserve["cash_reserve_amount"],
             "portfolio_value": round(total_value, 2),
             "available_to_trade_cash": reserve["available_to_trade_cash"],
             "cash_reserve_percent": reserve["cash_reserve_percent"],
+            "cash_reserve_amount": reserve["cash_reserve_amount"],
             "fees_bps": account.fees_bps,
             "slippage_bps": account.slippage_bps,
             "latency_ms": account.latency_ms,
             "short_enabled": account.short_enabled,
+            "short_borrow_fee_bps": account.short_borrow_fee_bps,
+            "short_margin_requirement": account.short_margin_requirement,
+            "partial_fill_ratio": account.partial_fill_ratio,
+            "enforce_market_hours": account.enforce_market_hours,
             "is_active": account.is_active,
             "realized_pnl": round(sum(trade["realized_pnl"] for trade in trades), 2),
             "unrealized_pnl": round(sum(position["unrealized_pnl"] for position in positions), 2),
             "total_return": round(((total_value - account.starting_cash) / account.starting_cash) if account.starting_cash else 0, 4),
             "win_rate": round((len(wins) / len(trades)) if trades else 0, 4),
+            "profit_factor": round((sum(trade["realized_pnl"] for trade in wins) / sum(losses)) if losses else sum(trade["realized_pnl"] for trade in wins), 2) if trades else 0,
             "max_drawdown": round(max_drawdown, 4),
             "trade_count": len(trades),
+            "rejected_trade_count": len(rejected_orders),
+            "invalid_signal_count": len(invalid_signals),
+            "invalid_signal_rate": round((len(invalid_signals) / len(signals)) if signals else 0, 4),
+            "useful_signal_rate": round((len(trades) / len(signals)) if signals else 0, 4),
             "reset_count": account.reset_count,
         }
 
@@ -1014,6 +1056,7 @@ class TradingWorkspaceService:
         realized = sum(trade["realized_pnl"] for trade in live_trades)
         unrealized = sum(position["unrealized_pnl"] for position in live_positions)
         last_sync_error = None
+        last_successful_sync_at = None
         synced = False
         if broker_account is not None:
             synced = broker_account.settings_json.get("available_cash") is not None or broker_account.settings_json.get("total_value") is not None
@@ -1028,8 +1071,15 @@ class TradingWorkspaceService:
             adapter = broker_service.get_adapter(broker_account.broker_type)
             supports_execution = adapter.capability.supports_execution
             latest_sync = broker_service.latest_sync_event(db, broker_account.id)
-            if latest_sync and latest_sync.status == "error":
-                last_sync_error = (latest_sync.details_json or {}).get("account_message") or (latest_sync.details_json or {}).get("message")
+            latest_successful_sync = broker_service.latest_successful_sync_event(db, broker_account.id)
+            if latest_successful_sync and latest_successful_sync.completed_at:
+                last_successful_sync_at = latest_successful_sync.completed_at.isoformat()
+            if latest_sync and latest_sync.status in {"error", "warn"}:
+                last_sync_error = (
+                    (latest_sync.details_json or {}).get("account_message")
+                    or (latest_sync.details_json or {}).get("positions_message")
+                    or (latest_sync.details_json or {}).get("message")
+                )
 
         reserve = self._cash_reserve_summary(db, "live", cash, total_value)
         if broker_account is None:
@@ -1066,6 +1116,8 @@ class TradingWorkspaceService:
                 "backend_live_trading_enabled": settings.enable_live_trading,
                 "broker_synced": synced,
                 "last_sync_error": last_sync_error,
+                "last_successful_sync_at": last_successful_sync_at,
+                "last_synced_at": broker_account.settings_json.get("last_synced_at") if broker_account else None,
                 "synced_positions": broker_account.settings_json.get("synced_positions", []) if broker_account else [],
                 "synced_pies": broker_account.settings_json.get("synced_pies", []) if broker_account else [],
                 "short_supported": False,
@@ -1149,6 +1201,10 @@ class TradingWorkspaceService:
                 "provider_type": account.provider_type,
                 "model_name": account.model_name,
                 "short_enabled": account.short_enabled,
+                "short_borrow_fee_bps": account.short_borrow_fee_bps,
+                "short_margin_requirement": account.short_margin_requirement,
+                "partial_fill_ratio": account.partial_fill_ratio,
+                "enforce_market_hours": account.enforce_market_hours,
             },
         }
         controls = {

@@ -21,6 +21,7 @@ import type {
   PositionAction,
   ProviderConfig,
   ProviderHealth,
+  ReplayRun,
   SettingsOverview,
   Signal,
   SignalDetail,
@@ -30,10 +31,12 @@ import type {
   SimulationSummary,
   SimulationVsLive,
   StrategyOption,
+  SystemHealthStatus,
   TaskMapping,
   TradingAutomationProfile,
   TradingWorkspace,
-  Trade
+  Trade,
+  ModelMetric
 } from "@/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
@@ -147,6 +150,9 @@ export const api = {
     request<SimulationAccount>(`/simulation/accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   resetSimulationAccount: (id: string) => request<SimulationAccount>(`/simulation/accounts/${id}/reset`, { method: "POST" }),
   getSimulationSummary: (id: string) => request<SimulationSummary>(`/simulation/accounts/${id}/summary`),
+  getReplayRuns: () => request<ReplayRun[]>("/simulation/replay-runs"),
+  createReplayRun: (payload: Record<string, unknown>) =>
+    request<ReplayRun>("/simulation/replay-runs", { method: "POST", body: JSON.stringify(payload) }),
   createSimulationOrder: (payload: Record<string, unknown>) =>
     request<Order>("/simulation/orders", { method: "POST", body: JSON.stringify(payload) }),
   createLiveOrder: (payload: Record<string, unknown>) => request<Order>("/live/orders", { method: "POST", body: JSON.stringify(payload) }),
@@ -195,6 +201,14 @@ export const api = {
   syncLiveBroker: (brokerAccountId?: string) =>
     request<BrokerSyncResult>(`/live/broker-sync${brokerAccountId ? `?broker_account_id=${encodeURIComponent(brokerAccountId)}` : ""}`, { method: "POST" }),
   getAnalyticsOverview: () => request<AnalyticsOverview>("/analytics/overview"),
+  getModelComparison: (params?: { scope?: string; replayRunId?: string; simulationAccountId?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.scope) search.set("scope", params.scope);
+    if (params?.replayRunId) search.set("replay_run_id", params.replayRunId);
+    if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
+    const suffix = search.toString() ? `?${search.toString()}` : "";
+    return request<ModelMetric[]>(`/analytics/model-comparison${suffix}`);
+  },
   getEquityCurve: (mode?: string, simulationAccountId?: string) => {
     const params = new URLSearchParams();
     if (mode) params.set("mode", mode);
@@ -204,10 +218,12 @@ export const api = {
   },
   getSimulationVsLive: () => request<SimulationVsLive>("/analytics/simulation-vs-live"),
   getAlerts: () => request<Alert[]>("/alerts/"),
-  clearAlerts: (params?: { mode?: string; category?: string }) => {
+  clearAlerts: (params?: { mode?: string; category?: string; includeSystem?: boolean; warningOnly?: boolean }) => {
     const search = new URLSearchParams();
     if (params?.mode) search.set("mode", params.mode);
     if (params?.category) search.set("category", params.category);
+    if (params?.includeSystem) search.set("include_system", "true");
+    if (params?.warningOnly) search.set("warning_only", "true");
     const suffix = search.toString() ? `?${search.toString()}` : "";
     return request<{ resolved: number }>(`/alerts/${suffix}`, { method: "DELETE" });
   },
@@ -219,5 +235,5 @@ export const api = {
   getHealthReady: () => request<HealthReadyStatus>("/health/ready"),
   saveBrokerAccount: (payload: Record<string, unknown>) => request<BrokerAccount>("/brokers/accounts", { method: "POST", body: JSON.stringify(payload) }),
   validateBrokerAccount: (accountId: string) => request<BrokerValidationResult>(`/brokers/accounts/${accountId}/validate`, { method: "POST" }),
-  getHealth: () => request<{ status: string; providers: ProviderHealth[]; events: Array<{ component: string; status: string; message: string; observed_at: string }> }>("/health/status")
+  getHealth: () => request<SystemHealthStatus>("/health/status")
 };

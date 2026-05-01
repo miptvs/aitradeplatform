@@ -35,6 +35,7 @@ class BrokerAccountRead(ORMModel):
     last_sync_started_at: str | None = None
     last_sync_completed_at: str | None = None
     last_sync_message: str | None = None
+    last_successful_sync_completed_at: str | None = None
     cash_balance: float | None = None
     available_cash: float | None = None
     invested_value: float | None = None
