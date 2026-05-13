@@ -75,9 +75,9 @@ export const api = {
     if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
     if (params?.brokerAccountId) search.set("broker_account_id", params.brokerAccountId);
     const suffix = search.toString() ? `?${search.toString()}` : "";
-    return request<Position[]>(`/positions${suffix}`);
+    return request<Position[]>(`/positions/${suffix}`);
   },
-  createPosition: (payload: Record<string, unknown>) => request<Position>("/positions", { method: "POST", body: JSON.stringify(payload) }),
+  createPosition: (payload: Record<string, unknown>) => request<Position>("/positions/", { method: "POST", body: JSON.stringify(payload) }),
   updatePosition: (id: string, payload: Record<string, unknown>) => request<Position>(`/positions/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   closePosition: (id: string, options?: { quantity?: number; closePercent?: number; exitPrice?: number }) => {
     const params = new URLSearchParams();
@@ -101,16 +101,16 @@ export const api = {
     if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
     if (params?.brokerAccountId) search.set("broker_account_id", params.brokerAccountId);
     const suffix = search.toString() ? `?${search.toString()}` : "";
-    return request<Order[]>(`/orders${suffix}`);
+    return request<Order[]>(`/orders/${suffix}`);
   },
-  createOrder: (payload: Record<string, unknown>) => request<Order>("/orders", { method: "POST", body: JSON.stringify(payload) }),
+  createOrder: (payload: Record<string, unknown>) => request<Order>("/orders/", { method: "POST", body: JSON.stringify(payload) }),
   getTrades: (params?: { mode?: string; simulationAccountId?: string; brokerAccountId?: string }) => {
     const search = new URLSearchParams();
     if (params?.mode) search.set("mode", params.mode);
     if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
     if (params?.brokerAccountId) search.set("broker_account_id", params.brokerAccountId);
     const suffix = search.toString() ? `?${search.toString()}` : "";
-    return request<Trade[]>(`/trades${suffix}`);
+    return request<Trade[]>(`/trades/${suffix}`);
   },
   getSignals: (providerType?: string) => request<Signal[]>(`/signals/${providerType ? `?provider_type=${encodeURIComponent(providerType)}` : ""}`),
   getSignalDiagnostics: (providerType?: string) =>
@@ -200,7 +200,13 @@ export const api = {
     request<AutomationDecision>(`/live/recommendations/${signalId}/reject`, { method: "POST", body: JSON.stringify({ reason }) }),
   syncLiveBroker: (brokerAccountId?: string) =>
     request<BrokerSyncResult>(`/live/broker-sync${brokerAccountId ? `?broker_account_id=${encodeURIComponent(brokerAccountId)}` : ""}`, { method: "POST" }),
-  getAnalyticsOverview: () => request<AnalyticsOverview>("/analytics/overview"),
+  getAnalyticsOverview: (params?: { mode?: string; simulationAccountId?: string }) => {
+    const search = new URLSearchParams();
+    if (params?.mode) search.set("mode", params.mode);
+    if (params?.simulationAccountId) search.set("simulation_account_id", params.simulationAccountId);
+    const suffix = search.toString() ? `?${search.toString()}` : "";
+    return request<AnalyticsOverview>(`/analytics/overview${suffix}`);
+  },
   getModelComparison: (params?: { scope?: string; replayRunId?: string; simulationAccountId?: string }) => {
     const search = new URLSearchParams();
     if (params?.scope) search.set("scope", params.scope);

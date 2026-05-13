@@ -136,6 +136,9 @@ class TradingRecommendationRead(BaseModel):
     suggested_stop_loss: float | None = None
     suggested_take_profit: float | None = None
     estimated_risk_reward: float | None = None
+    suggested_position_size_type: str | None = None
+    suggested_position_size_value: float | None = None
+    fallback_quantity: float | None = None
 
 
 class RecommendationRejectRequest(BaseModel):

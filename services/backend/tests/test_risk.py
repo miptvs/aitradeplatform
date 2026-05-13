@@ -185,6 +185,10 @@ def test_cash_reserve_blocks_order_that_would_spend_reserved_cash() -> None:
     assert reserve_check.details["reserve_pct"] == 0.2
     assert reserve_check.details["available_to_trade"] == 8000
     assert reserve_check.details["required"] == 9000
+    assert reserve_check.details["max_allowed_order_value"] == 8000
+    assert reserve_check.details["max_allowed_quantity"] == 80
+    assert result.max_allowed_order_value == 8000
+    assert result.max_allowed_quantity == 80
 
 
 def test_cash_reserve_allows_buy_above_reserved_cash_and_does_not_block_close() -> None:

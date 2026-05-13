@@ -16,6 +16,7 @@ This iteration upgrades the original MVP in place rather than replacing it:
 - added live broker sync visibility plus a manual sync action in the live workspace
 - removed fake live balances: Live Trading now shows Trading212 disconnected/not-synced until a real broker cash sync succeeds
 - added the configurable “Always keep X% in cash” reserve rule with available-to-trade cash shown in Live and Simulation
+- added fractional order sizing by portfolio percentage, fixed currency amount, or explicit fractional quantity, with risk-aware resize details
 - expanded signal/trading actions beyond buy/sell to include close/reduce long and simulated short/cover-short workflows
 - added separate simulation accounts per provider/model so models can compete side by side
 - added an isolated replay/backtest scaffold for fair same-window model comparison without mutating live-forward simulation ledgers
@@ -23,7 +24,8 @@ This iteration upgrades the original MVP in place rather than replacing it:
 - added operational health output for news freshness, market-data freshness, broker sync, scheduler state, selected live model health, and automation blockers
 - added short realism knobs for simulation: borrow fee, short margin requirement, margin-call forced-close scaffold, partial-fill ratio, and a simplified exchange-hours guard
 - locked live automation to exactly one configured live model profile
-- fixed the RSS refresh path so checkpoint overlap, backfill, duplicates, and per-feed diagnostics are visible
+- isolated live-only configuration in the Settings > Live Trading tab
+- fixed the RSS refresh path so checkpoint overlap, backfill, duplicates, backup feeds, and per-feed diagnostics are visible
 - preserved the existing provider, risk, audit, broker, and signal foundations instead of resetting the repo
 
 See [iteration-progress.md](./docs/iteration-progress.md) for a concise analysis of what existed, what was missing, what was fixed, and what remains.
@@ -37,8 +39,9 @@ See [iteration-progress.md](./docs/iteration-progress.md) for a concise analysis
 - Ollama sidecar image that preloads the configured local model catalog on startup
 - Remote paid-provider scaffolds for `ChatGPT / OpenAI`, `Claude / Anthropic`, `Gemini / Google`, and `DeepSeek API`
 - Central risk engine that validates orders before any simulated or live workflow
-- Cash reserve rule that blocks buy-like orders which would spend the configured cash reserve
+- Cash reserve rule that blocks or resizes buy-like orders which would spend the configured cash reserve, returning max allowed order value and fractional quantity
 - First-class simulation engine with separate accounts, cash, slippage, fees, latency, and audit history
+- Fractional simulation fills with configurable decimal precision per simulation account
 - Per-model simulation ledgers for comparing provider/model performance independently
 - Replay/backtest scaffold that stores replay runs/results separately from normal simulation orders, trades, positions, and cash
 - Model comparison metrics and CSV export across simulation accounts and replay runs
@@ -150,7 +153,7 @@ The backend uses the official MCP Python SDK on both sides:
 
 ## Known limits
 
-- News now refreshes from real RSS feeds with checkpoint overlap and per-feed diagnostics, but it is still RSS-first rather than a commercial market-data/news feed stack
+- News now refreshes from real RSS feeds with checkpoint overlap, backup feeds, and per-feed diagnostics, but it is still RSS-first rather than a commercial market-data/news feed stack
 - Market data uses lightweight external refreshes suitable for a local-first MVP, not institutional-grade real-time feeds
 - Local-model signal generation depends on Ollama health and model speed; when a model is too slow or unhealthy the app now reports that clearly instead of showing fake signals
 - Trading212 account cash, holdings, and pies sync is implemented for live display when API permissions allow it. Trading212 execution is intentionally not implemented; account sync/manual mirroring is the intended extension path

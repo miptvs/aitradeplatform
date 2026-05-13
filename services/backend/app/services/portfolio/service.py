@@ -13,10 +13,37 @@ from app.services.audit.service import audit_service
 from app.services.brokers.service import broker_service
 from app.services.events.service import publish_event
 from app.services.market_data.service import market_data_service
+from app.services.order_sizing import OrderSizingResult, resolve_order_sizing
 from app.services.risk.service import risk_service
 from app.services.simulation.service import simulation_service
 from app.utils.serialization import to_plain_dict
 from app.utils.time import utcnow
+
+
+OPENING_SIDES = {"buy", "short"}
+EXIT_SIDES = {"sell", "close_long", "reduce_long", "cover_short"}
+RESIZABLE_RISK_RULES = {
+    "cash_availability",
+    "cash_reserve",
+    "max_position_size",
+    "max_capital_per_asset",
+    "max_sector_exposure",
+    "position_holding",
+}
+NON_RESIZABLE_RISK_RULES = {
+    "mode_consistency",
+    "live_mode_disabled",
+    "live_broker_required",
+    "simulation_account_required",
+    "duplicate_order",
+    "protective_levels",
+    "kill_switch",
+    "daily_max_loss",
+    "max_drawdown_halt",
+    "loss_streak_cooldown",
+    "per_trade_risk",
+    "market_hours",
+}
 
 
 class PortfolioService:
@@ -174,6 +201,7 @@ class PortfolioService:
         if position.status == "closed" or abs(position.quantity) <= 1e-8:
             position.status = "closed"
             position.quantity = 0
+            position.unrealized_pnl = 0
             position.closed_at = position.closed_at or utcnow()
             db.flush()
             return position
@@ -237,6 +265,7 @@ class PortfolioService:
         if abs(position.quantity) <= 1e-8:
             position.quantity = 0
             position.status = "closed"
+            position.unrealized_pnl = 0
             position.closed_at = utcnow()
         db.flush()
         publish_event("position.closed", {"position_id": position.id, "quantity": close_quantity})
@@ -334,10 +363,8 @@ class PortfolioService:
     def create_order(self, db: Session, payload: OrderCreate) -> Order:
         correlation_id = str(uuid4())
         price = payload.requested_price or market_data_service.get_latest_price(db, payload.asset_id)
-        quantity = payload.quantity if payload.quantity is not None else ((payload.amount or 0) / price if price else 0)
-        if quantity <= 0:
-            raise ValueError("Order quantity must be positive after resolving amount/price inputs.")
         simulation_account_id = payload.simulation_account_id
+        simulation_account = None
         if payload.mode == "simulation" and not simulation_account_id:
             account = None
             if payload.provider_type:
@@ -349,6 +376,8 @@ class PortfolioService:
                 account = accounts[0]
             if account:
                 simulation_account_id = account.id
+        if payload.mode == "simulation" and simulation_account_id:
+            simulation_account = simulation_service.get_account(db, simulation_account_id)
         broker_account_id = payload.broker_account_id
         if payload.mode == "live" and not broker_account_id:
             broker = db.scalar(
@@ -358,6 +387,21 @@ class PortfolioService:
                 .limit(1)
             )
             broker_account_id = broker.id if broker else None
+        broker_account = db.get(BrokerAccount, broker_account_id) if broker_account_id else None
+        decimal_precision = self._quantity_precision(payload.mode, simulation_account, broker_account)
+        portfolio_value = risk_service._portfolio_value(db, payload.mode, simulation_account_id, broker_account_id)
+        sizing = resolve_order_sizing(
+            sizing_mode=payload.sizing_mode,
+            sizing_value=payload.sizing_value,
+            quantity=payload.quantity,
+            amount=payload.amount,
+            price=price,
+            portfolio_value=portfolio_value,
+            decimal_precision=decimal_precision,
+        )
+        quantity = sizing.quantity
+        if quantity <= 0:
+            raise ValueError("Order quantity must be positive after resolving fractional sizing inputs.")
         risk_result = risk_service.validate_order(
             db,
             RiskValidationRequest(
@@ -372,7 +416,39 @@ class PortfolioService:
                 strategy_name=payload.strategy_name,
             ),
         )
-        broker_account = db.get(BrokerAccount, broker_account_id) if broker_account_id else None
+        resize_note = None
+        if not risk_result.approved and payload.allow_fractional_resize:
+            resized = self._resized_sizing_from_risk(
+                original=sizing,
+                risk_result=risk_result,
+                side=payload.side,
+                price=price,
+                portfolio_value=portfolio_value,
+                decimal_precision=decimal_precision,
+            )
+            if resized is not None and resized.quantity > 0 and resized.quantity < quantity:
+                resized_risk = risk_service.validate_order(
+                    db,
+                    RiskValidationRequest(
+                        asset_id=payload.asset_id,
+                        mode=payload.mode,
+                        side=payload.side,
+                        quantity=resized.quantity,
+                        requested_price=price,
+                        stop_loss=payload.stop_loss,
+                        simulation_account_id=simulation_account_id,
+                        broker_account_id=broker_account_id,
+                        strategy_name=payload.strategy_name,
+                    ),
+                )
+                if resized_risk.approved:
+                    resize_note = (
+                        f"Order resized from {quantity:.8f} to {resized.quantity:.8f} shares "
+                        f"({resized.order_value:.2f} notional) to stay inside risk limits."
+                    )
+                    sizing = resized
+                    quantity = resized.quantity
+                    risk_result = resized_risk
         protective_levels = {
             "stop_loss": payload.stop_loss,
             "take_profit": payload.take_profit,
@@ -403,6 +479,17 @@ class PortfolioService:
                 "simulation_account_id": simulation_account_id,
                 "protective_levels": protective_levels,
                 "requested_amount": payload.amount,
+                "sizing": sizing.as_audit_context(),
+                "fractional_trading": {
+                    "supported": True,
+                    "decimal_precision": decimal_precision,
+                    "broker_type": broker_account.broker_type if broker_account else None,
+                    "execution_support": broker_service.get_adapter(broker_account.broker_type).capability.supports_execution
+                    if broker_account
+                    else payload.mode == "simulation",
+                    "warning": sizing.rounding_warning,
+                },
+                "resize_note": resize_note,
             },
             submitted_at=utcnow(),
         )
@@ -459,7 +546,20 @@ class PortfolioService:
                 }
             else:
                 adapter = broker_service.get_adapter(broker_account.broker_type)
-                broker_result = adapter.place_order(broker_account, payload.model_dump())
+                broker_result = adapter.place_order(
+                    broker_account,
+                    {
+                        **payload.model_dump(),
+                        "quantity": quantity,
+                        "amount": sizing.order_value,
+                        "sizing_mode": sizing.sizing_mode,
+                        "sizing_value": sizing.sizing_value,
+                        "order_notional": sizing.order_value,
+                        "portfolio_percent": sizing.portfolio_percent,
+                        "decimal_precision": decimal_precision,
+                        "rounding_warning": sizing.rounding_warning,
+                    },
+                )
                 if broker_result.success:
                     order.status = "accepted"
                 else:
@@ -488,10 +588,83 @@ class PortfolioService:
             target_id=order.id,
             status=order.status,
             mode=payload.mode,
-            details={"manual": payload.manual, "quantity": quantity, "amount": payload.amount, "protective_levels": protective_levels},
+            details={
+                "manual": payload.manual,
+                "quantity": quantity,
+                "amount": sizing.order_value,
+                "sizing": sizing.as_audit_context(),
+                "protective_levels": protective_levels,
+                "resize_note": resize_note,
+            },
         )
         publish_event("order.updated", {"order_id": order.id, "status": order.status, "correlation_id": correlation_id})
         return order
+
+    def _quantity_precision(self, mode: str, simulation_account, broker_account: BrokerAccount | None) -> int:
+        if mode == "simulation" and simulation_account is not None:
+            return int(simulation_account.decimal_precision or 6)
+        if broker_account is not None:
+            configured = (broker_account.settings_json or {}).get("decimal_precision")
+            if configured is not None:
+                return int(configured)
+            if broker_account.broker_type == "trading212":
+                return 6
+        return 6
+
+    def _resized_sizing_from_risk(
+        self,
+        *,
+        original: OrderSizingResult,
+        risk_result,
+        side: str,
+        price: float,
+        portfolio_value: float,
+        decimal_precision: int,
+    ) -> OrderSizingResult | None:
+        normalized_side = str(side).strip().lower()
+        failed_checks = [check for check in risk_result.checks if not check.passed]
+        if not failed_checks:
+            return None
+        if any(check.rule in NON_RESIZABLE_RISK_RULES for check in failed_checks):
+            return None
+        if any(check.rule not in RESIZABLE_RISK_RULES for check in failed_checks):
+            return None
+
+        max_values = [
+            float(check.details["max_allowed_order_value"])
+            for check in failed_checks
+            if check.details.get("max_allowed_order_value") is not None
+        ]
+        max_quantities = [
+            float(check.details["max_allowed_quantity"])
+            for check in failed_checks
+            if check.details.get("max_allowed_quantity") is not None
+        ]
+        if normalized_side in EXIT_SIDES and max_quantities:
+            max_quantity = min(max_quantities)
+            max_value = max_quantity * price
+        elif max_values:
+            max_value = min(max_values)
+            max_quantity = max_value / price if price > 0 else 0.0
+        elif max_quantities:
+            max_quantity = min(max_quantities)
+            max_value = max_quantity * price
+        else:
+            return None
+
+        max_value = max(0.0, min(float(max_value), original.order_value))
+        max_quantity = max(0.0, min(float(max_quantity), original.quantity))
+        if max_value <= 0 or max_quantity <= 0:
+            return None
+        return resolve_order_sizing(
+            sizing_mode="amount" if normalized_side in OPENING_SIDES else "quantity",
+            sizing_value=max_value if normalized_side in OPENING_SIDES else max_quantity,
+            quantity=None,
+            amount=None,
+            price=price,
+            portfolio_value=portfolio_value,
+            decimal_precision=decimal_precision,
+        )
 
     def get_portfolio_summary(self, db: Session, mode: str | None = None) -> dict:
         open_positions_stmt = select(Position).where(Position.status == "open")
@@ -541,7 +714,10 @@ class PortfolioService:
             "closed_trades_count": len([trade for trade in trades if trade.side == "sell"]),
             "best_performer": pnl_by_symbol[0] if pnl_by_symbol else {"symbol": "-", "pnl": 0},
             "worst_performer": pnl_by_symbol[-1] if pnl_by_symbol else {"symbol": "-", "pnl": 0},
-            "risk_exposure_summary": {"gross_exposure": round(sum(position.current_price * position.quantity for position in open_positions), 2)},
+            "risk_exposure_summary": {
+                "gross_exposure": round(sum(abs(position.current_price * position.quantity) for position in open_positions), 2),
+                "net_exposure": round(sum(position.current_price * position.quantity for position in open_positions), 2),
+            },
             "broker_connection_status": broker_status,
             "provider_status": {},
             "automation_status": {"worker": "scheduled", "safety": "risk-engine-enforced", "scope": mode or "combined"},
@@ -561,8 +737,11 @@ class PortfolioService:
             .order_by(desc(Order.created_at))
             .limit(1)
         )
+        position_payload = to_plain_dict(position)
+        if position.status == "closed" or abs(position.quantity) <= 1e-8:
+            position_payload["unrealized_pnl"] = 0
         return {
-            **to_plain_dict(position),
+            **position_payload,
             "symbol": asset.symbol if asset else position.asset_id,
             "asset_name": asset.name if asset else position.asset_id,
             "asset_currency": asset.currency if asset else "USD",
@@ -572,10 +751,16 @@ class PortfolioService:
     def _order_view(self, db: Session, order: Order) -> dict:
         asset = db.get(Asset, order.asset_id)
         protective_levels = order.audit_context.get("protective_levels", {})
+        sizing = (order.audit_context or {}).get("sizing", {})
         return {
             **to_plain_dict(order),
             "symbol": asset.symbol if asset else order.asset_id,
             "asset_name": asset.name if asset else order.asset_id,
+            "sizing_mode": sizing.get("sizing_mode"),
+            "sizing_value": sizing.get("sizing_value"),
+            "order_notional": sizing.get("order_value"),
+            "portfolio_percent": sizing.get("portfolio_percent"),
+            "rounding_warning": sizing.get("rounding_warning"),
             "stop_loss": protective_levels.get("stop_loss"),
             "take_profit": protective_levels.get("take_profit"),
             "trailing_stop": protective_levels.get("trailing_stop"),

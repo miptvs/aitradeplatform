@@ -22,9 +22,13 @@ from app.utils.time import utcnow
 settings = get_settings()
 
 RSS_HEADERS = {
-    "User-Agent": "AITraderPlatform/1.0 (+https://github.com/miptvs/aitradeplatform; RSS refresh)",
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; AITraderPlatform/1.0; "
+        "+https://github.com/miptvs/aitradeplatform; RSS refresh)"
+    ),
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
 }
 
 
@@ -74,6 +78,7 @@ class NewsService:
                 "cutoff": utcnow().isoformat(),
                 "latest_seen_published_at": None,
                 "force_refresh": False,
+                "fallback_feeds_used": False,
                 "last_successful_fetch_time": None,
                 "errors": [],
                 "feed_reports": [],
@@ -92,6 +97,7 @@ class NewsService:
             "cutoff": metadata.get("cutoff", event.observed_at.isoformat()),
             "latest_seen_published_at": metadata.get("latest_seen_published_at"),
             "force_refresh": metadata.get("force_refresh", False),
+            "fallback_feeds_used": metadata.get("fallback_feeds_used", False),
             "last_successful_fetch_time": metadata.get("last_successful_fetch_time"),
             "errors": metadata.get("errors", []),
             "feed_reports": metadata.get("feed_reports", []),
@@ -106,7 +112,7 @@ class NewsService:
         run_type: str = "manual",
     ) -> dict:
         refresh_started_at = utcnow()
-        feed_urls = self._build_feed_urls(db)
+        primary_feed_urls = self._build_feed_urls(db)
         tracked_assets = list(db.scalars(select(Asset).where(Asset.is_active.is_(True)).order_by(Asset.symbol)))
         last_successful_refresh = self._last_successful_refresh(db)
         checkpoint = self._last_refresh_checkpoint(db)
@@ -141,11 +147,22 @@ class NewsService:
         errors: list[str] = []
         feed_reports: list[dict] = []
         latest_seen_published_at: datetime | None = checkpoint
+        feed_urls: list[str] = []
+        fallback_feeds_used = False
 
-        for feed_url in feed_urls:
+        def process_feed(feed_url: str, *, feed_group: str) -> None:
+            nonlocal articles_added
+            nonlocal date_skipped
+            nonlocal duplicates_skipped
+            nonlocal feeds_failed
+            nonlocal latest_article_id
+            nonlocal latest_seen_published_at
+
+            feed_urls.append(feed_url)
             feed_report = {
                 "feed_url": feed_url,
                 "feed_label": self._feed_label(feed_url),
+                "feed_group": feed_group,
                 "status": "ok",
                 "fetched_count": 0,
                 "added_count": 0,
@@ -164,9 +181,11 @@ class NewsService:
                 message = f"{feed_url}: {exc}"
                 errors.append(message)
                 feed_report["status"] = "error"
+                if isinstance(exc, ElementTree.ParseError):
+                    feed_report["parse_error_count"] = 1
                 feed_report["error"] = str(exc)
                 feed_reports.append(feed_report)
-                continue
+                return
 
             feed_report["fetched_count"] = len(entries)
             feed_report["sample_titles"] = [entry["title"] for entry in entries[:3] if entry.get("title")]
@@ -252,6 +271,16 @@ class NewsService:
                 feed_report["status"] = "stale"
             feed_reports.append(feed_report)
 
+        for feed_url in primary_feed_urls:
+            process_feed(feed_url, feed_group="primary")
+
+        if articles_added == 0 and len(feed_urls) - feeds_failed <= 0:
+            backup_urls = self._build_backup_feed_urls(primary_feed_urls, tracked_assets)
+            if backup_urls:
+                fallback_feeds_used = True
+                for feed_url in backup_urls:
+                    process_feed(feed_url, feed_group="backup")
+
         successful_feeds = len(feed_urls) - feeds_failed
         status = "ok"
         if successful_feeds <= 0:
@@ -269,6 +298,7 @@ class NewsService:
             date_skipped=date_skipped,
             feeds_failed=feeds_failed,
             force_refresh=force_refresh,
+            fallback_feeds_used=fallback_feeds_used,
         )
 
         serialized_feed_reports = [
@@ -298,6 +328,7 @@ class NewsService:
                     "latest_seen_published_at": latest_seen_published_at.isoformat() if latest_seen_published_at else None,
                     "last_successful_fetch_time": last_successful_refresh.isoformat() if last_successful_refresh else None,
                     "force_refresh": force_refresh,
+                    "fallback_feeds_used": fallback_feeds_used,
                     "feed_reports": serialized_feed_reports,
                     "errors": errors[:5],
                 },
@@ -323,6 +354,7 @@ class NewsService:
             "latest_seen_published_at": latest_seen_published_at.isoformat() if latest_seen_published_at else None,
             "force_refresh": force_refresh,
             "last_successful_fetch_time": last_successful_refresh.isoformat() if last_successful_refresh else None,
+            "fallback_feeds_used": fallback_feeds_used,
             "feed_reports": serialized_feed_reports,
             "errors": errors[:5],
         }
@@ -379,6 +411,27 @@ class NewsService:
 
         return list(dict.fromkeys(urls))
 
+    def _build_backup_feed_urls(self, primary_urls: list[str], tracked_assets: list[Asset]) -> list[str]:
+        urls: list[str] = []
+        symbols = [
+            asset.symbol.split(".")[0].strip().upper()
+            for asset in tracked_assets[: settings.news_symbol_feed_limit]
+            if asset.symbol and asset.symbol.strip()
+        ]
+        unique_symbols = list(dict.fromkeys(symbol for symbol in symbols if re.fullmatch(r"[A-Z0-9._-]{1,12}", symbol)))
+        if unique_symbols:
+            symbol_query = quote_plus(",".join(unique_symbols), safe=",")
+            urls.append(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol_query}&region=US&lang=en-US")
+        urls.extend(settings.news_backup_rss_feeds)
+        seen = set(primary_urls)
+        backup_urls: list[str] = []
+        for url in urls:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            backup_urls.append(url)
+        return backup_urls
+
     def _fetch_feed(self, feed_url: str) -> str:
         last_error: Exception | None = None
         for attempt in range(3):
@@ -388,7 +441,15 @@ class NewsService:
                 if not response.text.strip():
                     raise ValueError("RSS feed returned an empty response.")
                 return response.text
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                last_error = ValueError(f"RSS feed returned HTTP {status_code}.")
+                if status_code in {408, 425, 429} or status_code >= 500:
+                    if attempt < 2:
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                break
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(0.25 * (attempt + 1))
@@ -425,6 +486,7 @@ class NewsService:
         date_skipped: int,
         feeds_failed: int,
         force_refresh: bool,
+        fallback_feeds_used: bool,
     ) -> str:
         if articles_added:
             message = (
@@ -444,6 +506,8 @@ class NewsService:
                 )
         if feeds_failed:
             message = f"{message} {feeds_failed} feed{'s' if feeds_failed != 1 else ''} failed."
+        if fallback_feeds_used:
+            message = f"{message} Backup RSS feeds were used because the primary feed set did not produce a usable fetch."
         return message
 
     def _parse_feed(self, document: str) -> list[dict]:

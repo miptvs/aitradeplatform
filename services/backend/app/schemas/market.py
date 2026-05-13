@@ -103,6 +103,7 @@ class NewsRefreshRequest(BaseModel):
 class NewsFeedDiagnostic(BaseModel):
     feed_url: str
     feed_label: str
+    feed_group: str = "primary"
     status: str
     fetched_count: int
     added_count: int
@@ -127,6 +128,7 @@ class NewsRefreshResponse(BaseModel):
     cutoff: str
     latest_seen_published_at: str | None = None
     force_refresh: bool = False
+    fallback_feeds_used: bool = False
     last_successful_fetch_time: str | None = None
     errors: list[str] = Field(default_factory=list)
     feed_reports: list[NewsFeedDiagnostic] = Field(default_factory=list)

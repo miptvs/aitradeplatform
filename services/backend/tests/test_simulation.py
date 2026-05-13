@@ -1,12 +1,12 @@
 from datetime import timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models.asset import Asset, MarketSnapshot
 from app.models.base import Base
-from app.models.portfolio import Order, Position, Trade
+from app.models.portfolio import Order, PortfolioSnapshot, Position, PositionStopEvent, Trade
 from app.models.provider import ProviderConfig
 from app.models.simulation import SimulationAccount
 from app.services.simulation.service import simulation_service
@@ -15,6 +15,7 @@ from app.utils.time import utcnow
 
 def build_session() -> Session:
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    event.listen(engine, "connect", lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"))
     Base.metadata.create_all(bind=engine)
     return sessionmaker(bind=engine, future=True)()
 
@@ -108,6 +109,32 @@ def test_short_simulation_can_profit_when_price_falls() -> None:
 
     assert sim_trade.realized_pnl == 20
     assert account.cash_balance == 1020
+    assert position.status == "closed"
+
+
+def test_fractional_short_and_cover_are_supported() -> None:
+    db = build_session()
+    asset = Asset(symbol="FSHORT", name="Fractional Short Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    account = SimulationAccount(name="Fractional Short Sim", starting_cash=1000, cash_balance=1000, fees_bps=0, slippage_bps=0, latency_ms=0, short_enabled=True)
+    db.add(account)
+    db.flush()
+
+    short_order = Order(asset_id=asset.id, mode="simulation", side="short", order_type="market", quantity=0.25, requested_price=100, status="accepted", manual=False)
+    db.add(short_order)
+    db.flush()
+    simulation_service.execute_order_from_order(db, order=short_order, simulation_account_id=account.id)
+    cover_order = Order(asset_id=asset.id, mode="simulation", side="cover_short", order_type="market", quantity=0.25, requested_price=80, status="accepted", manual=False)
+    db.add(cover_order)
+    db.flush()
+
+    _, sim_trade, position = simulation_service.execute_order_from_order(db, order=cover_order, simulation_account_id=account.id)
+    db.commit()
+
+    assert sim_trade.quantity == 0.25
+    assert sim_trade.realized_pnl == 5
+    assert account.cash_balance == 1005
     assert position.status == "closed"
 
 
@@ -372,10 +399,79 @@ def test_reset_account_clears_only_selected_model_ledger() -> None:
         manual=False,
         audit_context={"simulation_account_id": second.id},
     )
-    db.add_all([first_order, second_order])
+    provider_matched_order = Order(
+        asset_id=asset.id,
+        mode="simulation",
+        side="buy",
+        order_type="market",
+        quantity=1,
+        requested_price=25,
+        status="accepted",
+        manual=False,
+        provider_type="model_a",
+    )
+    db.add_all([first_order, second_order, provider_matched_order])
+    db.flush()
+    provider_matched_trade = Trade(
+        asset_id=asset.id,
+        order_id=provider_matched_order.id,
+        mode="simulation",
+        side="buy",
+        quantity=1,
+        price=25,
+        realized_pnl=0,
+        provider_type="model_a",
+        executed_at=utcnow(),
+    )
+    db.add(provider_matched_trade)
     db.flush()
     simulation_service.execute_order_from_order(db, order=first_order, simulation_account_id=first.id)
     simulation_service.execute_order_from_order(db, order=second_order, simulation_account_id=second.id)
+    first_position = db.scalar(select(Position).where(Position.simulation_account_id == first.id))
+    assert first_position is not None
+    stop_event = PositionStopEvent(
+        position_id=first_position.id,
+        order_id=first_order.id,
+        mode="simulation",
+        source="test",
+        event_type="protective_levels",
+        stop_loss=20,
+        take_profit=30,
+        trailing_stop=None,
+        observed_at=utcnow(),
+    )
+    legacy_snapshot = PortfolioSnapshot(
+        mode="simulation",
+        timestamp=utcnow() - timedelta(days=2),
+        total_value=320,
+        cash=320,
+        equity=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        exposure_json={},
+    )
+    first_snapshot = PortfolioSnapshot(
+        mode="simulation",
+        simulation_account_id=first.id,
+        timestamp=utcnow() - timedelta(days=1),
+        total_value=900,
+        cash=900,
+        equity=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        exposure_json={},
+    )
+    second_snapshot = PortfolioSnapshot(
+        mode="simulation",
+        simulation_account_id=second.id,
+        timestamp=utcnow() - timedelta(days=1),
+        total_value=975,
+        cash=975,
+        equity=0,
+        realized_pnl=0,
+        unrealized_pnl=0,
+        exposure_json={},
+    )
     legacy_position = Position(
         asset_id=asset.id,
         mode="simulation",
@@ -397,7 +493,7 @@ def test_reset_account_clears_only_selected_model_ledger() -> None:
         status="open",
         notes="Legacy provider-scoped row without an account id",
     )
-    db.add_all([legacy_position, provider_matched_legacy_position])
+    db.add_all([stop_event, legacy_snapshot, first_snapshot, second_snapshot, legacy_position, provider_matched_legacy_position])
     db.commit()
 
     simulation_service.reset_account(db, first.id)
@@ -407,7 +503,13 @@ def test_reset_account_clears_only_selected_model_ledger() -> None:
     assert db.scalar(select(Position).where(Position.simulation_account_id == first.id)) is None
     assert db.scalar(select(Order).where(Order.id == first_order.id)) is None
     assert db.scalar(select(Trade).where(Trade.order_id == first_order.id)) is None
+    assert db.scalar(select(Order).where(Order.id == provider_matched_order.id)) is None
+    assert db.scalar(select(Trade).where(Trade.id == provider_matched_trade.id)) is None
+    assert db.scalar(select(PositionStopEvent).where(PositionStopEvent.id == stop_event.id)) is None
     assert db.scalar(select(Position).where(Position.id == legacy_position.id)) is None
     assert db.scalar(select(Position).where(Position.id == provider_matched_legacy_position.id)) is None
+    assert db.scalar(select(PortfolioSnapshot).where(PortfolioSnapshot.id == legacy_snapshot.id)) is None
+    assert db.scalar(select(PortfolioSnapshot).where(PortfolioSnapshot.id == first_snapshot.id)) is None
+    assert db.scalar(select(PortfolioSnapshot).where(PortfolioSnapshot.id == second_snapshot.id)) is not None
     assert db.scalar(select(Position).where(Position.simulation_account_id == second.id)) is not None
     assert db.scalar(select(Order).where(Order.id == second_order.id)) is not None

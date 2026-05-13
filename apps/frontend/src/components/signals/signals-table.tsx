@@ -57,6 +57,7 @@ export function SignalsTable({
                 </td>
                 <td className="text-xs text-slate-300">
                   <div>Entry {signal.suggested_entry ? formatCurrency(signal.suggested_entry) : "-"}</div>
+                  <div>Size {formatSignalSize(signal)}</div>
                   <div>Stop {signal.suggested_stop_loss ? formatCurrency(signal.suggested_stop_loss) : "-"}</div>
                   <div>TP {signal.suggested_take_profit ? formatCurrency(signal.suggested_take_profit) : "-"}</div>
                 </td>
@@ -95,6 +96,20 @@ export function SignalsTable({
 function truncateText(value: string, maxLength: number) {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function formatSignalSize(signal: Signal) {
+  const value = signal.suggested_position_size_value;
+  if (signal.suggested_position_size_type === "percentage" && value !== null && value !== undefined) {
+    return `${value}%`;
+  }
+  if (signal.suggested_position_size_type === "amount" && value !== null && value !== undefined) {
+    return formatCurrency(value);
+  }
+  if (signal.fallback_quantity !== null && signal.fallback_quantity !== undefined) {
+    return `${signal.fallback_quantity} qty`;
+  }
+  return "-";
 }
 
 function signalActionLabel(signal: Signal) {

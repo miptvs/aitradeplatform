@@ -26,6 +26,18 @@ Example: with a 10,000 portfolio and a 20% reserve, 2,000 must remain in cash. N
 
 Simulation accounts can override the global reserve independently per provider/model account.
 
+## Fractional sizing
+
+Orders support three sizing modes:
+
+- `percentage`: invest a share of portfolio value, such as 5% of the account
+- `amount`: invest a fixed currency notional, such as 100 USD
+- `quantity`: explicitly trade a quantity, including fractional values like 0.25 shares
+
+Risk checks validate notional value rather than whole-share counts. When an otherwise valid order is too large for cash, cash reserve, max position size, asset allocation, sector allocation, or current holdings, the response includes `max_allowed_order_value` and `max_allowed_quantity`. Manual and automation order paths can use those values to resize to the maximum allowed fractional order. If no positive allowed amount remains, the order is rejected with the rule reason.
+
+Simulation accounts also have `decimal_precision`. Fills round quantity down at that precision and store a warning in the order audit context when rounding changed the requested size.
+
 ## Short behavior
 
 Live Trading212 shorting is rejected because the adapter does not confirm short execution support. Simulation can open `short` and `cover_short` only when `short_enabled` is enabled for the selected simulation account.

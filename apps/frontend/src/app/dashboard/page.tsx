@@ -22,12 +22,13 @@ export default function DashboardPage() {
   const [latestTradesOpen, setLatestTradesOpen] = useState(true);
   const [latestSignalsOpen, setLatestSignalsOpen] = useState(true);
   const { data, loading, error, reload } = useApi(async () => {
+    const selectedMode = mode === "combined" ? undefined : mode;
     const [summary, snapshots, positions, orders, trades, signals, alerts, health] = await Promise.all([
-      api.getPortfolioSummary(mode === "combined" ? undefined : mode),
-      api.getPortfolioSnapshots(),
-      api.getPositions(),
-      api.getOrders(),
-      api.getTrades(),
+      api.getPortfolioSummary(selectedMode),
+      api.getPortfolioSnapshots(selectedMode),
+      api.getPositions({ mode: selectedMode }),
+      api.getOrders({ mode: selectedMode }),
+      api.getTrades({ mode: selectedMode }),
       api.getSignals(workspace.signalProviderType),
       api.getAlerts(),
       api.getHealth()

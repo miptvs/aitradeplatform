@@ -38,10 +38,10 @@ export function AppShell({ children }: PropsWithChildren) {
   }
 
   return (
-    <div className="min-h-screen px-4 py-4 text-ink md:px-6" style={shellStyle}>
-      <div className={cn("mx-auto grid max-w-[1680px] gap-4 transition-[grid-template-columns]", sidebarCollapsed ? "lg:grid-cols-[88px_1fr]" : "lg:grid-cols-[280px_1fr]")}>
+    <div className="min-h-screen overflow-x-hidden px-4 py-4 text-ink md:px-6" style={shellStyle}>
+      <div className={cn("mx-auto grid w-full min-w-0 max-w-[1680px] gap-4 transition-[grid-template-columns]", sidebarCollapsed ? "lg:grid-cols-[88px_minmax(0,1fr)]" : "lg:grid-cols-[280px_minmax(0,1fr)]")}>
         <Sidebar collapsed={sidebarCollapsed} onToggle={toggleSidebar} />
-        <main className="rounded-[28px] border border-border bg-slate-950/60 p-4 shadow-panel backdrop-blur md:p-5" style={panelStyle}>
+        <main className="min-w-0 rounded-[28px] border border-border bg-slate-950/60 p-4 shadow-panel backdrop-blur md:p-5" style={panelStyle}>
           <div className="mb-4 flex flex-col gap-2 rounded-2xl border border-border bg-panel/70 px-3 py-3 lg:flex-row lg:items-center lg:justify-between" style={panelStyle}>
             <div>
               <div className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Operator Console</div>

@@ -10,6 +10,7 @@ from app.models.health import SystemHealthEvent
 from app.models.news import ExtractedEvent, NewsArticle
 from app.models.portfolio import Order, Position, PositionStopEvent, Trade
 from app.models.signal import Signal, SignalEvaluation
+from app.models.simulation import SimulationAccount
 from app.models.strategy import Strategy
 from app.services.portfolio.service import portfolio_service
 from app.services.market_data.service import market_data_service
@@ -195,9 +196,12 @@ class SignalService:
         provider_errors: list[str] = []
         candidate_limit = 1 if profile.deployment_scope == "local" else 2
         provider_timeout = 12 if profile.deployment_scope == "local" else 20
+        simulation_account = self._simulation_account_for_provider(db, provider_type)
         held_asset_ids = {
             item
-            for item in db.scalars(select(Position.asset_id).where(Position.status == "open")).all()
+            for item in db.scalars(
+                select(Position.asset_id).where(*self._provider_position_filters(provider_type, simulation_account))
+            ).all()
             if item is not None
         }
 
@@ -307,7 +311,8 @@ class SignalService:
                 continue
 
             parsed = self._parse_model_response(result.text)
-            action = self._normalize_action(parsed.get("action"), preferred_decision.action)
+            model_action = self._normalize_action(parsed.get("action"), preferred_decision.action)
+            action = self._normalize_action_for_position_state(model_action, is_held=is_held, simulation_account=simulation_account)
             confidence = self._clamp_confidence(parsed.get("confidence", preferred_decision.confidence))
             strategy_slug = self._normalize_strategy(parsed.get("strategy"), preferred_slug)
             strategy = strategies.get(strategy_slug, strategy)
@@ -319,6 +324,12 @@ class SignalService:
             estimated_risk_reward = self._safe_float(parsed.get("estimated_risk_reward"))
             if estimated_risk_reward is None and suggested_stop_loss is not None and suggested_take_profit is not None:
                 estimated_risk_reward = self._risk_reward(suggested_entry, suggested_stop_loss, suggested_take_profit, action)
+            suggested_size_type, suggested_size_value = self._normalize_position_size_suggestion(
+                parsed.get("suggested_position_size_type"),
+                parsed.get("suggested_position_size_value"),
+                action,
+            )
+            fallback_quantity = self._safe_float(parsed.get("fallback_quantity"), precision=6)
 
             signal = Signal(
                 asset_id=asset.id,
@@ -345,6 +356,9 @@ class SignalService:
                 suggested_stop_loss=suggested_stop_loss,
                 suggested_take_profit=suggested_take_profit,
                 estimated_risk_reward=estimated_risk_reward,
+                suggested_position_size_type=suggested_size_type,
+                suggested_position_size_value=suggested_size_value,
+                fallback_quantity=fallback_quantity,
                 provider_type=provider_type,
                 model_name=result.model_name,
                 mode="both",
@@ -356,6 +370,8 @@ class SignalService:
                     "generation_profile_mode": profile.trading_mode,
                     "trade_intent": self._trade_intent(action, is_held),
                     "is_held_asset": is_held,
+                    "model_action": model_action,
+                    "normalized_from_model_action": model_action if model_action != action else None,
                     "news_title": latest_news.title if latest_news else None,
                     "event_type": latest_event.event_type if latest_event else None,
                     "mcp_context_used": bool(mcp_context),
@@ -399,7 +415,13 @@ class SignalService:
         positions = list(
             db.scalars(
                 select(Position)
-                .where(Position.status == "open", Position.quantity > 0)
+                .where(
+                    *self._provider_position_filters(
+                        provider_type,
+                        self._simulation_account_for_provider(db, provider_type),
+                    ),
+                    Position.quantity > 0,
+                )
                 .order_by(desc(Position.updated_at))
                 .limit(12)
             )
@@ -465,6 +487,9 @@ class SignalService:
                 suggested_stop_loss=None,
                 suggested_take_profit=None,
                 estimated_risk_reward=None,
+                suggested_position_size_type="percentage",
+                suggested_position_size_value=100.0,
+                fallback_quantity=position.quantity,
                 provider_type=provider_type,
                 model_name=f"{config.default_model or profile.default_model}+exit-rules",
                 mode="both",
@@ -491,6 +516,37 @@ class SignalService:
                 break
 
         return created
+
+    def _simulation_account_for_provider(self, db: Session, provider_type: str) -> SimulationAccount | None:
+        return db.scalar(select(SimulationAccount).where(SimulationAccount.provider_type == provider_type).limit(1))
+
+    def _provider_position_filters(
+        self,
+        provider_type: str,
+        simulation_account: SimulationAccount | None,
+    ) -> list[Any]:
+        filters: list[Any] = [Position.status == "open", Position.mode == "simulation"]
+        if simulation_account is not None:
+            filters.append(Position.simulation_account_id == simulation_account.id)
+        else:
+            filters.append(Position.provider_type == provider_type)
+        return filters
+
+    def _normalize_action_for_position_state(
+        self,
+        action: str,
+        *,
+        is_held: bool,
+        simulation_account: SimulationAccount | None,
+    ) -> str:
+        normalized = str(action).lower()
+        if is_held:
+            return normalized
+        if normalized in {"sell", "close_long", "reduce_long"} and simulation_account and simulation_account.short_enabled:
+            return "short"
+        if normalized in {"close_long", "reduce_long", "cover_short"}:
+            return "hold"
+        return normalized
 
     def _recent_close_signal_exists(self, db: Session, asset_id: str, provider_type: str) -> bool:
         recent_signals = list(
@@ -1045,12 +1101,15 @@ class SignalService:
         return (
             f"You are generating a real trading signal for {asset.symbol} ({asset.name}) using the {profile_title} workspace.\n"
             "Use the technical inputs, real RSS news context, extracted event context, and MCP tool context below. "
-            "Return only JSON with keys: action, confidence, strategy, rationale, suggested_entry, suggested_stop_loss, suggested_take_profit, estimated_risk_reward.\n"
+            "Return only JSON with keys: action, confidence, strategy, rationale, suggested_entry, suggested_stop_loss, suggested_take_profit, estimated_risk_reward, suggested_position_size_type, suggested_position_size_value, fallback_quantity.\n"
             "Action must be one of BUY, SELL, HOLD, CLOSE_LONG, REDUCE_LONG, SHORT, COVER_SHORT. "
             "Use CLOSE_LONG or REDUCE_LONG for existing long holdings that should be exited or trimmed. "
             "Use SELL for bearish/exit pressure when a long exists or when shorting is not assumed. "
             "Use SHORT only for a clear bearish opportunity that should be simulated as a short; live brokers may not support it. "
             "Confidence must be between 0 and 1. Strategy must be one of: trend-following, mean-reversion, breakout, news-momentum, event-driven, blended.\n"
+            "Sizing must be fractional-aware and capital-efficient: prefer suggested_position_size_type as percentage or amount, with suggested_position_size_value such as 5 for 5% of portfolio or 150 for $150 notional. "
+            "Use fallback_quantity only when an exact quantity is essential, and fractional quantities such as 0.25 are allowed. "
+            "Scale positions gradually; avoid all-in/all-out sizing unless the action is CLOSE_LONG or COVER_SHORT.\n"
             "Use hold if the setup is weak or conflicted.\n\n"
             f"Technical indicators:\n{json.dumps(indicators, indent=2)}\n\n"
             f"Rule-engine strategy votes:\n{decision_lines}\n"
@@ -1142,9 +1201,30 @@ class SignalService:
         }
         return candidate if candidate in allowed else fallback
 
-    def _safe_float(self, value: Any) -> float | None:
+    def _normalize_position_size_suggestion(self, size_type: Any, size_value: Any, action: str) -> tuple[str | None, float | None]:
+        normalized = str(size_type or "").strip().lower().replace("-", "_").replace("fixed_", "")
+        aliases = {
+            "percent": "percentage",
+            "portfolio_percent": "percentage",
+            "notional": "amount",
+            "currency": "amount",
+            "cash": "amount",
+        }
+        normalized = aliases.get(normalized, normalized)
+        numeric = self._safe_float(size_value)
+        if normalized not in {"percentage", "amount"} or numeric is None or numeric <= 0:
+            if action in {"buy", "short", "reduce_long"}:
+                return "percentage", 5.0
+            if action in {"close_long", "cover_short"}:
+                return "percentage", 100.0
+            return None, None
+        if normalized == "percentage":
+            numeric = min(numeric, 100.0)
+        return normalized, numeric
+
+    def _safe_float(self, value: Any, *, precision: int = 2) -> float | None:
         try:
-            return round(float(value), 2)
+            return round(float(value), precision)
         except Exception:
             return None
 

@@ -116,6 +116,7 @@ export function ProvenanceDialog({
                   <TraceStat label="Symbol" value={`${detail.symbol} · ${detail.asset_name}`} />
                   <TraceStat label="Action / confidence" value={`${detail.action.toUpperCase()} · ${formatPct(detail.confidence)}`} />
                   <TraceStat label="Suggested entry" value={detail.suggested_entry ? formatCurrency(detail.suggested_entry) : "-"} />
+                  <TraceStat label="Suggested size" value={formatSignalSize(detail)} />
                   <TraceStat label="Risk / reward" value={detail.estimated_risk_reward ? `${detail.estimated_risk_reward.toFixed(2)}x` : "-"} />
                 </div>
                 <div className="mt-4 text-sm leading-6 text-slate-200">
@@ -345,4 +346,18 @@ function moneyish(value: unknown) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric === 0) return "-";
   return formatCurrency(numeric);
+}
+
+function formatSignalSize(signal: Signal) {
+  const value = signal.suggested_position_size_value;
+  if (signal.suggested_position_size_type === "percentage" && value !== null && value !== undefined) {
+    return `${value}% of portfolio`;
+  }
+  if (signal.suggested_position_size_type === "amount" && value !== null && value !== undefined) {
+    return formatCurrency(value);
+  }
+  if (signal.fallback_quantity !== null && signal.fallback_quantity !== undefined) {
+    return `${formatQuantity(signal.fallback_quantity, 6)} shares`;
+  }
+  return "-";
 }

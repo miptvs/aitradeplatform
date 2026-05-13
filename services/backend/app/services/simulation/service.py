@@ -9,6 +9,7 @@ from app.schemas.simulation import SimulationAccountCreate, SimulationAccountUpd
 from app.services.events.service import publish_event
 from app.services.market_data.service import market_data_service
 from app.services.market_hours.service import market_hours_service
+from app.services.order_sizing import round_quantity
 from app.services.providers.service import provider_service
 from app.services.alerts.service import alert_service
 from app.utils.time import utcnow
@@ -27,6 +28,7 @@ class SimulationService:
         default_fees_bps = float(template.fees_bps if template else 5)
         default_slippage_bps = float(template.slippage_bps if template else 2)
         default_latency_ms = int(template.latency_ms if template else 50)
+        default_decimal_precision = int(template.decimal_precision if template else 6)
 
         for config in provider_service.list_configs(db):
             profile = provider_service.get_profile(config.provider_type)
@@ -51,6 +53,7 @@ class SimulationService:
                 short_borrow_fee_bps=0,
                 short_margin_requirement=1.5,
                 partial_fill_ratio=1.0,
+                decimal_precision=default_decimal_precision,
                 enforce_market_hours=False,
                 is_active=True,
             )
@@ -78,6 +81,7 @@ class SimulationService:
             short_borrow_fee_bps=payload.short_borrow_fee_bps,
             short_margin_requirement=payload.short_margin_requirement,
             partial_fill_ratio=payload.partial_fill_ratio,
+            decimal_precision=payload.decimal_precision,
             enforce_market_hours=payload.enforce_market_hours,
         )
         db.add(account)
@@ -117,18 +121,31 @@ class SimulationService:
             for order in db.scalars(select(Order).where(Order.mode == "simulation"))
             if (order.audit_context or {}).get("simulation_account_id") == account_id
             or (order.position_id and order.position_id in position_ids)
+            or (account.provider_type and order.provider_type == account.provider_type)
         ]
         generic_order_ids = {order.id for order in generic_orders}
         generic_trades = [
             trade
             for trade in db.scalars(select(Trade))
-            if (trade.position_id and trade.position_id in position_ids) or (trade.order_id and trade.order_id in generic_order_ids)
+            if (trade.position_id and trade.position_id in position_ids)
+            or (trade.order_id and trade.order_id in generic_order_ids)
+            or (account.provider_type and trade.provider_type == account.provider_type and trade.mode == "simulation")
         ]
         for source_ref in {*position_ids, *generic_order_ids}:
             alert_service.resolve_alerts(db, source_ref=source_ref)
         # A simulation reset is a fresh virtual training ledger, so old rejected
         # simulation orders should stop surfacing as current risk notices.
         alert_service.resolve_alerts(db, mode="simulation", category="risk")
+        stop_event_query = select(PositionStopEvent).where(PositionStopEvent.mode == "simulation")
+        stop_event_filters = []
+        if position_ids:
+            stop_event_filters.append(PositionStopEvent.position_id.in_(position_ids))
+        if generic_order_ids:
+            stop_event_filters.append(PositionStopEvent.order_id.in_(generic_order_ids))
+        if stop_event_filters:
+            for stop_event in list(db.scalars(stop_event_query.where(or_(*stop_event_filters)))):
+                db.delete(stop_event)
+            db.flush()
         for fill in list(db.scalars(select(Fill))):
             if fill.order_id in generic_order_ids:
                 db.delete(fill)
@@ -148,7 +165,10 @@ class SimulationService:
             db.scalars(
                 select(PortfolioSnapshot).where(
                     PortfolioSnapshot.mode == "simulation",
-                    PortfolioSnapshot.simulation_account_id == account_id,
+                    or_(
+                        PortfolioSnapshot.simulation_account_id == account_id,
+                        PortfolioSnapshot.simulation_account_id.is_(None),
+                    ),
                 )
             )
         ):
@@ -186,7 +206,7 @@ class SimulationService:
             if not hours.is_open:
                 raise ValueError(f"Simulation market-hours guard blocked order: {hours.reason}")
         fill_ratio = max(0.0, min(1.0, float(account.partial_fill_ratio or 1.0)))
-        executed_quantity = round(order.quantity * fill_ratio, 8)
+        executed_quantity = round_quantity(order.quantity * fill_ratio, account.decimal_precision)
         if executed_quantity <= 0:
             raise ValueError("Simulation partial-fill settings produced a zero fill quantity.")
         slip = base_price * (account.slippage_bps / 10_000)
@@ -231,7 +251,7 @@ class SimulationService:
             if position:
                 new_qty = position.quantity + executed_quantity
                 position.avg_entry_price = ((position.quantity * position.avg_entry_price) + (executed_quantity * executed_price)) / new_qty
-                position.quantity = new_qty
+                position.quantity = round_quantity(new_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.unrealized_pnl = (executed_price - position.avg_entry_price) * position.quantity
                 if protective_levels.get("stop_loss") is not None:
@@ -268,7 +288,7 @@ class SimulationService:
                 existing_qty = abs(position.quantity)
                 new_qty = existing_qty + executed_quantity
                 position.avg_entry_price = ((existing_qty * position.avg_entry_price) + (executed_quantity * executed_price)) / new_qty
-                position.quantity = -new_qty
+                position.quantity = -round_quantity(new_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.unrealized_pnl = (position.avg_entry_price - executed_price) * new_qty
             else:
@@ -308,7 +328,7 @@ class SimulationService:
                 position.status = "closed"
                 position.closed_at = utcnow()
             else:
-                position.quantity = -remaining_qty
+                position.quantity = -round_quantity(remaining_qty, account.decimal_precision)
                 position.unrealized_pnl = (position.avg_entry_price - executed_price) * remaining_qty
         else:
             if position is None or position.quantity <= 0 or position.quantity < executed_quantity:
@@ -324,7 +344,7 @@ class SimulationService:
                 position.status = "closed"
                 position.closed_at = utcnow()
             else:
-                position.quantity = remaining_qty
+                position.quantity = round_quantity(remaining_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.realized_pnl += realized_pnl
                 position.unrealized_pnl = (executed_price - position.avg_entry_price) * remaining_qty

@@ -23,6 +23,7 @@ from app.services.brokers.service import broker_service
 from app.services.market_data.service import market_data_service
 from app.services.portfolio.service import portfolio_service
 from app.services.providers.service import provider_service
+from app.services.risk.service import risk_service
 from app.services.simulation.service import simulation_service
 from app.services.strategies.service import strategy_service
 from app.utils.time import utcnow
@@ -43,6 +44,7 @@ class TradingWorkspaceService:
     def get_or_create_profile(self, db: Session, mode: str) -> TradingAutomationProfile:
         profile = db.scalar(select(TradingAutomationProfile).where(TradingAutomationProfile.mode == mode))
         if profile is not None:
+            self._repair_profile_defaults(db, profile)
             return profile
 
         defaults = self._default_profile_values(mode)
@@ -57,6 +59,12 @@ class TradingWorkspaceService:
         updates = payload.model_dump()
         inherit_from_live = bool(updates.pop("inherit_from_live", False))
         config_updates = updates.pop("config_json", {})
+        if mode == "simulation" and "tradable_actions" in updates:
+            requested_actions = {str(action).lower() for action in (updates.get("tradable_actions") or [])}
+            config_updates = {
+                **config_updates,
+                "short_automation_opt_in": "short" in requested_actions,
+            }
         profile.config_json = {
             **(profile.config_json or {}),
             **config_updates,
@@ -314,7 +322,10 @@ class TradingWorkspaceService:
                     asset_id=signal.asset_id,
                     mode=mode,
                     side=order_side,
-                    quantity=quantity,
+                    sizing_mode=sizing.get("sizing_mode") or "quantity",
+                    sizing_value=sizing.get("sizing_value") or quantity,
+                    quantity=quantity if sizing.get("sizing_mode") == "quantity" else None,
+                    amount=sizing.get("order_value") if sizing.get("sizing_mode") == "amount" else None,
                     requested_price=entry_price,
                     order_type="market",
                     signal_id=signal.id,
@@ -458,6 +469,11 @@ class TradingWorkspaceService:
 
     def _default_profile_values(self, mode: str) -> dict[str, Any]:
         name = "Live Trading Automation" if mode == "live" else "Simulation Automation"
+        default_actions = (
+            ["buy", "sell", "close_long", "reduce_long", "cover_short"]
+            if mode == "simulation"
+            else ["buy", "sell", "close_long", "reduce_long"]
+        )
         return {
             "name": name,
             "enabled": True,
@@ -466,7 +482,7 @@ class TradingWorkspaceService:
             "execution_interval_seconds": 300,
             "approval_mode": "semi_automatic",
             "allowed_strategy_slugs": [],
-            "tradable_actions": ["buy", "sell", "close_long", "reduce_long"],
+            "tradable_actions": default_actions,
             "allowed_provider_types": [],
             "confidence_threshold": 0.58,
             "default_order_notional": 100.0,
@@ -478,6 +494,30 @@ class TradingWorkspaceService:
             "notes": "Signals always pass through the risk engine before any simulated or live order attempt.",
             "config_json": {"semi_auto_requires_manual_ticket_review": True},
         }
+
+    def _repair_profile_defaults(self, db: Session, profile: TradingAutomationProfile) -> None:
+        if profile.mode != "simulation":
+            return
+        config = dict(profile.config_json or {})
+        if config.get("automation_policy_default_version") == 3:
+            return
+
+        action_order = ["buy", "sell", "close_long", "reduce_long", "cover_short", "short"]
+        short_opt_in = bool(config.get("short_automation_opt_in"))
+        actions = {str(action).lower() for action in (profile.tradable_actions or [])}
+        actions.update(["buy", "sell", "close_long", "reduce_long", "cover_short"])
+        if not short_opt_in:
+            actions.discard("short")
+        profile.tradable_actions = [action for action in action_order if action in actions]
+
+        strategy_slugs = [str(slug) for slug in (profile.allowed_strategy_slugs or [])]
+        if strategy_slugs and "blended" not in strategy_slugs:
+            profile.allowed_strategy_slugs = ["blended", *strategy_slugs]
+
+        config["automation_policy_default_version"] = 3
+        config["short_automation_opt_in"] = short_opt_in
+        profile.config_json = config
+        db.flush()
 
     def _finalize_profile_run(
         self,
@@ -556,7 +596,16 @@ class TradingWorkspaceService:
         broker_account: BrokerAccount | None,
         submitted_orders: int,
     ) -> dict[str, Any]:
+        signal_size_type = signal.suggested_position_size_type
+        signal_size_value = signal.suggested_position_size_value
+        account_value = self._account_value_for_mode(db, mode, simulation_account, broker_account)
         desired_notional = max(float(profile.default_order_notional or 0), 0.0)
+        if signal_size_type == "amount" and signal_size_value:
+            desired_notional = max(float(signal_size_value), 0.0)
+        elif signal_size_type == "percentage" and signal_size_value:
+            pct = float(signal_size_value)
+            pct = pct / 100 if pct > 1 else pct
+            desired_notional = max(account_value * pct, 0.0)
         if side in {"sell", "cover_short"}:
             held_quantity = self._held_quantity(db, signal.asset_id, mode, simulation_account, broker_account)
             closeable_quantity = abs(held_quantity) if side == "cover_short" and held_quantity < 0 else max(held_quantity, 0.0)
@@ -565,11 +614,17 @@ class TradingWorkspaceService:
                     "executable": False,
                     "reason": f"{signal.action.upper()} was not processed because this account has no matching position to close or reduce.",
                 }
-            desired_quantity = desired_notional / entry_price if desired_notional > 0 else closeable_quantity
+            if signal.fallback_quantity and signal.action in {"close_long", "cover_short", "reduce_long"}:
+                desired_quantity = min(abs(float(signal.fallback_quantity)), closeable_quantity)
+            else:
+                desired_quantity = desired_notional / entry_price if desired_notional > 0 else closeable_quantity
             quantity = min(closeable_quantity, desired_quantity)
             return {
                 "executable": quantity > 0,
                 "quantity": quantity,
+                "sizing_mode": "quantity",
+                "sizing_value": quantity,
+                "order_value": quantity * entry_price,
                 "sizing_note": f"Sized to {round(quantity, 6)} because the account currently holds {round(closeable_quantity, 6)} shares.",
             }
 
@@ -598,8 +653,24 @@ class TradingWorkspaceService:
         return {
             "executable": True,
             "quantity": order_notional / entry_price,
+            "sizing_mode": "amount",
+            "sizing_value": order_notional,
+            "order_value": order_notional,
             "sizing_note": sizing_note,
         }
+
+    def _account_value_for_mode(
+        self,
+        db: Session,
+        mode: str,
+        simulation_account: SimulationAccount | None,
+        broker_account: BrokerAccount | None,
+    ) -> float:
+        if mode == "simulation" and simulation_account is not None:
+            return risk_service._portfolio_value(db, mode, simulation_account.id, None)
+        if mode == "live" and broker_account is not None:
+            return risk_service._portfolio_value(db, mode, None, broker_account.id)
+        return 0.0
 
     def _workspace_signals(self, db: Session, mode: str) -> list[dict]:
         signals = list(db.scalars(select(Signal).order_by(desc(Signal.occurred_at)).limit(40)))
@@ -1169,6 +1240,15 @@ class TradingWorkspaceService:
         positions = [position for position in all_positions if position["status"] == "open"]
         orders = portfolio_service.list_orders(db, mode="simulation", simulation_account_id=account.id)
         signed_equity = sum(position["current_price"] * position["quantity"] for position in positions)
+        long_market_value = sum(
+            position["current_price"] * position["quantity"] for position in positions if position["quantity"] > 0
+        )
+        short_liability = sum(
+            abs(position["current_price"] * position["quantity"]) for position in positions if position["quantity"] < 0
+        )
+        gross_exposure = long_market_value + short_liability
+        realized_pnl = sum(position["realized_pnl"] for position in all_positions)
+        unrealized_pnl = sum(position["unrealized_pnl"] for position in positions)
         total_value = account.cash_balance + signed_equity
         reserve = self._cash_reserve_summary(db, "simulation", account.cash_balance, total_value, account)
         account_summary = {
@@ -1185,8 +1265,8 @@ class TradingWorkspaceService:
             "cash_reserve_percent": reserve["cash_reserve_percent"],
             "cash_reserve_amount": reserve["cash_reserve_amount"],
             "equity": round(signed_equity, 2),
-            "realized_pnl": round(sum(position["realized_pnl"] for position in positions), 2),
-            "unrealized_pnl": round(sum(position["unrealized_pnl"] for position in positions), 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
             "open_positions_count": len(positions),
             "active_orders_count": len([order for order in orders if order["status"] in {"pending", "accepted"}]),
             "total_trades_count": simulation_summary["total_trades"],
@@ -1205,6 +1285,10 @@ class TradingWorkspaceService:
                 "short_margin_requirement": account.short_margin_requirement,
                 "partial_fill_ratio": account.partial_fill_ratio,
                 "enforce_market_hours": account.enforce_market_hours,
+                "long_market_value": round(long_market_value, 2),
+                "short_liability": round(short_liability, 2),
+                "gross_exposure": round(gross_exposure, 2),
+                "net_position_value": round(signed_equity, 2),
             },
         }
         controls = {
@@ -1244,6 +1328,9 @@ class TradingWorkspaceService:
             "suggested_stop_loss": signal.suggested_stop_loss,
             "suggested_take_profit": signal.suggested_take_profit,
             "estimated_risk_reward": signal.estimated_risk_reward,
+            "suggested_position_size_type": signal.suggested_position_size_type,
+            "suggested_position_size_value": signal.suggested_position_size_value,
+            "fallback_quantity": signal.fallback_quantity,
             "provider_type": signal.provider_type,
             "model_name": signal.model_name,
             "indicators_json": signal.indicators_json,
@@ -1279,6 +1366,9 @@ class TradingWorkspaceService:
             "suggested_stop_loss": signal.suggested_stop_loss,
             "suggested_take_profit": signal.suggested_take_profit,
             "estimated_risk_reward": signal.estimated_risk_reward,
+            "suggested_position_size_type": signal.suggested_position_size_type,
+            "suggested_position_size_value": signal.suggested_position_size_value,
+            "fallback_quantity": signal.fallback_quantity,
         }
 
     def _latest_mode_evaluation(self, db: Session, signal_id: str, mode: str) -> SignalEvaluation | None:

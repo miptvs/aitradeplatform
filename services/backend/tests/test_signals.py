@@ -111,7 +111,7 @@ def test_generate_signals_uses_explicit_provider_and_hides_template_rows(monkeyp
         assert '"asset"' in kwargs["prompt"]
         assert "MCP signal context" in kwargs["prompt"]
         return ProviderRunResult(
-            text='{"action":"buy","confidence":0.81,"strategy":"blended","rationale":"Real provider-backed signal with technical and news confirmation.","suggested_entry":905.5,"suggested_stop_loss":878.0,"suggested_take_profit":962.0,"estimated_risk_reward":2.05}',
+            text='{"action":"buy","confidence":0.81,"strategy":"blended","rationale":"Real provider-backed signal with technical and news confirmation.","suggested_entry":905.5,"suggested_stop_loss":878.0,"suggested_take_profit":962.0,"estimated_risk_reward":2.05,"suggested_position_size_type":"percentage","suggested_position_size_value":5}',
             provider_type="local",
             model_name="qwen3:8b",
         )
@@ -134,6 +134,8 @@ def test_generate_signals_uses_explicit_provider_and_hides_template_rows(monkeyp
     assert len(listed) == 1
     assert listed[0]["provider_type"] == "local_qwen3_simulation"
     assert listed[0]["ai_rationale"].startswith("Real provider-backed signal")
+    assert listed[0]["suggested_position_size_type"] == "percentage"
+    assert listed[0]["suggested_position_size_value"] == 5
 
 
 def test_generate_signals_surfaces_provider_error_with_symbol_context(monkeypatch) -> None:

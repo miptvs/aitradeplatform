@@ -9,8 +9,14 @@ router = APIRouter()
 
 
 @router.get("/overview", response_model=AnalyticsOverview)
-def overview(db: Session = Depends(get_db)) -> AnalyticsOverview:
-    return AnalyticsOverview.model_validate(analytics_service.overview(db))
+def overview(
+    mode: str | None = Query(default="simulation"),
+    simulation_account_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> AnalyticsOverview:
+    return AnalyticsOverview.model_validate(
+        analytics_service.overview(db, mode=mode, simulation_account_id=simulation_account_id)
+    )
 
 
 @router.get("/equity-curve")

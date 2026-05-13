@@ -451,9 +451,13 @@ export default function PositionsPage() {
                 onClick={async () => {
                   if (!workspaceSimulationAccount) return;
                   if (!window.confirm(`Reset ${workspaceSimulationAccount.name} and remove its simulation positions?`)) return;
-                  await api.resetSimulationAccount(workspaceSimulationAccount.id);
-                  setMessage(`${workspaceSimulationAccount.name} reset. Simulation positions, orders, trades, and snapshots were cleaned.`);
-                  state.reload();
+                  try {
+                    await api.resetSimulationAccount(workspaceSimulationAccount.id);
+                    setMessage(`${workspaceSimulationAccount.name} reset. Simulation positions, orders, trades, and snapshots were cleaned.`);
+                    state.reload();
+                  } catch (error) {
+                    setMessage(error instanceof Error ? error.message : "Simulation account reset failed.");
+                  }
                 }}
                 className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-amber-100 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                 title="Reset the simulation account for this workspace and remove its positions."

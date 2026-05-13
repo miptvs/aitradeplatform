@@ -68,7 +68,24 @@ class Trading212BrokerAdapter(BaseBrokerAdapter):
         return BrokerResult(False, "Trading212 order sync TODO")
 
     def place_order(self, account: BrokerAccount, order_payload: dict) -> BrokerResult:
-        return BrokerResult(False, "Trading212 execution is intentionally unavailable in this scaffold")
+        quantity = order_payload.get("quantity")
+        sizing_mode = order_payload.get("sizing_mode")
+        order_notional = order_payload.get("order_notional") or order_payload.get("amount")
+        return BrokerResult(
+            False,
+            (
+                "Trading212 execution is intentionally unavailable in this scaffold. "
+                f"Resolved fractional order was {quantity} shares"
+                f" from {sizing_mode or 'unspecified'} sizing"
+                f"{f' ({order_notional} notional)' if order_notional is not None else ''}; no rounding or broker submission occurred."
+            ),
+            {
+                "fractional_quantity": quantity,
+                "sizing_mode": sizing_mode,
+                "order_notional": order_notional,
+                "fractional_supported_assumption": True,
+            },
+        )
 
     def cancel_order(self, account: BrokerAccount, order_id: str) -> BrokerResult:
         return BrokerResult(False, "Trading212 cancel TODO")

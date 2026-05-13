@@ -13,6 +13,7 @@ from app.models.provider import ProviderConfig
 from app.models.risk import RiskRule
 from app.models.signal import Signal, SignalEvaluation
 from app.models.simulation import SimulationAccount
+from app.models.trading import TradingAutomationProfile
 from app.schemas.portfolio import PositionCreate
 from app.schemas.trading import TradingAutomationProfileUpsert
 from app.services.portfolio.service import portfolio_service
@@ -119,6 +120,146 @@ def test_simulation_automation_can_submit_order_from_candidate_signal() -> None:
     assert order_trace["risk_checks"] is not None
     assert position_trace["stop_history"]
     assert "simulation_fill" in {item["source"] for item in position_trace["stop_history"]}
+
+
+def test_simulation_automation_repairs_legacy_filters_for_blended_signals() -> None:
+    db = build_session()
+    asset = Asset(symbol="BLND", name="Blended Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    db.add(
+        MarketSnapshot(
+            asset_id=asset.id,
+            timestamp=utcnow() - timedelta(minutes=1),
+            open_price=50,
+            high_price=51,
+            low_price=49,
+            close_price=50,
+            volume=1000,
+            source="test",
+        )
+    )
+    account = SimulationAccount(
+        name="Legacy Filter Sim",
+        provider_type="openai_simulation",
+        starting_cash=1000,
+        cash_balance=1000,
+        fees_bps=0,
+        slippage_bps=0,
+        latency_ms=0,
+        is_active=True,
+        short_enabled=True,
+    )
+    db.add(account)
+    db.add(
+        TradingAutomationProfile(
+            mode="simulation",
+            name="Simulation Automation",
+            enabled=True,
+            automation_enabled=True,
+            scheduled_execution_enabled=True,
+            approval_mode="fully_automatic",
+            allowed_strategy_slugs=["event-driven", "mean-reversion"],
+            tradable_actions=["buy", "sell"],
+            allowed_provider_types=["openai_simulation"],
+            confidence_threshold=0.5,
+            default_order_notional=100,
+            stop_loss_pct=0.03,
+            take_profit_pct=0.06,
+            trailing_stop_pct=0.02,
+            max_orders_per_run=1,
+            risk_profile="balanced",
+            config_json={},
+        )
+    )
+    db.add(
+        Signal(
+            asset_id=asset.id,
+            action="buy",
+            confidence=0.82,
+            status="candidate",
+            occurred_at=utcnow(),
+            indicators_json={},
+            related_news_ids=[],
+            related_event_ids=[],
+            ai_rationale="Blended buy candidate.",
+            suggested_entry=50,
+            provider_type="openai_simulation",
+            model_name="gpt-5-mini",
+            mode="both",
+            source_kind="agent",
+            metadata_json={"preferred_strategy": "blended"},
+        )
+    )
+    db.flush()
+
+    result = trading_workspace_service.run_automation(db, "simulation", simulation_account_id=account.id)
+    db.commit()
+
+    repaired_profile = db.scalar(select(TradingAutomationProfile).where(TradingAutomationProfile.mode == "simulation"))
+    assert result["status"] == "success"
+    assert result["submitted_orders"] == 1
+    assert repaired_profile is not None
+    assert "blended" in repaired_profile.allowed_strategy_slugs
+    assert "cover_short" in set(repaired_profile.tradable_actions)
+    assert "short" not in set(repaired_profile.tradable_actions)
+    assert repaired_profile.config_json["short_automation_opt_in"] is False
+
+
+def test_simulation_workspace_reports_closed_realized_pnl_and_short_exposure() -> None:
+    db = build_session()
+    asset = Asset(symbol="PNL", name="PnL Asset", asset_type="stock", sector="Technology", exchange="TEST", currency="USD")
+    db.add(asset)
+    db.flush()
+    account = SimulationAccount(
+        name="PnL Sim",
+        starting_cash=1000,
+        cash_balance=1290.57,
+        fees_bps=0,
+        slippage_bps=0,
+        latency_ms=0,
+        is_active=True,
+        short_enabled=True,
+    )
+    db.add(account)
+    db.flush()
+    db.add_all(
+        [
+            Position(
+                asset_id=asset.id,
+                mode="simulation",
+                simulation_account_id=account.id,
+                quantity=-1.393722,
+                avg_entry_price=214.2072,
+                current_price=213.81,
+                unrealized_pnl=0.5536,
+                realized_pnl=0,
+                status="open",
+            ),
+            Position(
+                asset_id=asset.id,
+                mode="simulation",
+                simulation_account_id=account.id,
+                quantity=0,
+                avg_entry_price=100,
+                current_price=96,
+                unrealized_pnl=-4,
+                realized_pnl=-7.42,
+                status="closed",
+                closed_at=utcnow(),
+            ),
+        ]
+    )
+    db.commit()
+
+    workspace = trading_workspace_service.get_workspace(db, "simulation", simulation_account_id=account.id)
+    closed_view = next(position for position in workspace["positions"] if position["status"] == "closed")
+
+    assert workspace["account"]["realized_pnl"] == -7.42
+    assert workspace["account"]["unrealized_pnl"] == 0.55
+    assert workspace["account"]["metadata"]["short_liability"] == 297.99
+    assert workspace["account"]["metadata"]["net_position_value"] == -297.99
+    assert closed_view["unrealized_pnl"] == 0
 
 
 def test_automation_skips_buy_when_cash_reserve_leaves_no_trade_budget() -> None:

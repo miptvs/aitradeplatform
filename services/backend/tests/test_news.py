@@ -228,6 +228,50 @@ def test_refresh_latest_news_partial_feed_failure_is_warn_not_error(monkeypatch)
     assert latest_event.status == "warn"
 
 
+def test_refresh_latest_news_uses_backup_feeds_when_primary_feeds_fail(monkeypatch) -> None:
+    db = build_session()
+    db.add(Asset(symbol="AAPL", name="Apple Inc.", asset_type="stock", sector="Technology", exchange="NASDAQ", currency="USD"))
+    db.commit()
+
+    feed_xml = f"""
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Apple gains after services revenue beat</title>
+          <link>https://backup.example/aapl-services</link>
+          <guid>aapl-services</guid>
+          <description>Backup feed still provides a fresh market article when primary RSS is unavailable.</description>
+          <source>Backup Markets</source>
+          <pubDate>{format_datetime(utcnow())}</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """.strip()
+
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://primary.example/one", "https://primary.example/two"])
+    monkeypatch.setattr(news_service, "_build_backup_feed_urls", lambda _primary, _assets: ["https://backup.example/rss"])
+
+    def fake_fetch(url: str) -> str:
+        if "primary.example" in url:
+            raise RuntimeError("primary RSS upstream blocked")
+        return feed_xml
+
+    monkeypatch.setattr(news_service, "_fetch_feed", fake_fetch)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+
+    latest_event = db.query(SystemHealthEvent).filter(SystemHealthEvent.component == "news.rss_refresh").order_by(SystemHealthEvent.observed_at.desc()).first()
+    assert result["articles_added"] == 1
+    assert result["feeds_checked"] == 3
+    assert result["feeds_failed"] == 2
+    assert result["fallback_feeds_used"] is True
+    assert result["feed_reports"][-1]["feed_group"] == "backup"
+    assert db.query(NewsArticle).filter(NewsArticle.source == "Backup Markets").one()
+    assert latest_event is not None
+    assert latest_event.status == "warn"
+
+
 def test_refresh_latest_news_skips_duplicate_url_outside_recent_window(monkeypatch) -> None:
     db = build_session()
     db.add(Asset(symbol="DUP", name="Duplicate Asset", asset_type="stock", sector="Technology", exchange="NASDAQ", currency="USD"))

@@ -99,11 +99,12 @@ export default function NewsPage() {
 
       <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
         <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Latest refresh diagnostics</div>
-        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           <InfoRow label="Last status" value={humanRefreshMessage(diagnostics)} />
           <InfoRow label="Read articles since" value={formatDateTime(diagnostics.cutoff)} />
           <InfoRow label="Last successful fetch" value={formatOptionalDateTime(diagnostics.last_successful_fetch_time)} />
           <InfoRow label="Newest article found" value={formatOptionalDateTime(diagnostics.latest_seen_published_at)} />
+          <InfoRow label="Backup feeds" value={diagnostics.fallback_feeds_used ? "Used for latest run" : "Not needed"} />
         </div>
         {!diagnostics.feed_reports.length ? (
           <div className="mt-4 rounded-2xl border border-dashed border-border bg-black/20 px-4 py-3 text-sm text-slate-400">
@@ -119,7 +120,12 @@ export default function NewsPage() {
             <div key={report.feed_url} className="rounded-2xl border border-border bg-black/20 p-4">
               <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
                 <div>
-                  <div className="font-semibold text-slate-100">{report.feed_label}</div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="font-semibold text-slate-100">{report.feed_label}</div>
+                    {report.feed_group === "backup" ? (
+                      <div className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-amber-100">Backup</div>
+                    ) : null}
+                  </div>
                   <div className="text-xs text-slate-500">{report.feed_url}</div>
                 </div>
                 <div className="rounded-full border border-border px-3 py-1 text-xs uppercase tracking-[0.16em] text-slate-300">{report.status}</div>
@@ -191,6 +197,7 @@ function humanRefreshMessage(diagnostics: {
   duplicates_skipped: number;
   date_skipped: number;
   force_refresh: boolean;
+  fallback_feeds_used?: boolean;
 }) {
   const mode = diagnostics.force_refresh ? "Backfill" : "Refresh";
   const parts = [
@@ -205,6 +212,9 @@ function humanRefreshMessage(diagnostics: {
   }
   if (diagnostics.feeds_failed) {
     parts.push(`${diagnostics.feeds_failed} feed${diagnostics.feeds_failed === 1 ? "" : "s"} failed`);
+  }
+  if (diagnostics.fallback_feeds_used) {
+    parts.push("backup feeds were used");
   }
   return `${parts.join(", ")}.`;
 }

@@ -202,10 +202,52 @@
 - Added a simulated margin-call forced-close helper for short positions that breach configured margin requirements.
 - Added provider usage parsing and model-cost estimation from configured per-token rates, plus model-cost aggregation in simulation/replay comparison metrics.
 - Hardened RSS refresh after a live duplicate-URL failure: refresh now checks existing articles across the full database before insert, retries transient feed fetch failures with RSS-friendly headers, resolves stale RSS error alerts after a clean run, and lets the workspace clear system warning notices.
-- Added tests for market-hours blocking/allowance, margin-call forced close, normalized stop provenance, and model-cost accounting.
+- Added fractional sizing support across manual orders, automation, risk validation, signals, simulation fills, and Trading212 guarded live order payloads.
+- Added tests for market-hours blocking/allowance, margin-call forced close, normalized stop provenance, model-cost accounting, fractional sizing, percentage sizing, fractional PnL, rounding, and live fractional payload consistency.
 
 ### Known Limitations
 
 - Trading212 execution and live shorting remain intentionally unavailable because the current adapter does not verify broker execution support.
 - Market-hours logic is deterministic and lightweight; it is not a complete holiday/half-day exchange calendar.
 - Margin-call forced close is simulation-only and simplified; real brokers may apply product-specific margin tiers and liquidation ordering.
+- Trading212 fractional execution payloads are resolved and audited, but the adapter still rejects live execution because broker order placement remains intentionally disabled in this scaffold.
+
+## 2026-05-07 Settings And RSS Follow-Up
+
+### Changes Made
+
+- Moved live-only settings into a dedicated Settings > Live Trading tab, including the live backend switch, live provider profile, Trading212 credentials/sync settings, the one-model live selector, and live automation policy summary.
+- Kept the default Settings workspace tab focused on the simulation provider profile and shared non-live operational notes.
+- Added backup RSS feeds and diagnostics so a full primary-feed outage no longer leaves news ingestion stuck in an error state if CNBC, Investing.com, MarketWatch, or dynamic Yahoo Finance fallback feeds are reachable.
+- Hardened RSS fetching with a browser-compatible user agent, no-cache header, retry handling for transient HTTP/network/protocol failures, backup-feed diagnostics, and parse-error counting.
+- Added backend RSS fallback coverage and a frontend smoke-test case for the settings-tab isolation.
+- Cleaned up the Analytics page by scoping headline metrics/equity curve to selected simulation or live snapshots, keeping live-vs-simulation returns in the comparison panel, and replacing the zero-baseline filled chart with a readable line chart.
+- Hardened Analytics calculations so multi-model simulation snapshots are aggregated by model account instead of interleaved chronologically, and legacy un-attributed simulation snapshots are ignored.
+- Simulation reset now clears stop-provenance rows before deleting orders/positions, clears legacy/un-attributed simulation analytics snapshots as well as the selected model account's snapshots, and surfaces reset failures in the UI instead of failing silently.
+- Analytics now defaults to the current workspace simulation account, exposes an account selector, and passes that account scope through overview/equity APIs so resetting an account also resets the headline Analytics numbers for that same account.
+- Fixed the expanded-sidebar Analytics overflow by allowing the app shell and Analytics grids to shrink inside the viewport instead of forcing horizontal page scrolling.
+- Fixed the PnL breakdown charts so empty/zero data shows an explicit empty state, positive/negative bars use readable colors, and symbol attribution displays ticker symbols instead of raw asset ids.
+- Repaired legacy Simulation automation filters so existing profiles include blended signals and the expanded simulation action set, including short/cover when the simulation account allows shorts.
+- Scoped position-exit signal generation to the provider's own simulation account and normalized non-held bearish exits into executable simulated shorts when short simulation is enabled.
+
+### Known Limitations
+
+- RSS remains a best-effort public-feed source. A commercial market/news data provider would still be required for production-grade freshness, entitlement, and coverage guarantees.
+
+## 2026-05-13 Dashboard And Simulation Follow-Up
+
+### Changes Made
+
+- Fixed Dashboard data loading by using trailing-slash collection API calls for positions, orders, and trades, avoiding FastAPI redirects in browser fetches.
+- Scoped Dashboard portfolio snapshots, positions, orders, and trades to the selected mode instead of always fetching mixed-mode collections.
+- Corrected simulation account summary PnL: realized PnL now includes closed positions for the selected account, while unrealized PnL only reflects open positions.
+- Normalized closed position views so closed rows no longer display stale unrealized PnL.
+- Replaced the confusing negative simulation `Equity` card with `Position Exposure`, including net position value and short liability detail when a simulated short is open.
+- Added gross/net exposure metadata to simulation account summaries and fixed gross exposure math to use absolute exposure for shorts.
+- Changed default simulation automation safety so scheduled automation can cover existing shorts but does not open new shorts unless short automation is explicitly enabled.
+- Added Celery schedule expiry, task time limits, and prefetch control; purged a stale queue backlog that had prevented scheduled simulation automation from running.
+
+### Known Limitations
+
+- Current automation is running, but it reported `No eligible candidate signals matched the current automation policy`; no new positions will open until candidate signals match the active provider/model, strategy, action, confidence, and risk filters.
+- The existing account still contains historical closed losing positions from earlier automation runs. Their PnL is now reported correctly rather than hidden in the account cards.

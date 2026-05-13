@@ -51,3 +51,6 @@ class RiskValidationResponse(BaseModel):
     approved: bool
     checks: list[RiskCheck]
     rejection_reasons: list[str]
+    order_value: float = 0
+    max_allowed_order_value: float | None = None
+    max_allowed_quantity: float | None = None

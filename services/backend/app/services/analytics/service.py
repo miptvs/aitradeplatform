@@ -1,8 +1,9 @@
 from math import sqrt
 
-from sqlalchemy import select
+from sqlalchemy import false, select
 from sqlalchemy.orm import Session
 
+from app.models.asset import Asset
 from app.models.portfolio import PortfolioSnapshot, Position, Trade
 from app.models.provider import ModelRun
 from app.models.replay import ReplayModelResult
@@ -12,10 +13,21 @@ from app.models.simulation import SimulationAccount, SimulationOrder, Simulation
 
 
 class AnalyticsService:
-    def overview(self, db: Session) -> dict:
-        trades = list(db.scalars(select(Trade)))
-        snapshots = list(db.scalars(select(PortfolioSnapshot).order_by(PortfolioSnapshot.timestamp.asc())))
-        if not snapshots:
+    def overview(self, db: Session, *, mode: str | None = "simulation", simulation_account_id: str | None = None) -> dict:
+        trade_stmt = select(Trade)
+        if mode:
+            trade_stmt = trade_stmt.where(Trade.mode == mode)
+        if mode == "simulation" and simulation_account_id:
+            account = db.get(SimulationAccount, simulation_account_id)
+            if account and account.provider_type:
+                trade_stmt = trade_stmt.where(Trade.provider_type == account.provider_type)
+            else:
+                trade_stmt = trade_stmt.where(false())
+        trades = list(db.scalars(trade_stmt))
+        snapshots = self._snapshot_rows(db, mode=mode, simulation_account_id=simulation_account_id)
+        equity_curve = self._equity_series_from_snapshots(snapshots, mode=mode, simulation_account_id=simulation_account_id)
+        equity_values = [point["value"] for point in equity_curve]
+        if not equity_values:
             return {
                 "total_return": 0,
                 "realized_return": 0,
@@ -34,7 +46,7 @@ class AnalyticsService:
                 "performance_by_provider": [],
                 "confidence_correlation": 0,
             }
-        total_return = (snapshots[-1].total_value - snapshots[0].total_value) / snapshots[0].total_value if snapshots[0].total_value else 0
+        total_return = (equity_values[-1] - equity_values[0]) / equity_values[0] if equity_values[0] else 0
         realized = sum(trade.realized_pnl for trade in trades)
         wins = [trade.realized_pnl for trade in trades if trade.realized_pnl > 0]
         losses = [abs(trade.realized_pnl) for trade in trades if trade.realized_pnl < 0]
@@ -44,16 +56,16 @@ class AnalyticsService:
         payoff_ratio = average_win / average_loss if average_loss else 0
         profit_factor = sum(wins) / sum(losses) if losses else float(sum(wins)) if wins else 0
 
-        peak = snapshots[0].total_value
+        peak = equity_values[0]
         max_drawdown = 0.0
         returns = []
         downside_returns = []
-        for previous, current in zip(snapshots[:-1], snapshots[1:]):
-            peak = max(peak, current.total_value)
+        for previous, current in zip(equity_values[:-1], equity_values[1:]):
+            peak = max(peak, current)
             if peak:
-                max_drawdown = min(max_drawdown, (current.total_value - peak) / peak)
-            if previous.total_value:
-                ret = (current.total_value - previous.total_value) / previous.total_value
+                max_drawdown = min(max_drawdown, (current - peak) / peak)
+            if previous:
+                ret = (current - previous) / previous
                 returns.append(ret)
                 if ret < 0:
                     downside_returns.append(ret)
@@ -66,7 +78,7 @@ class AnalyticsService:
         return {
             "total_return": round(total_return, 4),
             "realized_return": round(realized, 2),
-            "unrealized_return": round(snapshots[-1].unrealized_pnl, 2),
+            "unrealized_return": round(self._latest_unrealized(snapshots, mode=mode, simulation_account_id=simulation_account_id), 2),
             "annualized_return": round(total_return * 12, 4),
             "win_rate": round(win_rate, 4),
             "average_win": round(average_win, 2),
@@ -76,28 +88,21 @@ class AnalyticsService:
             "max_drawdown": round(max_drawdown, 4),
             "sharpe": round(sharpe, 2),
             "sortino": round(sortino, 2),
-            "performance_by_symbol": self._aggregate(trades, key="asset_id"),
-            "performance_by_strategy": self._aggregate(trades, key="strategy_name"),
-            "performance_by_provider": self._aggregate(trades, key="provider_type"),
+            "performance_by_symbol": self._aggregate(db, trades, key="asset_id"),
+            "performance_by_strategy": self._aggregate(db, trades, key="strategy_name"),
+            "performance_by_provider": self._aggregate(db, trades, key="provider_type"),
             "confidence_correlation": 0.54,
         }
 
     def equity_curve(self, db: Session, *, mode: str | None = None, simulation_account_id: str | None = None) -> list[dict]:
-        stmt = select(PortfolioSnapshot).order_by(PortfolioSnapshot.timestamp.asc())
-        if mode:
-            stmt = stmt.where(PortfolioSnapshot.mode == mode)
-        if simulation_account_id:
-            stmt = stmt.where(PortfolioSnapshot.simulation_account_id == simulation_account_id)
-        snapshots = list(db.scalars(stmt))
-        return [{"timestamp": snapshot.timestamp.isoformat(), "value": snapshot.total_value} for snapshot in snapshots]
+        snapshots = self._snapshot_rows(db, mode=mode, simulation_account_id=simulation_account_id)
+        return self._equity_series_from_snapshots(snapshots, mode=mode, simulation_account_id=simulation_account_id)
 
     def simulation_vs_live(self, db: Session) -> dict:
-        live = list(db.scalars(select(PortfolioSnapshot).where(PortfolioSnapshot.mode == "live").order_by(PortfolioSnapshot.timestamp.asc())))
-        sim = list(
-            db.scalars(select(PortfolioSnapshot).where(PortfolioSnapshot.mode == "simulation").order_by(PortfolioSnapshot.timestamp.asc()))
-        )
-        live_return = ((live[-1].total_value - live[0].total_value) / live[0].total_value) if len(live) > 1 and live[0].total_value else 0
-        sim_return = ((sim[-1].total_value - sim[0].total_value) / sim[0].total_value) if len(sim) > 1 and sim[0].total_value else 0
+        live = [point["value"] for point in self.equity_curve(db, mode="live")]
+        sim = [point["value"] for point in self.equity_curve(db, mode="simulation")]
+        live_return = ((live[-1] - live[0]) / live[0]) if len(live) > 1 and live[0] else 0
+        sim_return = ((sim[-1] - sim[0]) / sim[0]) if len(sim) > 1 and sim[0] else 0
         return {
             "live_return": round(live_return, 4),
             "simulation_return": round(sim_return, 4),
@@ -162,12 +167,78 @@ class AnalyticsService:
             lines.append(",".join(values))
         return "\n".join(lines) + "\n"
 
-    def _aggregate(self, trades: list[Trade], *, key: str) -> list[dict]:
+    def _aggregate(self, db: Session, trades: list[Trade], *, key: str) -> list[dict]:
         bucket: dict[str, float] = {}
+        asset_labels: dict[str, str] = {}
+        if key == "asset_id":
+            asset_ids = {trade.asset_id for trade in trades if trade.asset_id}
+            if asset_ids:
+                asset_labels = {asset.id: asset.symbol for asset in db.scalars(select(Asset).where(Asset.id.in_(asset_ids)))}
         for trade in trades:
-            bucket_key = getattr(trade, key) or "unknown"
+            raw_key = getattr(trade, key) or "unknown"
+            bucket_key = asset_labels.get(raw_key, raw_key) if key == "asset_id" else raw_key
             bucket[bucket_key] = bucket.get(bucket_key, 0) + trade.realized_pnl
         return [{"name": name, "value": round(value, 2)} for name, value in bucket.items()]
+
+    def _snapshot_rows(
+        self,
+        db: Session,
+        *,
+        mode: str | None = None,
+        simulation_account_id: str | None = None,
+    ) -> list[PortfolioSnapshot]:
+        stmt = select(PortfolioSnapshot).order_by(PortfolioSnapshot.timestamp.asc())
+        if mode:
+            stmt = stmt.where(PortfolioSnapshot.mode == mode)
+        if simulation_account_id:
+            stmt = stmt.where(PortfolioSnapshot.simulation_account_id == simulation_account_id)
+        elif mode == "simulation":
+            stmt = stmt.where(PortfolioSnapshot.simulation_account_id.is_not(None))
+        return list(db.scalars(stmt))
+
+    def _equity_series_from_snapshots(
+        self,
+        snapshots: list[PortfolioSnapshot],
+        *,
+        mode: str | None = None,
+        simulation_account_id: str | None = None,
+    ) -> list[dict]:
+        if mode != "simulation" or simulation_account_id:
+            return [{"timestamp": snapshot.timestamp.isoformat(), "value": round(snapshot.total_value, 2)} for snapshot in snapshots]
+
+        first_value_by_account: dict[str, float] = {}
+        for snapshot in snapshots:
+            if snapshot.simulation_account_id and snapshot.simulation_account_id not in first_value_by_account:
+                first_value_by_account[snapshot.simulation_account_id] = snapshot.total_value
+
+        latest_by_account = dict(first_value_by_account)
+        points: list[dict] = []
+        for snapshot in snapshots:
+            if not snapshot.simulation_account_id:
+                continue
+            latest_by_account[snapshot.simulation_account_id] = snapshot.total_value
+            value = round(sum(latest_by_account.values()), 2)
+            if points and points[-1]["value"] == value:
+                continue
+            points.append({"timestamp": snapshot.timestamp.isoformat(), "value": value})
+        return points
+
+    def _latest_unrealized(
+        self,
+        snapshots: list[PortfolioSnapshot],
+        *,
+        mode: str | None = None,
+        simulation_account_id: str | None = None,
+    ) -> float:
+        if not snapshots:
+            return 0
+        if mode != "simulation" or simulation_account_id:
+            return snapshots[-1].unrealized_pnl
+        latest_by_account: dict[str, PortfolioSnapshot] = {}
+        for snapshot in snapshots:
+            if snapshot.simulation_account_id:
+                latest_by_account[snapshot.simulation_account_id] = snapshot
+        return sum(snapshot.unrealized_pnl for snapshot in latest_by_account.values())
 
     def _simulation_model_metric(self, db: Session, account: SimulationAccount) -> dict:
         positions = list(
