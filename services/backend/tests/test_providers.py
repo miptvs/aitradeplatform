@@ -130,3 +130,15 @@ def test_openai_adapter_uses_max_completion_tokens_for_openai_signal_generation(
     assert "temperature" not in payload
     assert payload["reasoning_effort"] == "minimal"
     assert payload["response_format"] == {"type": "json_object"}
+
+
+def test_provider_usage_metrics_estimate_model_cost_from_configured_rates() -> None:
+    metrics = provider_service._usage_metrics(
+        {"prompt_tokens": 1000, "completion_tokens": 500},
+        {"input_cost_per_million": 2.0, "output_cost_per_million": 10.0},
+    )
+
+    assert metrics["prompt_tokens"] == 1000
+    assert metrics["completion_tokens"] == 500
+    assert metrics["total_tokens"] == 1500
+    assert metrics["estimated_cost"] == 0.007

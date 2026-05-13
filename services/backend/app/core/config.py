@@ -34,6 +34,13 @@ class Settings(BaseSettings):
             "https://news.google.com/rss/search?q=Federal+Reserve+OR+inflation+markets+when:1d&hl=en-US&gl=US&ceid=US:en",
         ]
     )
+    news_backup_rss_feeds: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+            "https://www.investing.com/rss/news_25.rss",
+            "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+        ]
+    )
 
     provider_local_base_url: str = "http://ollama:11434"
     provider_openai_base_url: str = "https://api.openai.com/v1"
@@ -68,7 +75,7 @@ class Settings(BaseSettings):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
-    @field_validator("news_rss_feeds", mode="before")
+    @field_validator("news_rss_feeds", "news_backup_rss_feeds", mode="before")
     @classmethod
     def split_news_rss_feeds(cls, value: list[str] | str) -> list[str]:
         if isinstance(value, str):

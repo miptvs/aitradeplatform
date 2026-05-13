@@ -6,6 +6,7 @@ from app.models.asset import Asset, MarketSnapshot
 from app.models.broker import BrokerAccount, BrokerSyncEvent
 from app.models.portfolio import PortfolioSnapshot, Position
 from app.schemas.broker import BrokerAccountCreate
+from app.services.audit.service import audit_service
 from app.services.brokers.base import BrokerResult
 from app.services.brokers.paper import PaperBrokerAdapter
 from app.services.brokers.trading212 import Trading212BrokerAdapter
@@ -55,10 +56,19 @@ class BrokerService:
             .limit(1)
         )
 
+    def latest_successful_sync_event(self, db: Session, account_id: str) -> BrokerSyncEvent | None:
+        return db.scalar(
+            select(BrokerSyncEvent)
+            .where(BrokerSyncEvent.broker_account_id == account_id, BrokerSyncEvent.status.in_(["ok", "warn"]))
+            .order_by(desc(BrokerSyncEvent.completed_at), desc(BrokerSyncEvent.started_at), desc(BrokerSyncEvent.created_at))
+            .limit(1)
+        )
+
     def serialize_runtime_account(self, db: Session, account: BrokerAccount) -> dict:
         payload = self.serialize_account(account)
         adapter = self.adapters[account.broker_type]
         latest_sync = self.latest_sync_event(db, account.id)
+        latest_successful_sync = self.latest_successful_sync_event(db, account.id)
         payload.update(
             {
                 "supports_execution": adapter.capability.supports_execution,
@@ -68,6 +78,7 @@ class BrokerService:
                 "last_sync_started_at": latest_sync.started_at.isoformat() if latest_sync and latest_sync.started_at else None,
                 "last_sync_completed_at": latest_sync.completed_at.isoformat() if latest_sync and latest_sync.completed_at else None,
                 "last_sync_message": (latest_sync.details_json or {}).get("message") if latest_sync else None,
+                "last_successful_sync_completed_at": latest_successful_sync.completed_at.isoformat() if latest_successful_sync and latest_successful_sync.completed_at else None,
                 "cash_balance": account.settings_json.get("cash_balance"),
                 "available_cash": account.settings_json.get("available_cash"),
                 "invested_value": account.settings_json.get("invested_value"),
@@ -236,6 +247,16 @@ class BrokerService:
         elif status == "error":
             account.status = "scaffolded"
         db.flush()
+        audit_service.log(
+            db,
+            actor="system",
+            action="broker.sync",
+            target_type="broker_account",
+            target_id=account.id,
+            status=status,
+            mode=account.mode,
+            details=sync_event.details_json,
+        )
 
         return {
             "broker_account_id": account.id,

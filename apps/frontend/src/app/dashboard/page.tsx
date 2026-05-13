@@ -13,7 +13,7 @@ import { RiskBanner } from "@/components/ui/risk-banner";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useApi } from "@/hooks/use-api";
 import { api } from "@/lib/api";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatDateTime } from "@/lib/utils";
 import { useWorkspace } from "@/components/layout/workspace-provider";
 
 export default function DashboardPage() {
@@ -22,12 +22,13 @@ export default function DashboardPage() {
   const [latestTradesOpen, setLatestTradesOpen] = useState(true);
   const [latestSignalsOpen, setLatestSignalsOpen] = useState(true);
   const { data, loading, error, reload } = useApi(async () => {
+    const selectedMode = mode === "combined" ? undefined : mode;
     const [summary, snapshots, positions, orders, trades, signals, alerts, health] = await Promise.all([
-      api.getPortfolioSummary(mode === "combined" ? undefined : mode),
-      api.getPortfolioSnapshots(),
-      api.getPositions(),
-      api.getOrders(),
-      api.getTrades(),
+      api.getPortfolioSummary(selectedMode),
+      api.getPortfolioSnapshots(selectedMode),
+      api.getPositions({ mode: selectedMode }),
+      api.getOrders({ mode: selectedMode }),
+      api.getTrades({ mode: selectedMode }),
       api.getSignals(workspace.signalProviderType),
       api.getAlerts(),
       api.getHealth()
@@ -134,16 +135,37 @@ export default function DashboardPage() {
                 </div>
               </div>
               <div className="rounded-xl border border-border bg-black/20 p-3">
-                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Broker Connections</div>
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Operational warnings</div>
                 <div className="mt-2 space-y-2">
-                  {Object.entries(data.summary.broker_connection_status).map(([name, status]) => (
-                    <div key={name} className="flex items-center justify-between">
-                      <span className="text-sm text-slate-200">{name}</span>
-                      <StatusBadge status={status} />
+                  {data.health.warnings?.length ? (
+                    data.health.warnings.slice(0, 5).map((warning) => (
+                      <div key={warning} className="text-sm text-amber-200">{warning}</div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-emerald-200">No current blocking warnings.</div>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-xl border border-border bg-black/20 p-3">
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Freshness</div>
+                <div className="mt-2 space-y-1 text-sm text-slate-300">
+                  <div>News: {formatDateTime(data.health.freshness?.news_latest_published_at, { fallback: "Not recorded" })}</div>
+                  <div>Market: {formatDateTime(data.health.freshness?.market_latest_snapshot_at, { fallback: "Not recorded" })}</div>
+                  <div>Signals: {formatDateTime(data.health.freshness?.last_signal_generation_at, { fallback: "Not recorded" })}</div>
+                  <div>Scheduler: {data.health.freshness?.scheduler_status || "unknown"}</div>
+                </div>
+              </div>
+              <div className="rounded-xl border border-border bg-black/20 p-3">
+                <div className="text-xs uppercase tracking-[0.18em] text-slate-400">Broker Sync</div>
+                <div className="mt-2 space-y-2">
+                  {data.health.broker_sync?.map((account) => (
+                    <div key={String(account.account_id)} className="flex items-center justify-between gap-3">
+                      <span className="text-sm text-slate-200">{String(account.name)}</span>
+                      <StatusBadge status={String(account.last_sync_status || account.status || "disconnected")} />
                     </div>
                   ))}
-                  {!Object.keys(data.summary.broker_connection_status).length ? (
-                    <div className="text-sm text-slate-500">No broker statuses for this mode.</div>
+                  {!data.health.broker_sync?.length ? (
+                    <div className="text-sm text-slate-500">Trading212 not connected.</div>
                   ) : null}
                 </div>
               </div>

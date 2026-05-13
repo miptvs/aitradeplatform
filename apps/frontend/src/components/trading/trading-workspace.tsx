@@ -24,6 +24,7 @@ import type {
   AssetSearchResult,
   Order,
   Position,
+  ReplayRun,
   Signal,
   SignalTrace,
   Trade,
@@ -33,7 +34,7 @@ import type {
 } from "@/types";
 
 type TradingMode = "live" | "simulation";
-type SizingMode = "amount" | "quantity";
+type SizingMode = "percentage" | "amount" | "quantity";
 
 const RISK_PRESETS = {
   conservative: { stopLossPct: 0.02, takeProfitPct: 0.04, trailingStopPct: 0.015 },
@@ -61,11 +62,16 @@ export function TradingWorkspace({
 }) {
   const workspace = useWorkspace();
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [replayOpen, setReplayOpen] = useState(mode === "simulation");
   const [manualTradingOpen, setManualTradingOpen] = useState(false);
   const [selectedSimulationAccountId, setSelectedSimulationAccountId] = useState("");
   const workspaceState = useApi<TradingWorkspaceData>(
     () => (mode === "live" ? api.getLiveWorkspace() : api.getSimulationWorkspace(selectedSimulationAccountId || undefined)),
     [mode, selectedSimulationAccountId]
+  );
+  const replayRunsState = useApi<ReplayRun[]>(
+    () => (mode === "simulation" ? api.getReplayRuns() : Promise.resolve([])),
+    [mode]
   );
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -94,6 +100,7 @@ export function TradingWorkspace({
     side: "buy",
     order_type: "market",
     sizing_mode: "amount" as SizingMode,
+    sizing_value: "100",
     amount: "100",
     quantity: "",
     requested_price: "",
@@ -127,12 +134,26 @@ export function TradingWorkspace({
   const [stopForm, setStopForm] = useState({ stop_loss: "", take_profit: "", trailing_stop: "", notes: "" });
   const [closePercent, setClosePercent] = useState("");
   const [automationForm, setAutomationForm] = useState<TradingAutomationProfile | null>(null);
+  const [replayForm, setReplayForm] = useState({
+    date_start: "",
+    date_end: "",
+    starting_cash: "10000",
+    selected_models: [] as string[],
+    symbols: [] as string[],
+    fees_bps: "5",
+    slippage_bps: "2",
+    cash_reserve_percent: "20",
+    short_enabled: false,
+    enforce_market_hours: false,
+  });
   const [recommendationBusyId, setRecommendationBusyId] = useState<string | null>(null);
   const [brokerSyncingId, setBrokerSyncingId] = useState<string | null>(null);
   const [clearRiskBusy, setClearRiskBusy] = useState(false);
   const provenance = useProvenanceTrace();
 
   const workspaceData = workspaceState.data;
+  const simulationAccounts = ((workspaceData?.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || []);
+  const brokerAccounts = ((workspaceData?.controls.broker_accounts as Array<Record<string, unknown>> | undefined) || []);
   const localAssetDefaults = useMemo(() => (workspaceData?.assets || []).slice(0, 8).map(toLocalSearchResult), [workspaceData?.assets]);
   const providerOptions = useMemo(
     () => {
@@ -163,6 +184,15 @@ export function TradingWorkspace({
     if (preferredAccountId && !selectedSimulationAccountId) {
       setSelectedSimulationAccountId(preferredAccountId);
     }
+    const modelDefaults = simulationAccounts.map((account) => String(account.provider_type || "")).filter(Boolean).slice(0, 4);
+    const symbolDefaults = (workspaceData.assets || []).map((asset) => asset.symbol).slice(0, 5);
+    setReplayForm((current) => ({
+      ...current,
+      selected_models: current.selected_models.length ? current.selected_models : modelDefaults,
+      symbols: current.symbols.length ? current.symbols : symbolDefaults,
+      date_start: current.date_start || defaultReplayStart(),
+      date_end: current.date_end || defaultReplayEnd(),
+    }));
   }, [mode, selectedSimulationAccountId, workspace.simulationProviderType, workspaceData]);
 
   useEffect(() => {
@@ -257,16 +287,29 @@ export function TradingWorkspace({
   }
 
   const activeSignals = workspaceData.signals.slice(0, 8);
-  const currentCurrency = orderForm.currency || selectedAsset?.currency || workspaceData.account.base_currency || "USD";
+  const accountCurrency = workspaceData.account.base_currency || "USD";
+  const currentCurrency = orderForm.currency || selectedAsset?.currency || accountCurrency;
   const requestedPrice = Number(orderForm.requested_price || selectedAsset?.latest_price || 0);
-  const derivedQuantity = orderForm.sizing_mode === "amount" ? deriveQuantity(orderForm.amount, requestedPrice) : Number(orderForm.quantity || 0);
+  const portfolioValue = Number(workspaceData.account.total_value || workspaceData.account.cash_available || 0);
+  const totalCash = Number(workspaceData.account.total_cash ?? workspaceData.account.cash_available ?? 0);
+  const sizingValue = orderForm.sizing_mode === "percentage" ? orderForm.sizing_value : orderForm.sizing_mode === "amount" ? orderForm.amount : orderForm.quantity;
+  const derivedQuantity = deriveOrderQuantity(orderForm.sizing_mode, sizingValue, requestedPrice, portfolioValue);
   const orderNotional = requestedPrice > 0 ? derivedQuantity * requestedPrice : 0;
-  const simulationAccounts = (workspaceData.controls.simulation_accounts as Array<Record<string, unknown>> | undefined) || [];
-  const brokerAccounts = (workspaceData.controls.broker_accounts as Array<Record<string, unknown>> | undefined) || [];
+  const orderPortfolioPct = portfolioValue > 0 ? orderNotional / portfolioValue : 0;
+  const buyLikePreview = ["buy", "short"].includes(orderForm.side);
+  const remainingCashPreview = buyLikePreview ? totalCash - orderNotional : totalCash + (["sell", "close_long", "reduce_long", "short"].includes(orderForm.side) ? orderNotional : -orderNotional);
+  const exceedsAvailableToTrade = buyLikePreview && orderNotional > Number(workspaceData.account.available_to_trade_cash || 0);
   const openPositions = workspaceData.positions.filter((position) => position.status === "open");
   const closedPositions = workspaceData.positions.filter((position) => position.status === "closed");
   const closePreviewPct = closePercent ? Number(closePercent) : 100;
   const closePreviewQty = closeDialogPosition ? (Math.abs(closeDialogPosition.quantity) * closePreviewPct) / 100 : 0;
+  const netPositionValue = Number(workspaceData.account.metadata.net_position_value ?? workspaceData.account.equity ?? 0);
+  const shortLiability = metadataNumber(workspaceData.account.metadata.short_liability);
+  const grossExposure = metadataNumber(workspaceData.account.metadata.gross_exposure) || Math.abs(netPositionValue);
+  const positionExposureDetail =
+    shortLiability > 0
+      ? `Short liability ${formatCurrency(shortLiability, accountCurrency)} · net ${formatCurrency(netPositionValue, accountCurrency)}`
+      : `Net position value ${formatCurrency(netPositionValue, accountCurrency)}`;
 
   function loadRecommendationIntoTicket(recommendation: TradingRecommendation) {
     if (!workspaceData || !automationForm) return;
@@ -274,10 +317,19 @@ export function TradingWorkspace({
     const suggestedEntry = recommendation.suggested_entry || asset?.latest_price || 0;
     const trailingStop =
       automationForm.trailing_stop_pct && suggestedEntry > 0 ? String(round(suggestedEntry * automationForm.trailing_stop_pct)) : "";
+    const suggestedSizeType = recommendation.suggested_position_size_type === "percentage" || recommendation.suggested_position_size_type === "amount"
+      ? recommendation.suggested_position_size_type
+      : "amount";
+    const suggestedSizeValue = Number(recommendation.suggested_position_size_value || automationForm.default_order_notional);
+    const normalizedSuggestedPct = suggestedSizeType === "percentage" ? normalizePercentageInput(suggestedSizeValue) : 0;
+    const suggestedNotional =
+      suggestedSizeType === "percentage"
+        ? Number(workspaceData.account.total_value || 0) * normalizedSuggestedPct
+        : suggestedSizeValue;
     const cappedNotional = Math.max(
       0,
       Math.min(
-        automationForm.default_order_notional,
+        suggestedNotional || automationForm.default_order_notional,
         Number(workspaceData.account.available_to_trade_cash || automationForm.default_order_notional)
       )
     );
@@ -296,7 +348,8 @@ export function TradingWorkspace({
       exchange: asset?.exchange || "",
       side: recommendation.action,
       order_type: "market",
-      sizing_mode: "amount",
+      sizing_mode: suggestedSizeType === "percentage" && cappedNotional === suggestedNotional ? "percentage" : "amount",
+      sizing_value: suggestedSizeType === "percentage" && cappedNotional === suggestedNotional ? String(suggestedSizeValue) : String(cappedNotional),
       amount: String(cappedNotional),
       quantity: derivedQuantityFromNotional,
       requested_price: suggestedEntry ? String(suggestedEntry) : current.requested_price,
@@ -390,12 +443,12 @@ export function TradingWorkspace({
   async function handleClearRiskNotices() {
     try {
       setClearRiskBusy(true);
-      const result = await api.clearAlerts({ mode, category: "risk" });
+      const result = await api.clearAlerts({ mode, includeSystem: true, warningOnly: true });
       setBanner({
         tone: "success",
         message: result.resolved
-          ? `Cleaned up ${result.resolved} ${mode} risk notice${result.resolved === 1 ? "" : "s"}.`
-          : "No open risk notices needed cleanup.",
+          ? `Cleaned up ${result.resolved} ${mode} warning notice${result.resolved === 1 ? "" : "s"}.`
+          : "No open warning notices needed cleanup.",
       });
       workspaceState.reload();
     } catch (error) {
@@ -436,7 +489,7 @@ export function TradingWorkspace({
         <StatsCard label="Account Value" value={workspaceData.account.total_value} />
         <StatsCard label="Total Cash" value={workspaceData.account.total_cash ?? workspaceData.account.cash_available} />
         <StatsCard label="Available To Trade" value={workspaceData.account.available_to_trade_cash ?? workspaceData.account.cash_available} />
-        <StatsCard label="Equity" value={workspaceData.account.equity} />
+        <StatsCard label="Position Exposure" value={grossExposure} detail={positionExposureDetail} />
         <StatsCard label="Realized PnL" value={workspaceData.account.realized_pnl} />
         <StatsCard label="Unrealized PnL" value={workspaceData.account.unrealized_pnl} />
       </div>
@@ -453,9 +506,13 @@ export function TradingWorkspace({
           onResetSimulation={async () => {
             if (!selectedSimulationAccountId) return;
             if (!window.confirm("Reset this simulation account back to its configured starting balance?")) return;
-            await api.resetSimulationAccount(selectedSimulationAccountId);
-            setBanner({ tone: "success", message: "Simulation account reset. Cash, positions, orders, trades, and snapshots for this account were cleaned." });
-            workspaceState.reload();
+            try {
+              await api.resetSimulationAccount(selectedSimulationAccountId);
+              setBanner({ tone: "success", message: "Simulation account reset. Cash, positions, orders, trades, and snapshots for this account were cleaned." });
+              workspaceState.reload();
+            } catch (error) {
+              setBanner({ tone: "error", message: error instanceof Error ? error.message : "Simulation account reset failed." });
+            }
           }}
           onSaveSimulationSettings={async (payload) => {
             if (!selectedSimulationAccountId) return;
@@ -465,6 +522,39 @@ export function TradingWorkspace({
           }}
           onSyncLiveBroker={handleSyncLiveBroker}
         />
+
+        {mode === "simulation" ? (
+          <ReplayBacktestPanel
+            open={replayOpen}
+            onToggle={() => setReplayOpen((current) => !current)}
+            workspaceData={workspaceData}
+            simulationAccounts={simulationAccounts}
+            replayRuns={replayRunsState.data || []}
+            loading={replayRunsState.loading}
+            form={replayForm}
+            onChange={setReplayForm}
+            onCreate={async () => {
+              try {
+                const run = await api.createReplayRun({
+                  date_start: new Date(replayForm.date_start).toISOString(),
+                  date_end: new Date(replayForm.date_end).toISOString(),
+                  starting_cash: Number(replayForm.starting_cash || 0),
+                  selected_models: replayForm.selected_models,
+                  symbols: replayForm.symbols,
+                  fees_bps: Number(replayForm.fees_bps || 0),
+                  slippage_bps: Number(replayForm.slippage_bps || 0),
+                  cash_reserve_percent: Math.max(0, Number(replayForm.cash_reserve_percent || 0)) / 100,
+                  short_enabled: replayForm.short_enabled,
+                  config_json: { enforce_market_hours: replayForm.enforce_market_hours },
+                });
+                setBanner({ tone: "success", message: `${run.name} completed for ${run.results.length} model result${run.results.length === 1 ? "" : "s"}.` });
+                replayRunsState.reload();
+              } catch (error) {
+                setBanner({ tone: "error", message: error instanceof Error ? error.message : "Replay run failed." });
+              }
+            }}
+          />
+        ) : null}
 
         <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -517,6 +607,9 @@ export function TradingWorkspace({
                 currentCurrency={currentCurrency}
                 derivedQuantity={derivedQuantity}
                 orderNotional={orderNotional}
+                orderPortfolioPct={orderPortfolioPct}
+                remainingCashPreview={remainingCashPreview}
+                exceedsAvailableToTrade={exceedsAvailableToTrade}
                 embedded
                 onSearchQueryChange={setSearchQuery}
                 onChooseAsset={(asset) => {
@@ -770,9 +863,12 @@ export function TradingWorkspace({
         <div className="grid gap-4 md:grid-cols-2">
           <ReviewStat label="Symbol" value={orderForm.asset_symbol || "-"} />
           <ReviewStat label="Side / Type" value={`${orderForm.side.toUpperCase()} · ${orderForm.order_type}`} />
+          <ReviewStat label="Sizing" value={formatSizingMode(orderForm.sizing_mode, sizingValue)} />
           <ReviewStat label="Quantity" value={formatQuantity(derivedQuantity, 6)} />
           <ReviewStat label="Estimated Notional" value={formatCurrency(orderNotional, currentCurrency)} />
+          <ReviewStat label="% Of Portfolio" value={formatPct(orderPortfolioPct)} />
           <ReviewStat label="Entry" value={formatCurrency(requestedPrice || 0, currentCurrency)} />
+          <ReviewStat label="Cash After Preview" value={formatCurrency(remainingCashPreview, currentCurrency)} />
           <ReviewStat label="Stop / Target" value={`${orderForm.stop_loss || "-"} / ${orderForm.take_profit || "-"}`} />
         </div>
         <div className="mt-5 flex flex-wrap gap-3">
@@ -780,24 +876,15 @@ export function TradingWorkspace({
             type="button"
             onClick={async () => {
               try {
-                const buyLike = ["buy", "short"].includes(orderForm.side);
-                const availableToTrade = Number(workspaceData.account.available_to_trade_cash || 0);
-                if (buyLike && orderNotional > availableToTrade) {
-                  setBanner({
-                    tone: "warn",
-                    message:
-                      availableToTrade <= 0
-                        ? "Order not processed because the cash reserve rule leaves no available-to-trade cash. Insufficient balance checks still apply to submitted orders."
-                        : `Order not processed because it would breach the cash reserve. Available to trade is ${formatCurrency(availableToTrade, currentCurrency)}.`,
-                  });
-                  return;
-                }
                 const basePayload = {
                   asset_id: orderForm.asset_id,
                   side: orderForm.side,
                   order_type: orderForm.order_type,
+                  sizing_mode: orderForm.sizing_mode,
+                  sizing_value: Number(sizingValue || 0),
                   quantity: orderForm.sizing_mode === "quantity" ? Number(orderForm.quantity) : null,
                   amount: orderForm.sizing_mode === "amount" ? Number(orderForm.amount) : null,
+                  allow_fractional_resize: true,
                   requested_price: orderForm.requested_price ? Number(orderForm.requested_price) : null,
                   stop_loss: parseOptional(orderForm.stop_loss),
                   take_profit: parseOptional(orderForm.take_profit),
@@ -817,9 +904,12 @@ export function TradingWorkspace({
                         simulation_account_id: selectedSimulationAccountId,
                         reason: orderForm.notes,
                       });
+                const resizeNote = typeof order.audit_context?.resize_note === "string" ? order.audit_context.resize_note : "";
+                const fractionalTrading = order.audit_context?.fractional_trading as { warning?: string } | undefined;
+                const roundingWarning = order.rounding_warning || fractionalTrading?.warning || "";
                 setBanner({
                   tone: order.status === "rejected" ? "warn" : "success",
-                  message: order.rejection_reason || `Order ${order.status} for ${order.symbol}.`,
+                  message: order.rejection_reason || resizeNote || roundingWarning || `Order ${order.status} for ${order.symbol}.`,
                 });
                 setReviewOpen(false);
                 workspaceState.reload();
@@ -1142,7 +1232,19 @@ function AccountSummaryPanel({
   onSaveSimulationSettings: (payload: Record<string, unknown>) => Promise<void>;
   onSyncLiveBroker: (brokerAccountId?: string) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState({ starting_cash: 1000, fees_bps: 5, slippage_bps: 2, latency_ms: 50, min_cash_reserve_percent: "", short_enabled: false });
+  const [draft, setDraft] = useState({
+    starting_cash: 1000,
+    fees_bps: 5,
+    slippage_bps: 2,
+    latency_ms: 50,
+    min_cash_reserve_percent: "",
+    short_enabled: false,
+    short_borrow_fee_bps: 0,
+    short_margin_requirement: 1.5,
+    partial_fill_ratio: 1,
+    decimal_precision: 6,
+    enforce_market_hours: false,
+  });
 
   useEffect(() => {
     if (mode !== "simulation") return;
@@ -1158,6 +1260,11 @@ function AccountSummaryPanel({
           ? ""
           : String(Number(current.min_cash_reserve_percent) * 100),
       short_enabled: Boolean(current.short_enabled),
+      short_borrow_fee_bps: Number(current.short_borrow_fee_bps || 0),
+      short_margin_requirement: Number(current.short_margin_requirement || 1.5),
+      partial_fill_ratio: Number(current.partial_fill_ratio || 1),
+      decimal_precision: Number(current.decimal_precision || 6),
+      enforce_market_hours: Boolean(current.enforce_market_hours),
     });
   }, [mode, selectedSimulationAccountId, simulationAccounts]);
 
@@ -1211,6 +1318,23 @@ function AccountSummaryPanel({
               label={<HelpTooltip label="Short simulation" help="Allows this simulation account to open short trades that profit if price falls. Live availability depends on broker support and is disabled for Trading212 here." />}
               checked={draft.short_enabled}
               onChange={(checked) => setDraft((current) => ({ ...current, short_enabled: checked }))}
+            />
+            <Field label={<HelpTooltip label="Short borrow fee" help="One-period borrow fee scaffold applied when covering simulated short exposure." />}>
+              <input type="number" value={draft.short_borrow_fee_bps} onChange={(event) => setDraft((current) => ({ ...current, short_borrow_fee_bps: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label={<HelpTooltip label="Short margin requirement" help="Multiplier of short notional required as available cash before opening a simulated short." />}>
+              <input type="number" step="0.1" min="1" value={draft.short_margin_requirement} onChange={(event) => setDraft((current) => ({ ...current, short_margin_requirement: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label={<HelpTooltip label="Partial fill ratio" help="Scaffold for partial fills. 1 means full fills; 0.5 fills half the requested quantity." />}>
+              <input type="number" step="0.05" min="0" max="1" value={draft.partial_fill_ratio} onChange={(event) => setDraft((current) => ({ ...current, partial_fill_ratio: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label={<HelpTooltip label="Decimal precision" help="Maximum fractional-share precision for simulated fills. Quantity is rounded down visibly at this precision." />}>
+              <input type="number" min="0" max="8" value={draft.decimal_precision} onChange={(event) => setDraft((current) => ({ ...current, decimal_precision: Number(event.target.value) }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <ToggleField
+              label={<HelpTooltip label="Market-hours guard" help="Simulation setting scaffold for restricting orders to market-hours windows." />}
+              checked={draft.enforce_market_hours}
+              onChange={(checked) => setDraft((current) => ({ ...current, enforce_market_hours: checked }))}
             />
           </div>
           <div className="flex flex-wrap gap-3">
@@ -1327,11 +1451,16 @@ function SimulationModelComparison({
             <tr>
               <th>Model account</th>
               <th>Cash</th>
+              <th>Reserved</th>
+              <th>Available</th>
               <th>Value</th>
               <th>Return</th>
               <th>Win rate</th>
+              <th>Profit factor</th>
               <th>Drawdown</th>
               <th>Trades</th>
+              <th>Rejected</th>
+              <th>Invalid</th>
               <th>Shorts</th>
             </tr>
           </thead>
@@ -1345,11 +1474,16 @@ function SimulationModelComparison({
                   </button>
                 </td>
                 <td>{formatCurrency(Number(account.cash_balance || 0))}</td>
+                <td>{formatCurrency(Number(account.reserved_cash || account.cash_reserve_amount || 0))}</td>
+                <td>{formatCurrency(Number(account.available_to_trade_cash || 0))}</td>
                 <td>{formatCurrency(Number(account.portfolio_value ?? account.cash_balance ?? 0))}</td>
                 <td>{formatPct(Number(account.total_return || 0))}</td>
                 <td>{formatPct(Number(account.win_rate || 0))}</td>
+                <td>{Number(account.profit_factor || 0).toFixed(2)}</td>
                 <td>{formatPct(Number(account.max_drawdown || 0))}</td>
                 <td>{String(account.trade_count ?? 0)}</td>
+                <td>{String(account.rejected_trade_count ?? 0)}</td>
+                <td>{formatPct(Number(account.invalid_signal_rate || 0))}</td>
                 <td>{Boolean(account.short_enabled) ? "Enabled" : "Off"}</td>
               </tr>
             ))}
@@ -1357,6 +1491,160 @@ function SimulationModelComparison({
         </table>
       </div>
     </div>
+  );
+}
+
+function ReplayBacktestPanel({
+  open,
+  onToggle,
+  workspaceData,
+  simulationAccounts,
+  replayRuns,
+  loading,
+  form,
+  onChange,
+  onCreate,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  workspaceData: TradingWorkspaceData;
+  simulationAccounts: Array<Record<string, unknown>>;
+  replayRuns: ReplayRun[];
+  loading: boolean;
+  form: {
+    date_start: string;
+    date_end: string;
+    starting_cash: string;
+    selected_models: string[];
+    symbols: string[];
+    fees_bps: string;
+    slippage_bps: string;
+    cash_reserve_percent: string;
+    short_enabled: boolean;
+    enforce_market_hours: boolean;
+  };
+  onChange: Dispatch<SetStateAction<any>>;
+  onCreate: () => Promise<void>;
+}) {
+  const modelOptions = Array.from(new Set(simulationAccounts.map((account) => String(account.provider_type || "")).filter(Boolean)));
+  const symbolOptions = workspaceData.assets.map((asset) => asset.symbol).slice(0, 12);
+  const latestRun = replayRuns[0];
+  return (
+    <section className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+      <button type="button" onClick={onToggle} className="flex w-full flex-col gap-3 text-left md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Replay / Backtest scaffold</div>
+          <div className="mt-1 text-sm text-slate-400">
+            Runs selected models over the same historical window using stored signals and market snapshots. Results are isolated from normal simulation balances.
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge status="scaffold" />
+          <span className="rounded-full border border-border px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-200">
+            {open ? "Close" : "Open"}
+          </span>
+        </div>
+      </button>
+      {open ? (
+        <div className="mt-4 space-y-4">
+          <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            Scaffold / limited historical data: fills use stored prices at or before each replay timestamp and do not write normal simulation orders, trades, positions, or cash.
+          </div>
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <Field label="Start">
+              <input type="datetime-local" value={form.date_start} onChange={(event) => onChange((current: any) => ({ ...current, date_start: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="End">
+              <input type="datetime-local" value={form.date_end} onChange={(event) => onChange((current: any) => ({ ...current, date_end: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Starting cash">
+              <input type="number" value={form.starting_cash} onChange={(event) => onChange((current: any) => ({ ...current, starting_cash: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Cash reserve %">
+              <input type="number" value={form.cash_reserve_percent} onChange={(event) => onChange((current: any) => ({ ...current, cash_reserve_percent: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Fees (bps)">
+              <input type="number" value={form.fees_bps} onChange={(event) => onChange((current: any) => ({ ...current, fees_bps: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <Field label="Slippage (bps)">
+              <input type="number" value={form.slippage_bps} onChange={(event) => onChange((current: any) => ({ ...current, slippage_bps: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100" />
+            </Field>
+            <ToggleField label="Short simulation" checked={form.short_enabled} onChange={(checked) => onChange((current: any) => ({ ...current, short_enabled: checked }))} />
+            <ToggleField label="Market-hours guard" checked={form.enforce_market_hours} onChange={(checked) => onChange((current: any) => ({ ...current, enforce_market_hours: checked }))} />
+          </div>
+          <div className="grid gap-4 xl:grid-cols-2">
+            <CheckList
+              title="Replay models"
+              description="All selected models consume the same chronological market/news window."
+              items={modelOptions.map((provider) => ({ value: provider, label: provider }))}
+              value={form.selected_models}
+              onChange={(next) => onChange((current: any) => ({ ...current, selected_models: next }))}
+            />
+            <CheckList
+              title="Replay symbols"
+              description="Historical snapshots and stored signals are filtered to this symbol set."
+              items={symbolOptions.map((symbol) => ({ value: symbol, label: symbol }))}
+              value={form.symbols}
+              onChange={(next) => onChange((current: any) => ({ ...current, symbols: next }))}
+            />
+          </div>
+          <button type="button" onClick={onCreate} className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">
+            Create replay run
+          </button>
+
+          <div className="rounded-2xl border border-border bg-black/20 p-4">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold text-slate-100">Replay results</div>
+              <SummaryChip label="Runs" value={loading ? "Loading" : String(replayRuns.length)} />
+            </div>
+            {!latestRun ? (
+              <div className="mt-4 text-sm text-slate-500">No replay runs yet.</div>
+            ) : (
+              <div className="mt-4 overflow-x-auto">
+                <div className="mb-3 text-xs text-slate-400">
+                  Latest: {latestRun.name} · {formatDateTime(latestRun.created_at)} · {latestRun.status}
+                </div>
+                <table className="min-w-full text-xs">
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      <th>Return</th>
+                      <th>Drawdown</th>
+                      <th>Sharpe</th>
+                      <th>Sortino</th>
+                      <th>Win rate</th>
+                      <th>Profit factor</th>
+                      <th>Trades</th>
+                      <th>Rejected</th>
+                      <th>Invalid</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {latestRun.results.map((result) => (
+                      <tr key={result.id}>
+                        <td>
+                          <div className="font-semibold text-slate-100">{result.provider_type}</div>
+                          <div className="text-[11px] text-slate-400">{result.model_name || "model unset"}</div>
+                        </td>
+                        <td>{formatPct(result.total_return)}</td>
+                        <td>{formatPct(result.max_drawdown)}</td>
+                        <td>{result.sharpe.toFixed(2)}</td>
+                        <td>{result.sortino.toFixed(2)}</td>
+                        <td>{formatPct(result.win_rate)}</td>
+                        <td>{result.profit_factor.toFixed(2)}</td>
+                        <td>{result.trades}</td>
+                        <td>{result.rejected_trades}</td>
+                        <td>{result.invalid_signals}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -1373,6 +1661,9 @@ function OrderEntryPanel({
   currentCurrency,
   derivedQuantity,
   orderNotional,
+  orderPortfolioPct,
+  remainingCashPreview,
+  exceedsAvailableToTrade,
   embedded = false,
   onSearchQueryChange,
   onChooseAsset,
@@ -1392,6 +1683,9 @@ function OrderEntryPanel({
   currentCurrency: string;
   derivedQuantity: number;
   orderNotional: number;
+  orderPortfolioPct: number;
+  remainingCashPreview: number;
+  exceedsAvailableToTrade: boolean;
   embedded?: boolean;
   onSearchQueryChange: (value: string) => void;
   onChooseAsset: (asset: AssetSearchResult) => void;
@@ -1475,20 +1769,25 @@ function OrderEntryPanel({
               <option value="limit">Limit</option>
             </select>
           </Field>
-          <Field label="Sizing">
+          <Field label={<HelpTooltip label="Sizing" help="Fractional trading allows buying less than 1 share. Order size is calculated from the selected mode." />}>
             <select value={orderForm.sizing_mode} onChange={(event) => onChange((current: any) => ({ ...current, sizing_mode: event.target.value }))} className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100">
-              <option value="amount">Amount</option>
+              <option value="percentage">% of portfolio</option>
+              <option value="amount">$ amount</option>
               <option value="quantity">Quantity</option>
             </select>
           </Field>
-          <Field label={orderForm.sizing_mode === "amount" ? "Amount" : "Quantity"}>
+          <Field label={orderForm.sizing_mode === "percentage" ? "% of portfolio" : orderForm.sizing_mode === "amount" ? "Amount" : "Quantity"}>
             <input
               type="number"
               step="0.0001"
-              value={orderForm.sizing_mode === "amount" ? orderForm.amount : orderForm.quantity}
+              value={orderForm.sizing_mode === "percentage" ? orderForm.sizing_value : orderForm.sizing_mode === "amount" ? orderForm.amount : orderForm.quantity}
               onChange={(event) =>
                 onChange((current: any) =>
-                  current.sizing_mode === "amount" ? { ...current, amount: event.target.value } : { ...current, quantity: event.target.value }
+                  current.sizing_mode === "percentage"
+                    ? { ...current, sizing_value: event.target.value }
+                    : current.sizing_mode === "amount"
+                      ? { ...current, amount: event.target.value }
+                      : { ...current, quantity: event.target.value }
                 )
               }
               className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100"
@@ -1553,8 +1852,16 @@ function OrderEntryPanel({
             <SummaryChip label="Selected asset" value={selectedAsset ? `${selectedAsset.symbol} · ${selectedAsset.name}` : orderForm.asset_symbol || "-"} />
             <SummaryChip label="Estimated quantity" value={formatQuantity(derivedQuantity, 6)} />
             <SummaryChip label="Estimated notional" value={formatCurrency(orderNotional, currentCurrency)} />
+            <SummaryChip label="% of portfolio" value={formatPct(orderPortfolioPct)} />
+            <SummaryChip label="Remaining cash" value={formatCurrency(remainingCashPreview, currentCurrency)} />
+            <SummaryChip label="Reserved cash" value={formatCurrency(workspaceData.account.cash_reserve_amount || 0, currentCurrency)} />
             <SummaryChip label="Available after reserve" value={formatCurrency(workspaceData.account.available_to_trade_cash || 0, currentCurrency)} />
           </div>
+          {exceedsAvailableToTrade ? (
+            <div className="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+              This order is above available-to-trade cash after reserve; the backend will resize to the maximum allowed fractional quantity or reject it with a risk reason.
+            </div>
+          ) : null}
         </div>
 
         <button type="button" onClick={onOpenReview} className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 hover:bg-cyan-500/20">
@@ -1838,6 +2145,7 @@ function RecommendationQueue({
               </div>
               <div className="mt-3 grid gap-2 md:grid-cols-2">
                 <SummaryChip label="Suggested entry" value={recommendation.suggested_entry ? String(recommendation.suggested_entry) : "n/a"} />
+                <SummaryChip label="Suggested size" value={formatSignalSizing(recommendation)} />
                 <SummaryChip label="Risk / reward" value={recommendation.estimated_risk_reward ? recommendation.estimated_risk_reward.toFixed(2) : "n/a"} />
                 <SummaryChip label="Stop / target" value={`${recommendation.suggested_stop_loss || "-"} / ${recommendation.suggested_take_profit || "-"}`} />
                 <SummaryChip label="Queued at" value={recommendation.queued_at.replace("T", " ").slice(0, 16)} />
@@ -2053,6 +2361,48 @@ function deriveQuantity(amount: string | number, price: number) {
   return numericAmount / price;
 }
 
+function deriveOrderQuantity(mode: SizingMode, value: string | number, price: number, portfolioValue: number) {
+  const numericValue = typeof value === "number" ? value : Number(value || 0);
+  if (!(numericValue > 0) || !(price > 0)) return 0;
+  if (mode === "percentage") {
+    return (portfolioValue * normalizePercentageInput(numericValue)) / price;
+  }
+  if (mode === "amount") {
+    return numericValue / price;
+  }
+  return numericValue;
+}
+
+function normalizePercentageInput(value: number) {
+  return value > 1 ? value / 100 : value;
+}
+
+function metadataNumber(value: unknown) {
+  const numeric = Number(value || 0);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function formatSizingMode(mode: SizingMode, value: string | number) {
+  const numericValue = typeof value === "number" ? value : Number(value || 0);
+  if (mode === "percentage") return `${numericValue || 0}% of portfolio`;
+  if (mode === "amount") return formatCurrency(numericValue || 0);
+  return `${formatQuantity(numericValue || 0, 6)} shares`;
+}
+
+function formatSignalSizing(signal: Pick<Signal, "suggested_position_size_type" | "suggested_position_size_value" | "fallback_quantity">) {
+  const value = signal.suggested_position_size_value;
+  if (signal.suggested_position_size_type === "percentage" && value !== null && value !== undefined) {
+    return `${value}% of portfolio`;
+  }
+  if (signal.suggested_position_size_type === "amount" && value !== null && value !== undefined) {
+    return formatCurrency(value);
+  }
+  if (signal.fallback_quantity !== null && signal.fallback_quantity !== undefined) {
+    return `${formatQuantity(signal.fallback_quantity, 6)} shares`;
+  }
+  return "-";
+}
+
 function parseOptional(value: string) {
   if (!value.trim()) return null;
   const numeric = Number(value);
@@ -2073,4 +2423,19 @@ function formatInterval(seconds?: number | null) {
 function toggleListValue(list: string[], value: string, enabled: boolean) {
   if (enabled) return Array.from(new Set([...list, value]));
   return list.filter((item) => item !== value);
+}
+
+function defaultReplayStart() {
+  const date = new Date();
+  date.setDate(date.getDate() - 30);
+  return toDatetimeLocal(date);
+}
+
+function defaultReplayEnd() {
+  return toDatetimeLocal(new Date());
+}
+
+function toDatetimeLocal(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }

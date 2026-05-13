@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -15,6 +16,11 @@ class SimulationAccountCreate(BaseModel):
     latency_ms: int = 50
     min_cash_reserve_percent: float | None = None
     short_enabled: bool = False
+    short_borrow_fee_bps: float = 0
+    short_margin_requirement: float = 1.5
+    partial_fill_ratio: float = 1.0
+    decimal_precision: int = 6
+    enforce_market_hours: bool = False
 
 
 class SimulationAccountUpdate(BaseModel):
@@ -27,6 +33,11 @@ class SimulationAccountUpdate(BaseModel):
     latency_ms: int | None = None
     min_cash_reserve_percent: float | None = None
     short_enabled: bool | None = None
+    short_borrow_fee_bps: float | None = None
+    short_margin_requirement: float | None = None
+    partial_fill_ratio: float | None = None
+    decimal_precision: int | None = None
+    enforce_market_hours: bool | None = None
     is_active: bool | None = None
 
 
@@ -42,6 +53,11 @@ class SimulationAccountRead(ORMModel):
     latency_ms: int
     min_cash_reserve_percent: float | None = None
     short_enabled: bool
+    short_borrow_fee_bps: float
+    short_margin_requirement: float
+    partial_fill_ratio: float
+    decimal_precision: int
+    enforce_market_hours: bool
     is_active: bool
     reset_count: int
 
@@ -50,8 +66,11 @@ class SimulationOrderCreate(BaseModel):
     simulation_account_id: str
     asset_id: str
     side: str
+    sizing_mode: Literal["percentage", "amount", "quantity"] | None = None
+    sizing_value: float | None = None
     quantity: float | None = None
     amount: float | None = None
+    allow_fractional_resize: bool = True
     requested_price: float | None = None
     stop_loss: float | None = None
     take_profit: float | None = None

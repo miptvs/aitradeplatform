@@ -110,6 +110,11 @@ export interface Order {
   side: string;
   order_type: string;
   quantity: number;
+  sizing_mode?: string | null;
+  sizing_value?: number | null;
+  order_notional?: number | null;
+  portfolio_percent?: number | null;
+  rounding_warning?: string | null;
   requested_price?: number | null;
   filled_price?: number | null;
   stop_loss?: number | null;
@@ -168,6 +173,9 @@ export interface Signal {
   suggested_stop_loss?: number | null;
   suggested_take_profit?: number | null;
   estimated_risk_reward?: number | null;
+  suggested_position_size_type?: string | null;
+  suggested_position_size_value?: number | null;
+  fallback_quantity?: number | null;
   provider_type?: string | null;
   model_name?: string | null;
   indicators_json: Record<string, unknown>;
@@ -244,6 +252,7 @@ export interface NewsArticle {
 export interface NewsFeedDiagnostic {
   feed_url: string;
   feed_label: string;
+  feed_group?: string;
   status: string;
   fetched_count: number;
   added_count: number;
@@ -268,6 +277,7 @@ export interface NewsRefreshDiagnostics {
   cutoff: string;
   latest_seen_published_at?: string | null;
   force_refresh: boolean;
+  fallback_feeds_used?: boolean;
   last_successful_fetch_time?: string | null;
   errors: string[];
   feed_reports: NewsFeedDiagnostic[];
@@ -295,6 +305,11 @@ export interface SimulationAccount {
   latency_ms: number;
   min_cash_reserve_percent?: number | null;
   short_enabled: boolean;
+  short_borrow_fee_bps: number;
+  short_margin_requirement: number;
+  partial_fill_ratio: number;
+  decimal_precision: number;
+  enforce_market_hours: boolean;
   is_active: boolean;
   reset_count: number;
 }
@@ -319,6 +334,81 @@ export interface SimulationSummary {
   total_trades: number;
   hypothetical_pnl: number;
   latest_orders: Order[];
+}
+
+export interface ReplayModelResult {
+  id: string;
+  replay_run_id: string;
+  provider_type: string;
+  model_name?: string | null;
+  status: string;
+  cash: number;
+  portfolio_value: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_return: number;
+  max_drawdown: number;
+  sharpe: number;
+  sortino: number;
+  win_rate: number;
+  profit_factor: number;
+  average_holding_time_minutes: number;
+  turnover: number;
+  trades: number;
+  rejected_trades: number;
+  invalid_signals: number;
+  useful_signal_rate: number;
+  latency_ms?: number | null;
+  model_cost?: number | null;
+  metrics_json: Record<string, unknown>;
+}
+
+export interface ReplayRun {
+  id: string;
+  name: string;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  date_start: string;
+  date_end: string;
+  starting_cash: number;
+  fees_bps: number;
+  slippage_bps: number;
+  cash_reserve_percent: number;
+  short_enabled: boolean;
+  selected_models: string[];
+  symbols: string[];
+  config_json: Record<string, unknown>;
+  notes?: string | null;
+  created_at: string;
+  updated_at: string;
+  results: ReplayModelResult[];
+}
+
+export interface ModelMetric {
+  scope: string;
+  replay_run_id?: string | null;
+  simulation_account_id?: string | null;
+  provider_type?: string | null;
+  model_name?: string | null;
+  cash: number;
+  reserved_cash: number;
+  available_cash: number;
+  portfolio_value: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  total_return: number;
+  max_drawdown: number;
+  win_rate: number;
+  profit_factor: number;
+  average_holding_time_minutes: number;
+  turnover: number;
+  trade_count: number;
+  rejected_trade_count: number;
+  invalid_signal_count: number;
+  latency_ms?: number | null;
+  model_cost?: number | null;
+  useful_signal_rate: number;
 }
 
 export interface PortfolioSummary {
@@ -521,6 +611,9 @@ export interface TradingRecommendation {
   suggested_stop_loss?: number | null;
   suggested_take_profit?: number | null;
   estimated_risk_reward?: number | null;
+  suggested_position_size_type?: string | null;
+  suggested_position_size_value?: number | null;
+  fallback_quantity?: number | null;
 }
 
 export interface BrokerAccount {
@@ -541,6 +634,7 @@ export interface BrokerAccount {
   last_sync_started_at?: string | null;
   last_sync_completed_at?: string | null;
   last_sync_message?: string | null;
+  last_successful_sync_completed_at?: string | null;
   cash_balance?: number | null;
   available_cash?: number | null;
   invested_value?: number | null;
@@ -638,4 +732,24 @@ export interface McpStatus {
 export interface HealthReadyStatus {
   status: string;
   details: Record<string, string>;
+}
+
+export interface SystemHealthStatus {
+  status: string;
+  providers: ProviderHealth[];
+  events: Array<{ component: string; status: string; message: string; observed_at: string; metadata?: Record<string, unknown> }>;
+  freshness: {
+    news_latest_published_at?: string | null;
+    market_latest_snapshot_at?: string | null;
+    last_signal_generation_at?: string | null;
+    scheduler_status?: string | null;
+    scheduler_observed_at?: string | null;
+  };
+  broker_sync: Array<Record<string, unknown>>;
+  model_health: {
+    live_model_provider_type?: string | null;
+    selected_live_model?: ProviderHealth | null;
+  };
+  news: NewsRefreshDiagnostics;
+  warnings: string[];
 }

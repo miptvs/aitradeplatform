@@ -163,7 +163,7 @@ def seed_demo() -> None:
         if simulation_account is None:
             simulation_account = simulation_service.create_account(
                 db,
-                SimulationAccountCreate(name="Primary Simulation", starting_cash=1000, fees_bps=5, slippage_bps=2, latency_ms=50),
+                SimulationAccountCreate(name="Primary Simulation", starting_cash=1000, fees_bps=5, slippage_bps=2, latency_ms=50, decimal_precision=6),
             )
         simulation_service.ensure_model_accounts(db)
         trading_workspace_service.get_or_create_profile(db, "live")

@@ -9,6 +9,7 @@ from app.models.audit import Alert
 from app.models.base import Base
 from app.models.health import SystemHealthEvent
 from app.models.news import NewsArticle
+from app.services.alerts.service import alert_service
 from app.services.news.service import news_service
 from app.tasks import periodic
 from app.utils.time import utcnow
@@ -225,6 +226,175 @@ def test_refresh_latest_news_partial_feed_failure_is_warn_not_error(monkeypatch)
     assert result["feeds_failed"] == 1
     assert latest_event is not None
     assert latest_event.status == "warn"
+
+
+def test_refresh_latest_news_uses_backup_feeds_when_primary_feeds_fail(monkeypatch) -> None:
+    db = build_session()
+    db.add(Asset(symbol="AAPL", name="Apple Inc.", asset_type="stock", sector="Technology", exchange="NASDAQ", currency="USD"))
+    db.commit()
+
+    feed_xml = f"""
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Apple gains after services revenue beat</title>
+          <link>https://backup.example/aapl-services</link>
+          <guid>aapl-services</guid>
+          <description>Backup feed still provides a fresh market article when primary RSS is unavailable.</description>
+          <source>Backup Markets</source>
+          <pubDate>{format_datetime(utcnow())}</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """.strip()
+
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://primary.example/one", "https://primary.example/two"])
+    monkeypatch.setattr(news_service, "_build_backup_feed_urls", lambda _primary, _assets: ["https://backup.example/rss"])
+
+    def fake_fetch(url: str) -> str:
+        if "primary.example" in url:
+            raise RuntimeError("primary RSS upstream blocked")
+        return feed_xml
+
+    monkeypatch.setattr(news_service, "_fetch_feed", fake_fetch)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+
+    latest_event = db.query(SystemHealthEvent).filter(SystemHealthEvent.component == "news.rss_refresh").order_by(SystemHealthEvent.observed_at.desc()).first()
+    assert result["articles_added"] == 1
+    assert result["feeds_checked"] == 3
+    assert result["feeds_failed"] == 2
+    assert result["fallback_feeds_used"] is True
+    assert result["feed_reports"][-1]["feed_group"] == "backup"
+    assert db.query(NewsArticle).filter(NewsArticle.source == "Backup Markets").one()
+    assert latest_event is not None
+    assert latest_event.status == "warn"
+
+
+def test_refresh_latest_news_skips_duplicate_url_outside_recent_window(monkeypatch) -> None:
+    db = build_session()
+    db.add(Asset(symbol="DUP", name="Duplicate Asset", asset_type="stock", sector="Technology", exchange="NASDAQ", currency="USD"))
+    db.add(
+        NewsArticle(
+            title="Old duplicate headline",
+            source="Example Markets",
+            url="https://example.com/duplicate-url",
+            published_at=utcnow() - timedelta(days=30),
+            summary="Old row outside the rolling duplicate preload window.",
+            sentiment="neutral",
+            impact_score=0.4,
+            affected_symbols=["DUP"],
+            provider_type="rss",
+            model_name="rss-heuristic",
+            dedupe_key="old-duplicate",
+            analysis_metadata={},
+        )
+    )
+    db.commit()
+
+    feed_xml = f"""
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>DUP duplicate headline returns in RSS</title>
+          <link>https://example.com/duplicate-url</link>
+          <guid>new-guid-for-existing-url</guid>
+          <description>The URL already exists even though the old article is outside the preload window.</description>
+          <source>Example Markets</source>
+          <pubDate>{format_datetime(utcnow())}</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """.strip()
+
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://example.com/rss"])
+    monkeypatch.setattr(news_service, "_fetch_feed", lambda _: feed_xml)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+
+    assert result["articles_added"] == 0
+    assert result["duplicates_skipped"] == 1
+    assert db.query(NewsArticle).filter(NewsArticle.url == "https://example.com/duplicate-url").count() == 1
+
+
+def test_successful_rss_refresh_resolves_stale_news_error_alert(monkeypatch) -> None:
+    db = build_session()
+    db.add(
+        Alert(
+            category="health",
+            severity="warning",
+            title="news.rss_refresh reported an error",
+            message="Old DNS failure",
+            status="open",
+            mode="system",
+            source_ref="news.rss_refresh",
+            metadata_json={},
+        )
+    )
+    db.commit()
+
+    empty_feed = """
+    <rss version="2.0">
+      <channel></channel>
+    </rss>
+    """.strip()
+    monkeypatch.setattr(news_service, "_build_feed_urls", lambda _: ["https://example.com/rss"])
+    monkeypatch.setattr(news_service, "_fetch_feed", lambda _: empty_feed)
+
+    result = news_service.refresh_latest_news(db)
+    db.commit()
+    db.expire_all()
+
+    alert = db.query(Alert).filter(Alert.title == "news.rss_refresh reported an error").one()
+    assert result["feeds_failed"] == 0
+    assert alert.status == "resolved"
+
+
+def test_warning_notice_cleanup_includes_system_health_warnings_for_workspace_mode() -> None:
+    db = build_session()
+    db.add_all(
+        [
+            Alert(
+                category="health",
+                severity="warning",
+                title="news.rss_refresh reported an error",
+                message="Old RSS warning",
+                status="open",
+                mode="system",
+                source_ref="news.rss_refresh",
+                metadata_json={},
+            ),
+            Alert(
+                category="risk",
+                severity="warning",
+                title="Order rejected by risk engine",
+                message="Old simulation warning",
+                status="open",
+                mode="simulation",
+                source_ref="order-1",
+                metadata_json={},
+            ),
+            Alert(
+                category="provider",
+                severity="info",
+                title="Provider disabled",
+                message="Info should remain open.",
+                status="open",
+                mode="system",
+                source_ref="provider:test",
+                metadata_json={},
+            ),
+        ]
+    )
+    db.commit()
+
+    resolved = alert_service.resolve_alerts(db, mode="simulation", include_system=True, warning_only=True)
+    db.commit()
+
+    assert resolved == 2
+    assert db.query(Alert).filter(Alert.title == "Provider disabled").one().status == "open"
 
 
 def test_alert_generation_resolves_stale_news_error_alert(monkeypatch) -> None:

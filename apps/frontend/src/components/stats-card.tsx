@@ -21,7 +21,7 @@ export function StatsCard({
           : value.toLocaleString();
 
   return (
-    <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+    <div className="min-w-0 rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
       <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">{label}</div>
       <div className="mt-3 text-2xl font-semibold text-ink">{display}</div>
       {detail ? <div className="mt-2 text-xs text-slate-400">{detail}</div> : null}

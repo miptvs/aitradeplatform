@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.portfolio import OrderCreate, OrderRead, PositionRead, PositionUpdate
+from app.schemas.replay import ReplayRunCreate, ReplayRunRead
 from app.schemas.simulation import SimulationAccountCreate, SimulationAccountRead, SimulationAccountUpdate, SimulationOrderCreate, SimulationSummary
 from app.schemas.trading import (
     AutomationDecisionRead,
@@ -16,6 +17,7 @@ from app.schemas.trading import (
     TradingWorkspaceRead,
 )
 from app.services.portfolio.service import portfolio_service
+from app.services.replay.service import replay_service
 from app.services.simulation.service import simulation_service
 from app.services.trading.service import trading_workspace_service
 
@@ -66,6 +68,30 @@ def account_summary(account_id: str, db: Session = Depends(get_db)) -> Simulatio
     return SimulationSummary.model_validate(summary)
 
 
+@router.get("/replay-runs", response_model=list[ReplayRunRead])
+def replay_runs(db: Session = Depends(get_db)) -> list[ReplayRunRead]:
+    return [ReplayRunRead.model_validate(run) for run in replay_service.list_runs(db)]
+
+
+@router.post("/replay-runs", response_model=ReplayRunRead)
+def create_replay_run(payload: ReplayRunCreate, db: Session = Depends(get_db)) -> ReplayRunRead:
+    try:
+        run = replay_service.create_run(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    return ReplayRunRead.model_validate(run)
+
+
+@router.get("/replay-runs/{replay_run_id}", response_model=ReplayRunRead)
+def replay_run(replay_run_id: str, db: Session = Depends(get_db)) -> ReplayRunRead:
+    try:
+        run = replay_service.get_run(db, replay_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ReplayRunRead.model_validate(run)
+
+
 @router.get("/workspace", response_model=TradingWorkspaceRead)
 def workspace(account_id: str | None = Query(default=None), db: Session = Depends(get_db)) -> TradingWorkspaceRead:
     return TradingWorkspaceRead.model_validate(trading_workspace_service.get_workspace(db, "simulation", simulation_account_id=account_id))
@@ -109,8 +135,11 @@ def create_simulation_order(payload: SimulationOrderCreate, db: Session = Depend
                 asset_id=payload.asset_id,
                 mode="simulation",
                 side=payload.side,
+                sizing_mode=payload.sizing_mode,
+                sizing_value=payload.sizing_value,
                 quantity=payload.quantity,
                 amount=payload.amount,
+                allow_fractional_resize=payload.allow_fractional_resize,
                 requested_price=payload.requested_price,
                 signal_id=payload.signal_id,
                 strategy_name=payload.strategy_name,

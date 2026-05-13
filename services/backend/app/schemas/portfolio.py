@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -79,8 +80,11 @@ class OrderCreate(BaseModel):
     asset_id: str
     mode: str = "simulation"
     side: str
+    sizing_mode: Literal["percentage", "amount", "quantity"] | None = None
+    sizing_value: float | None = None
     quantity: float | None = None
     amount: float | None = None
+    allow_fractional_resize: bool = True
     order_type: str = "market"
     requested_price: float | None = None
     limit_price: float | None = None
@@ -100,8 +104,14 @@ class OrderCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_sizing(self) -> "OrderCreate":
-        if self.quantity is None and self.amount is None:
-            raise ValueError("Either quantity or amount is required.")
+        if self.sizing_mode == "percentage" and self.sizing_value is None:
+            raise ValueError("Percentage sizing requires sizing_value.")
+        if self.sizing_mode == "amount" and self.sizing_value is None and self.amount is None:
+            raise ValueError("Amount sizing requires sizing_value or amount.")
+        if self.sizing_mode == "quantity" and self.sizing_value is None and self.quantity is None:
+            raise ValueError("Quantity sizing requires sizing_value or quantity.")
+        if self.sizing_mode is None and self.quantity is None and self.amount is None and self.sizing_value is None:
+            raise ValueError("Either percentage, amount, or quantity sizing is required.")
         return self
 
 
@@ -122,6 +132,11 @@ class OrderRead(ORMModel):
     side: str
     order_type: str
     quantity: float
+    sizing_mode: str | None = None
+    sizing_value: float | None = None
+    order_notional: float | None = None
+    portfolio_percent: float | None = None
+    rounding_warning: str | None = None
     limit_price: float | None = None
     stop_price: float | None = None
     stop_loss: float | None = None

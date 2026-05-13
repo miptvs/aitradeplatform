@@ -2,12 +2,14 @@ from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.asset import Asset
-from app.models.portfolio import Fill, Order, PortfolioSnapshot, Position, Trade
+from app.models.portfolio import Fill, Order, PortfolioSnapshot, Position, PositionStopEvent, Trade
 from app.models.signal import Signal, SignalEvaluation
 from app.models.simulation import SimulationAccount, SimulationOrder, SimulationTrade
 from app.schemas.simulation import SimulationAccountCreate, SimulationAccountUpdate
 from app.services.events.service import publish_event
 from app.services.market_data.service import market_data_service
+from app.services.market_hours.service import market_hours_service
+from app.services.order_sizing import round_quantity
 from app.services.providers.service import provider_service
 from app.services.alerts.service import alert_service
 from app.utils.time import utcnow
@@ -26,6 +28,7 @@ class SimulationService:
         default_fees_bps = float(template.fees_bps if template else 5)
         default_slippage_bps = float(template.slippage_bps if template else 2)
         default_latency_ms = int(template.latency_ms if template else 50)
+        default_decimal_precision = int(template.decimal_precision if template else 6)
 
         for config in provider_service.list_configs(db):
             profile = provider_service.get_profile(config.provider_type)
@@ -47,6 +50,11 @@ class SimulationService:
                 latency_ms=default_latency_ms,
                 min_cash_reserve_percent=None,
                 short_enabled=False,
+                short_borrow_fee_bps=0,
+                short_margin_requirement=1.5,
+                partial_fill_ratio=1.0,
+                decimal_precision=default_decimal_precision,
+                enforce_market_hours=False,
                 is_active=True,
             )
             db.add(account)
@@ -70,6 +78,11 @@ class SimulationService:
             latency_ms=payload.latency_ms,
             min_cash_reserve_percent=payload.min_cash_reserve_percent,
             short_enabled=payload.short_enabled,
+            short_borrow_fee_bps=payload.short_borrow_fee_bps,
+            short_margin_requirement=payload.short_margin_requirement,
+            partial_fill_ratio=payload.partial_fill_ratio,
+            decimal_precision=payload.decimal_precision,
+            enforce_market_hours=payload.enforce_market_hours,
         )
         db.add(account)
         db.flush()
@@ -108,18 +121,31 @@ class SimulationService:
             for order in db.scalars(select(Order).where(Order.mode == "simulation"))
             if (order.audit_context or {}).get("simulation_account_id") == account_id
             or (order.position_id and order.position_id in position_ids)
+            or (account.provider_type and order.provider_type == account.provider_type)
         ]
         generic_order_ids = {order.id for order in generic_orders}
         generic_trades = [
             trade
             for trade in db.scalars(select(Trade))
-            if (trade.position_id and trade.position_id in position_ids) or (trade.order_id and trade.order_id in generic_order_ids)
+            if (trade.position_id and trade.position_id in position_ids)
+            or (trade.order_id and trade.order_id in generic_order_ids)
+            or (account.provider_type and trade.provider_type == account.provider_type and trade.mode == "simulation")
         ]
         for source_ref in {*position_ids, *generic_order_ids}:
             alert_service.resolve_alerts(db, source_ref=source_ref)
         # A simulation reset is a fresh virtual training ledger, so old rejected
         # simulation orders should stop surfacing as current risk notices.
         alert_service.resolve_alerts(db, mode="simulation", category="risk")
+        stop_event_query = select(PositionStopEvent).where(PositionStopEvent.mode == "simulation")
+        stop_event_filters = []
+        if position_ids:
+            stop_event_filters.append(PositionStopEvent.position_id.in_(position_ids))
+        if generic_order_ids:
+            stop_event_filters.append(PositionStopEvent.order_id.in_(generic_order_ids))
+        if stop_event_filters:
+            for stop_event in list(db.scalars(stop_event_query.where(or_(*stop_event_filters)))):
+                db.delete(stop_event)
+            db.flush()
         for fill in list(db.scalars(select(Fill))):
             if fill.order_id in generic_order_ids:
                 db.delete(fill)
@@ -139,7 +165,10 @@ class SimulationService:
             db.scalars(
                 select(PortfolioSnapshot).where(
                     PortfolioSnapshot.mode == "simulation",
-                    PortfolioSnapshot.simulation_account_id == account_id,
+                    or_(
+                        PortfolioSnapshot.simulation_account_id == account_id,
+                        PortfolioSnapshot.simulation_account_id.is_(None),
+                    ),
                 )
             )
         ):
@@ -171,15 +200,24 @@ class SimulationService:
         side = self._normalize_execution_side(order.side)
         if side == "short" and not account.short_enabled:
             raise ValueError("Short simulation is disabled for this simulation account.")
+        if account.enforce_market_hours:
+            asset = db.get(Asset, order.asset_id)
+            hours = market_hours_service.check_asset(asset, at=order.submitted_at or utcnow())
+            if not hours.is_open:
+                raise ValueError(f"Simulation market-hours guard blocked order: {hours.reason}")
+        fill_ratio = max(0.0, min(1.0, float(account.partial_fill_ratio or 1.0)))
+        executed_quantity = round_quantity(order.quantity * fill_ratio, account.decimal_precision)
+        if executed_quantity <= 0:
+            raise ValueError("Simulation partial-fill settings produced a zero fill quantity.")
         slip = base_price * (account.slippage_bps / 10_000)
         executed_price = round(base_price + slip if side in {"buy", "cover_short"} else base_price - slip, 4)
-        fees = round(executed_price * order.quantity * (account.fees_bps / 10_000), 4)
+        fees = round(executed_price * executed_quantity * (account.fees_bps / 10_000), 4)
         sim_order = SimulationOrder(
             simulation_account_id=account.id,
             asset_id=order.asset_id,
             signal_id=order.signal_id,
             side=side,
-            quantity=order.quantity,
+            quantity=executed_quantity,
             requested_price=base_price,
             executed_price=executed_price,
             fees=fees,
@@ -208,12 +246,12 @@ class SimulationService:
         if side == "buy":
             if position and position.quantity < 0:
                 raise ValueError("Use cover short to reduce an open short before opening a long position.")
-            total_cost = executed_price * order.quantity + fees
+            total_cost = executed_price * executed_quantity + fees
             account.cash_balance -= total_cost
             if position:
-                new_qty = position.quantity + order.quantity
-                position.avg_entry_price = ((position.quantity * position.avg_entry_price) + (order.quantity * executed_price)) / new_qty
-                position.quantity = new_qty
+                new_qty = position.quantity + executed_quantity
+                position.avg_entry_price = ((position.quantity * position.avg_entry_price) + (executed_quantity * executed_price)) / new_qty
+                position.quantity = round_quantity(new_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.unrealized_pnl = (executed_price - position.avg_entry_price) * position.quantity
                 if protective_levels.get("stop_loss") is not None:
@@ -231,7 +269,7 @@ class SimulationService:
                     strategy_name=order.strategy_name,
                     provider_type=order.provider_type,
                     model_name=order.model_name,
-                    quantity=order.quantity,
+                    quantity=executed_quantity,
                     avg_entry_price=executed_price,
                     current_price=executed_price,
                     stop_loss=protective_levels.get("stop_loss"),
@@ -244,13 +282,13 @@ class SimulationService:
         elif side == "short":
             if position and position.quantity > 0:
                 raise ValueError("Close the long position before opening a simulated short.")
-            proceeds = executed_price * order.quantity - fees
+            proceeds = executed_price * executed_quantity - fees
             account.cash_balance += proceeds
             if position:
                 existing_qty = abs(position.quantity)
-                new_qty = existing_qty + order.quantity
-                position.avg_entry_price = ((existing_qty * position.avg_entry_price) + (order.quantity * executed_price)) / new_qty
-                position.quantity = -new_qty
+                new_qty = existing_qty + executed_quantity
+                position.avg_entry_price = ((existing_qty * position.avg_entry_price) + (executed_quantity * executed_price)) / new_qty
+                position.quantity = -round_quantity(new_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.unrealized_pnl = (position.avg_entry_price - executed_price) * new_qty
             else:
@@ -262,7 +300,7 @@ class SimulationService:
                     strategy_name=order.strategy_name,
                     provider_type=order.provider_type,
                     model_name=order.model_name,
-                    quantity=-order.quantity,
+                    quantity=-executed_quantity,
                     avg_entry_price=executed_price,
                     current_price=executed_price,
                     stop_loss=protective_levels.get("stop_loss"),
@@ -274,12 +312,15 @@ class SimulationService:
                 db.flush()
         elif side == "cover_short":
             short_quantity = abs(position.quantity) if position and position.quantity < 0 else 0
-            if position is None or short_quantity < order.quantity:
+            if position is None or short_quantity < executed_quantity:
                 raise ValueError("Cover quantity exceeds current simulated short exposure.")
-            total_cost = executed_price * order.quantity + fees
+            borrow_fee = round(position.avg_entry_price * executed_quantity * (account.short_borrow_fee_bps / 10_000), 4)
+            fees = round(fees + borrow_fee, 4)
+            sim_order.fees = fees
+            total_cost = executed_price * executed_quantity + fees
             account.cash_balance -= total_cost
-            realized_pnl = (position.avg_entry_price - executed_price) * order.quantity - fees
-            remaining_qty = short_quantity - order.quantity
+            realized_pnl = (position.avg_entry_price - executed_price) * executed_quantity - fees
+            remaining_qty = short_quantity - executed_quantity
             position.current_price = executed_price
             position.realized_pnl += realized_pnl
             if remaining_qty <= 0:
@@ -287,15 +328,15 @@ class SimulationService:
                 position.status = "closed"
                 position.closed_at = utcnow()
             else:
-                position.quantity = -remaining_qty
+                position.quantity = -round_quantity(remaining_qty, account.decimal_precision)
                 position.unrealized_pnl = (position.avg_entry_price - executed_price) * remaining_qty
         else:
-            if position is None or position.quantity <= 0 or position.quantity < order.quantity:
+            if position is None or position.quantity <= 0 or position.quantity < executed_quantity:
                 raise ValueError("Simulation sell order exceeds current holdings")
-            proceeds = executed_price * order.quantity - fees
+            proceeds = executed_price * executed_quantity - fees
             account.cash_balance += proceeds
-            realized_pnl = (executed_price - position.avg_entry_price) * order.quantity - fees
-            remaining_qty = position.quantity - order.quantity
+            realized_pnl = (executed_price - position.avg_entry_price) * executed_quantity - fees
+            remaining_qty = position.quantity - executed_quantity
             if remaining_qty <= 0:
                 position.quantity = 0
                 position.current_price = executed_price
@@ -303,10 +344,12 @@ class SimulationService:
                 position.status = "closed"
                 position.closed_at = utcnow()
             else:
-                position.quantity = remaining_qty
+                position.quantity = round_quantity(remaining_qty, account.decimal_precision)
                 position.current_price = executed_price
                 position.realized_pnl += realized_pnl
                 position.unrealized_pnl = (executed_price - position.avg_entry_price) * remaining_qty
+
+        self._record_stop_event_from_order(db, position, order, protective_levels, source="simulation_fill")
 
         trade = Trade(
             asset_id=order.asset_id,
@@ -314,7 +357,7 @@ class SimulationService:
             position_id=position.id if position else None,
             mode="simulation",
             side=side,
-            quantity=order.quantity,
+            quantity=executed_quantity,
             price=executed_price,
             fees=fees,
             realized_pnl=realized_pnl,
@@ -330,7 +373,7 @@ class SimulationService:
 
         fill = Fill(
             order_id=order.id,
-            quantity=order.quantity,
+            quantity=executed_quantity,
             price=executed_price,
             fees=fees,
             filled_at=trade.executed_at,
@@ -342,7 +385,7 @@ class SimulationService:
             simulation_order_id=sim_order.id,
             asset_id=order.asset_id,
             side=side,
-            quantity=order.quantity,
+            quantity=executed_quantity,
             price=executed_price,
             fees=fees,
             realized_pnl=realized_pnl,
@@ -364,10 +407,204 @@ class SimulationService:
                 "asset_id": order.asset_id,
                 "side": side,
                 "price": executed_price,
-                "quantity": order.quantity,
+                "quantity": executed_quantity,
+                "correlation_id": (order.audit_context or {}).get("correlation_id"),
             },
         )
         return sim_order, sim_trade, position
+
+    def enforce_margin_requirements(self, db: Session, account_id: str) -> dict:
+        account = self.get_account(db, account_id)
+        if account is None:
+            raise ValueError("Simulation account not found")
+        short_positions = list(
+            db.scalars(
+                select(Position).where(
+                    Position.mode == "simulation",
+                    Position.simulation_account_id == account.id,
+                    Position.status == "open",
+                    Position.quantity < 0,
+                )
+            )
+        )
+        if not short_positions:
+            return {"status": "ok", "forced_closes": [], "required_margin": 0, "equity": account.cash_balance}
+
+        self._refresh_position_prices(db, short_positions)
+        required_margin = self._required_short_margin(short_positions, account)
+        equity = self._account_equity(short_positions, account)
+        forced_closes: list[dict] = []
+        if equity >= required_margin:
+            return {
+                "status": "ok",
+                "forced_closes": forced_closes,
+                "required_margin": round(required_margin, 2),
+                "equity": round(equity, 2),
+            }
+
+        for position in sorted(short_positions, key=lambda item: abs(item.quantity) * item.current_price, reverse=True):
+            close_qty = abs(position.quantity)
+            price = position.current_price or position.avg_entry_price
+            fees = round(price * close_qty * (account.fees_bps / 10_000), 4)
+            borrow_fee = round(position.avg_entry_price * close_qty * (account.short_borrow_fee_bps / 10_000), 4)
+            total_fees = round(fees + borrow_fee, 4)
+            realized_pnl = (position.avg_entry_price - price) * close_qty - total_fees
+            account.cash_balance -= price * close_qty + total_fees
+            position.realized_pnl += realized_pnl
+            position.current_price = price
+            position.quantity = 0
+            position.unrealized_pnl = 0
+            position.status = "closed"
+            position.closed_at = utcnow()
+            trade = Trade(
+                asset_id=position.asset_id,
+                position_id=position.id,
+                mode="simulation",
+                side="cover_short",
+                quantity=close_qty,
+                price=price,
+                fees=total_fees,
+                realized_pnl=realized_pnl,
+                exit_reason="margin call forced close",
+                strategy_name=position.strategy_name,
+                provider_type=position.provider_type,
+                model_name=position.model_name,
+                executed_at=utcnow(),
+            )
+            db.add(trade)
+            db.flush()
+            sim_trade = SimulationTrade(
+                simulation_account_id=account.id,
+                simulation_order_id=None,
+                asset_id=position.asset_id,
+                side="cover_short",
+                quantity=close_qty,
+                price=price,
+                fees=total_fees,
+                realized_pnl=realized_pnl,
+                rationale="margin call forced close",
+                provider_type=position.provider_type,
+                model_name=position.model_name,
+                executed_at=trade.executed_at,
+            )
+            db.add(sim_trade)
+            self._record_stop_event(
+                db,
+                position=position,
+                source="margin_call",
+                event_type="forced_close",
+                levels={},
+                triggered_price=price,
+                notes="Simulated margin call forced this short exposure closed.",
+                metadata={"required_margin_before": required_margin, "equity_before": equity},
+            )
+            forced_closes.append(
+                {
+                    "position_id": position.id,
+                    "quantity": close_qty,
+                    "price": price,
+                    "realized_pnl": round(realized_pnl, 2),
+                }
+            )
+            remaining_shorts = [item for item in short_positions if item.status == "open" and item.quantity < 0]
+            required_margin = self._required_short_margin(remaining_shorts, account)
+            equity = self._account_equity(remaining_shorts, account)
+            if equity >= required_margin:
+                break
+
+        alert_service.create_alert(
+            db,
+            category="risk",
+            severity="critical",
+            title="Simulation margin call forced close",
+            message=f"Forced {len(forced_closes)} simulated short position(s) closed because equity fell below margin requirement.",
+            mode="simulation",
+            source_ref=account.id,
+        )
+        db.flush()
+        self.create_snapshot(db, account)
+        publish_event(
+            "simulation.margin_call",
+            {
+                "simulation_account_id": account.id,
+                "forced_closes": forced_closes,
+                "required_margin": round(required_margin, 2),
+                "equity": round(equity, 2),
+            },
+        )
+        return {
+            "status": "forced_closed" if forced_closes else "breached",
+            "forced_closes": forced_closes,
+            "required_margin": round(required_margin, 2),
+            "equity": round(equity, 2),
+        }
+
+    def _record_stop_event_from_order(self, db: Session, position: Position | None, order: Order, levels: dict, *, source: str) -> None:
+        if position is None:
+            return
+        self._record_stop_event(
+            db,
+            position=position,
+            source=source,
+            event_type="levels_applied",
+            levels=levels,
+            order_id=order.id,
+            signal_id=order.signal_id,
+            notes="Protective levels applied by simulated fill.",
+        )
+
+    def _record_stop_event(
+        self,
+        db: Session,
+        *,
+        position: Position,
+        source: str,
+        event_type: str,
+        levels: dict,
+        order_id: str | None = None,
+        signal_id: str | None = None,
+        triggered_price: float | None = None,
+        notes: str | None = None,
+        metadata: dict | None = None,
+    ) -> PositionStopEvent | None:
+        if not any(levels.get(key) is not None for key in ("stop_loss", "take_profit", "trailing_stop")) and triggered_price is None:
+            return None
+        event = PositionStopEvent(
+            position_id=position.id,
+            order_id=order_id,
+            signal_id=signal_id,
+            mode=position.mode,
+            source=source,
+            event_type=event_type,
+            stop_loss=levels.get("stop_loss"),
+            take_profit=levels.get("take_profit"),
+            trailing_stop=levels.get("trailing_stop"),
+            triggered_price=triggered_price,
+            notes=notes,
+            metadata_json=metadata or {},
+            observed_at=utcnow(),
+        )
+        db.add(event)
+        db.flush()
+        return event
+
+    def _refresh_position_prices(self, db: Session, positions: list[Position]) -> None:
+        for position in positions:
+            try:
+                position.current_price = market_data_service.get_latest_price(db, position.asset_id)
+            except ValueError:
+                position.current_price = position.current_price or position.avg_entry_price
+            if position.quantity < 0:
+                position.unrealized_pnl = (position.avg_entry_price - position.current_price) * abs(position.quantity)
+            else:
+                position.unrealized_pnl = (position.current_price - position.avg_entry_price) * position.quantity
+
+    def _required_short_margin(self, positions: list[Position], account: SimulationAccount) -> float:
+        requirement = max(float(account.short_margin_requirement or 1.0), 1.0)
+        return sum(abs(position.quantity) * position.current_price * requirement for position in positions if position.quantity < 0)
+
+    def _account_equity(self, positions: list[Position], account: SimulationAccount) -> float:
+        return account.cash_balance + sum(position.quantity * position.current_price for position in positions)
 
     def create_snapshot(self, db: Session, account: SimulationAccount) -> PortfolioSnapshot:
         positions = list(
@@ -382,7 +619,10 @@ class SimulationService:
         total_equity = 0.0
         sector_breakdown: dict[str, float] = {}
         for position in positions:
-            latest_price = market_data_service.get_latest_price(db, position.asset_id)
+            try:
+                latest_price = market_data_service.get_latest_price(db, position.asset_id)
+            except ValueError:
+                latest_price = position.current_price or position.avg_entry_price
             position.current_price = latest_price
             if position.quantity < 0:
                 position.unrealized_pnl = (position.avg_entry_price - latest_price) * abs(position.quantity)

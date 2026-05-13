@@ -12,6 +12,15 @@ import { api } from "@/lib/api";
 import { formatPct } from "@/lib/utils";
 import type { BrokerAccount, ProviderConfig, SettingsOverview, TradingAutomationProfile } from "@/types";
 
+type SettingsTab = "workspace" | "live" | "simulation" | "risk";
+
+const SETTINGS_TABS: { key: SettingsTab; label: string; description: string }[] = [
+  { key: "workspace", label: "Workspace", description: "Simulation model profile and shared workspace notes" },
+  { key: "live", label: "Live Trading", description: "Live model, Trading212 sync, and guarded live policy" },
+  { key: "simulation", label: "Simulation", description: "Simulation-only automation inheritance" },
+  { key: "risk", label: "Risk", description: "Cash reserve and account protection rules" },
+];
+
 function summarizeRiskRule(rule: SettingsOverview["risk_rules"][number]) {
   if (rule.rule_type === "daily_max_loss") {
     const limitPct = Number(rule.config_json.max_daily_loss_pct ?? 0);
@@ -86,6 +95,7 @@ export default function SettingsPage() {
   const [settingsState, setSettingsState] = useState<SettingsOverview | null>(null);
   const [brokerAccountsState, setBrokerAccountsState] = useState<BrokerAccount[]>([]);
   const [message, setMessage] = useState("");
+  const [activeTab, setActiveTab] = useState<SettingsTab>("workspace");
 
   useEffect(() => {
     if (!data) return;
@@ -173,48 +183,140 @@ export default function SettingsPage() {
 
       {message ? <div className="rounded-xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-200">{message}</div> : null}
 
-      <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-300 shadow-panel">
-        This entrypoint is centered on <span className="font-semibold text-slate-100">{workspace.label}</span>. Cross-provider switching and per-task routing are intentionally hidden here so this port only edits its own model workspace.
+      <div className="rounded-2xl border border-border bg-panel/90 p-2 shadow-panel">
+        <div role="tablist" aria-label="Settings sections" className="grid gap-2 md:grid-cols-4">
+          {SETTINGS_TABS.map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={`rounded-xl border px-4 py-3 text-left transition ${activeTab === tab.key ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-100" : "border-transparent text-slate-300 hover:border-border hover:bg-white/5"}`}
+            >
+              <div className="text-sm font-semibold">{tab.label}</div>
+              <div className="mt-1 text-xs text-slate-500">{tab.description}</div>
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
-        Live trading backend switch: <span className="font-semibold">{settingsState.live_trading_enabled ? "enabled" : "disabled"}</span>. Even if enabled later, every live order still passes risk validation and broker capability checks.
-      </div>
-
-      <ProviderTabs providers={settingsState.providers} onSaved={handleProviderSaved} />
-
-      <Trading212Form account={trading212Account} onSaved={handleBrokerSaved} />
-
-      <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Live trading model</div>
-            <div className="mt-1 text-sm text-slate-400">
-              Only this one model/profile may generate or approve live trading decisions. Simulation can still run many model accounts side by side.
+      {activeTab === "workspace" ? (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-border bg-panel/90 px-4 py-3 text-sm text-slate-300 shadow-panel">
+            This entrypoint is centered on <span className="font-semibold text-slate-100">{workspace.label}</span>. Cross-provider switching and per-task routing are intentionally hidden here so this port only edits its own simulation workspace.
+          </div>
+          <ProviderTabs key="workspace-simulation-provider" providers={settingsState.providers} allowedModes={["simulation"]} onSaved={handleProviderSaved} />
+          <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+            <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Operational notes</div>
+            <div className="space-y-3 text-sm text-slate-300">
+              <div className="rounded-xl border border-border bg-black/20 p-3">
+                Watchlists, assets universe, and simulation parameters are stored locally and survive container restarts through Postgres volumes.
+              </div>
+              <div className="rounded-xl border border-border bg-black/20 p-3">
+                Provider secrets are write-only from the UI. Saved keys are encrypted in the backend database before persistence.
+              </div>
             </div>
           </div>
-          <StatusBadge status={configuredLiveProvider ? "locked" : "blocked"} />
         </div>
-        <div className="mt-4 grid gap-3 lg:grid-cols-[1fr,auto]">
-          <select
-            value={configuredLiveProvider}
-            onChange={(event) => handleLiveModelChange(event.target.value)}
-            className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100"
-          >
-            <option value="">No live model selected</option>
-            {liveProviders.map((provider) => (
-              <option key={provider.provider_type} value={provider.provider_type}>
-                {provider.vendor_name} · {provider.provider_type} · {provider.default_model || "model not set"}
-              </option>
-            ))}
-          </select>
-          <div className="rounded-xl border border-border bg-black/20 px-4 py-2 text-sm text-slate-300">
-            {configuredLiveProvider ? "Server-side live automation is locked to this profile." : "Live automation is disabled until a live model is selected."}
+      ) : null}
+
+      {activeTab === "live" ? (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+            Live trading backend switch: <span className="font-semibold">{settingsState.live_trading_enabled ? "enabled" : "disabled"}</span>. Even if enabled later, every live order still passes risk validation and broker capability checks.
+          </div>
+
+          <ProviderTabs key="workspace-live-provider" providers={settingsState.providers} allowedModes={["live"]} onSaved={handleProviderSaved} />
+
+          <Trading212Form account={trading212Account} onSaved={handleBrokerSaved} />
+
+          <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Live trading model</div>
+                <div className="mt-1 text-sm text-slate-400">
+                  Only this one model/profile may generate or approve live trading decisions. Simulation can still run many model accounts side by side.
+                </div>
+              </div>
+              <StatusBadge status={configuredLiveProvider ? "locked" : "blocked"} />
+            </div>
+            <div className="mt-4 grid gap-3 lg:grid-cols-[1fr,auto]">
+              <select
+                value={configuredLiveProvider}
+                onChange={(event) => handleLiveModelChange(event.target.value)}
+                className="rounded-xl border border-border bg-slate-950 px-3 py-2 text-slate-100"
+              >
+                <option value="">No live model selected</option>
+                {liveProviders.map((provider) => (
+                  <option key={provider.provider_type} value={provider.provider_type}>
+                    {provider.vendor_name} · {provider.provider_type} · {provider.default_model || "model not set"}
+                  </option>
+                ))}
+              </select>
+              <div className="rounded-xl border border-border bg-black/20 px-4 py-2 text-sm text-slate-300">
+                {configuredLiveProvider ? "Server-side live automation is locked to this profile." : "Live automation is disabled until a live model is selected."}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+            <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Live automation</div>
+            <div className="rounded-xl border border-border bg-black/20 p-3 text-sm text-slate-300">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-medium text-slate-100">Guarded production policy</div>
+                  <div className="mt-1 text-xs text-slate-400">This is the policy used by the Live Trading workspace after the backend confirms exactly one healthy live model.</div>
+                </div>
+                <StatusBadge status={settingsState.live_automation.automation_enabled ? "enabled" : "disabled"} />
+              </div>
+              <div className="mt-3 text-sm text-slate-200">{summarizeAutomation(settingsState.live_automation)}</div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-border bg-panel/90 p-4 text-sm text-slate-300 shadow-panel">
+            Trading212 credentials are backend-only and write-only. Ticker validation and account sync may use the broker API, but direct execution remains intentionally scaffolded.
           </div>
         </div>
-      </div>
+      ) : null}
 
-      <div className="grid gap-4 xl:grid-cols-2">
+      {activeTab === "simulation" ? (
+        <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
+          <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Simulation automation</div>
+          <div className="rounded-xl border border-border bg-black/20 p-3 text-sm text-slate-300">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="font-medium text-slate-100">Automation inheritance</div>
+                <div className="mt-1 text-xs text-slate-400">
+                  Use the same policy as Live when you want training and production review to stay aligned. Turn it off when you want a safe override for experimentation.
+                </div>
+              </div>
+              <StatusBadge status={settingsState.simulation_automation.inherit_from_live ? "shared" : "custom"} />
+            </div>
+            <label className="mt-4 flex items-center justify-between rounded-xl border border-border px-3 py-3">
+              <div>
+                <div className="text-sm font-medium text-slate-100">Use same settings as Live</div>
+                <div className="mt-1 text-xs text-slate-400">
+                  This keeps Simulation on the same strategy, threshold, sizing, and stop defaults as the live automation profile.
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={settingsState.simulation_automation.inherit_from_live}
+                onChange={(event) => handleSimulationInheritanceChange(event.target.checked)}
+                className="h-4 w-4 rounded border-border bg-slate-900"
+              />
+            </label>
+            <div className="mt-3 text-sm text-slate-200">
+              {settingsState.simulation_automation.inherit_from_live
+                ? `Currently inheriting from ${settingsState.simulation_automation.effective_source_mode}. ${summarizeAutomation(settingsState.simulation_automation)}`
+                : summarizeAutomation(settingsState.simulation_automation)}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeTab === "risk" ? (
         <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
           <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Risk rules</div>
           <div className="space-y-3">
@@ -239,65 +341,7 @@ export default function SettingsPage() {
             ))}
           </div>
         </div>
-        <div className="rounded-2xl border border-border bg-panel/90 p-4 shadow-panel">
-          <div className="mb-4 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Automation parity</div>
-          <div className="space-y-3 text-sm text-slate-300">
-            <div className="rounded-xl border border-border bg-black/20 p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="font-medium text-slate-100">Live automation</div>
-                  <div className="mt-1 text-xs text-slate-400">This is the guarded production policy used by the Live Trading workspace.</div>
-                </div>
-                <StatusBadge status={settingsState.live_automation.automation_enabled ? "enabled" : "disabled"} />
-              </div>
-              <div className="mt-3 text-sm text-slate-200">{summarizeAutomation(settingsState.live_automation)}</div>
-            </div>
-            <div className="rounded-xl border border-border bg-black/20 p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="font-medium text-slate-100">Simulation automation</div>
-                  <div className="mt-1 text-xs text-slate-400">
-                    Use the same policy as Live when you want training and production review to stay aligned. Turn it off when you want a safe override for experimentation.
-                  </div>
-                </div>
-                <StatusBadge status={settingsState.simulation_automation.inherit_from_live ? "shared" : "custom"} />
-              </div>
-              <label className="mt-4 flex items-center justify-between rounded-xl border border-border px-3 py-3">
-                <div>
-                  <div className="text-sm font-medium text-slate-100">Use same settings as Live</div>
-                  <div className="mt-1 text-xs text-slate-400">
-                    This keeps Simulation on the same strategy, threshold, sizing, and stop defaults as the live automation profile.
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={settingsState.simulation_automation.inherit_from_live}
-                  onChange={(event) => handleSimulationInheritanceChange(event.target.checked)}
-                  className="h-4 w-4 rounded border-border bg-slate-900"
-                />
-              </label>
-              <div className="mt-3 text-sm text-slate-200">
-                {settingsState.simulation_automation.inherit_from_live
-                  ? `Currently inheriting from ${settingsState.simulation_automation.effective_source_mode}. ${summarizeAutomation(settingsState.simulation_automation)}`
-                  : summarizeAutomation(settingsState.simulation_automation)}
-              </div>
-            </div>
-          </div>
-
-          <div className="mb-4 mt-6 text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">Operational notes</div>
-          <div className="space-y-3 text-sm text-slate-300">
-            <div className="rounded-xl border border-border bg-black/20 p-3">
-              Trading212 credentials can now be saved here for backend-only ticker validation. Execution remains intentionally scaffolded.
-            </div>
-            <div className="rounded-xl border border-border bg-black/20 p-3">
-              Watchlists, assets universe, and simulation parameters are stored locally and survive container restarts through Postgres volumes.
-            </div>
-            <div className="rounded-xl border border-border bg-black/20 p-3">
-              Provider secrets are write-only from the UI. Saved keys are encrypted in the backend database before persistence.
-            </div>
-          </div>
-        </div>
-      </div>
+      ) : null}
     </div>
   );
 }

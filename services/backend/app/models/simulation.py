@@ -19,6 +19,11 @@ class SimulationAccount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=50)
     min_cash_reserve_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     short_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    short_borrow_fee_bps: Mapped[float] = mapped_column(Float, default=0)
+    short_margin_requirement: Mapped[float] = mapped_column(Float, default=1.5)
+    partial_fill_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+    decimal_precision: Mapped[int] = mapped_column(Integer, default=6)
+    enforce_market_hours: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     reset_count: Mapped[int] = mapped_column(Integer, default=0)
 

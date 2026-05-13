@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -43,9 +44,13 @@ class RiskValidationRequest(BaseModel):
     simulation_account_id: str | None = None
     broker_account_id: str | None = None
     strategy_name: str | None = None
+    observed_at: datetime | None = None
 
 
 class RiskValidationResponse(BaseModel):
     approved: bool
     checks: list[RiskCheck]
     rejection_reasons: list[str]
+    order_value: float = 0
+    max_allowed_order_value: float | None = None
+    max_allowed_quantity: float | None = None
